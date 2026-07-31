@@ -1,0 +1,1530 @@
+// @vitest-environment jsdom
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { mount, flushPromises } from '@vue/test-utils'
+import { createI18n } from 'vue-i18n'
+
+// Adjust the import path if your test folder differs
+import Files from '../files.vue'
+
+beforeEach(() => {
+  ;(globalThis as any).createRendererLogger = vi.fn(() => ({
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn()
+  }))
+})
+
+vi.mock('ant-design-vue', () => ({
+  message: {
+    success: vi.fn(),
+    error: vi.fn(),
+    info: vi.fn(),
+    warning: vi.fn(),
+    loading: vi.fn()
+  },
+  Modal: {
+    confirm: vi.fn(),
+    info: vi.fn(),
+    warning: vi.fn(),
+    error: vi.fn()
+  }
+}))
+
+const i18n = createI18n({
+  legacy: false,
+  locale: 'en',
+  messages: {
+    en: {
+      common: { ok: 'OK', cancel: 'Cancel' },
+      files: {
+        name: 'Name',
+        permissions: 'Permissions',
+        size: 'Size',
+        modifyDate: 'Modified',
+        read: 'Read',
+        write: 'Write',
+        exec: 'Execute',
+        rollback: 'Rollback',
+        showHiddenFiles: 'Show Hidden Files',
+        hideHiddenFiles: 'Hide Hidden Files',
+
+        // upload
+        uploadSuccess: 'Upload success',
+        uploadCancel: 'Upload canceled',
+        uploadSkipped: 'Upload skipped',
+        uploadFailed: 'Upload failed',
+        uploadError: 'Upload error',
+
+        // download
+        downloadSuccess: 'Download success',
+        downloadCancel: 'Download canceled',
+        downloadSkipped: 'Download skipped',
+        downloadFailed: 'Download failed',
+        downloadError: 'Download error',
+
+        // rename / delete
+        modifySuccess: 'Modify success',
+        modifyFailed: 'Modify failed',
+        modifyError: 'Modify error',
+        deleteFileTips: 'Delete?',
+        deleting: 'Deleting...',
+        deleteSuccess: 'Delete success',
+        deleteFailed: 'Delete failed',
+        deleteError: 'Delete error',
+
+        // copy/move
+        copyFileSuccess: 'Copy success',
+        copyFileFailed: 'Copy failed',
+        copyFileError: 'Copy error',
+        moveFileSuccess: 'Move success',
+        moveFileFailed: 'Move failed',
+        moveFileError: 'Move error',
+
+        // copy absolute path
+        copyAbsolutePath: 'Copy Absolute Path',
+        copyAbsolutePathSuccess: 'Absolute Path Copied',
+        copyAbsolutePathFailed: 'Failed to Copy Absolute Path',
+
+        // chmod
+        modifyFilePermissionsFailed: 'chmod failed',
+        modifyFilePermissionsError: 'chmod error'
+      }
+    }
+  }
+})
+
+const antdStubs = {
+  // Common antd building blocks used by template
+  'a-card': { template: '<div class="a-card"><slot /></div>' },
+  'a-space': { template: '<div class="a-space"><slot /></div>' },
+  'a-row': { template: '<div class="a-row"><slot /></div>' },
+  'a-col': { template: '<div class="a-col"><slot /></div>' },
+  'a-tooltip': { template: '<div class="a-tooltip"><slot /></div>' },
+  'a-dropdown': { template: '<div class="a-dropdown"><slot /></div>' },
+  'a-menu': { template: '<div class="a-menu"><slot /></div>' },
+  'a-menu-item': { template: '<div class="a-menu-item"><slot /></div>' },
+  'a-empty': { template: '<div class="a-empty" />' },
+
+  'a-button': { template: '<button class="a-button" @click="$emit(\'click\')"><slot /></button>' },
+  'a-input': {
+    props: ['value'],
+    emits: ['update:value', 'press-enter'],
+    template: '<input class="a-input" :value="value" @input="$emit(\'update:value\', $event.target && $event.target.value)" />'
+  },
+  'a-table': { template: '<div class="a-table"><slot /></div>' },
+
+  // Modal used inside template (not to be confused with Modal.confirm API)
+  'a-modal': { template: '<div class="a-modal"><slot /></div>' },
+
+  'a-checkbox-group': { template: '<div class="a-checkbox-group"><slot /></div>' },
+  'a-checkbox': { template: '<div class="a-checkbox"><slot /></div>' }
+}
+
+// Icons & inner components
+const iconStubs = {
+  CheckOutlined: true,
+  CloseOutlined: true,
+  CloudUploadOutlined: true,
+  CopyOutlined: true,
+  DeleteOutlined: true,
+  DownloadOutlined: true,
+  EditOutlined: true,
+  EllipsisOutlined: true,
+  EyeOutlined: true,
+  EyeInvisibleOutlined: true,
+  FileFilled: true,
+  FolderFilled: true,
+  FolderOpenOutlined: true,
+  LinkOutlined: true,
+  LockOutlined: true,
+  RedoOutlined: true,
+  RollbackOutlined: true,
+  ScissorOutlined: true,
+  UploadOutlined: true,
+  copyOrMoveModal: true
+}
+
+type ApiStub = {
+  sshSftpList: ReturnType<typeof vi.fn>
+  copyOrMoveBySftp: ReturnType<typeof vi.fn>
+  openDirectoryDialog: ReturnType<typeof vi.fn>
+  openFileDialog: ReturnType<typeof vi.fn>
+  openSaveDialog: ReturnType<typeof vi.fn>
+  uploadFile: ReturnType<typeof vi.fn>
+  uploadDirectory: ReturnType<typeof vi.fn>
+  downloadFile: ReturnType<typeof vi.fn>
+  renameFile: ReturnType<typeof vi.fn>
+  deleteFile: ReturnType<typeof vi.fn>
+  chmodFile: ReturnType<typeof vi.fn>
+  sshConnExec: ReturnType<typeof vi.fn>
+}
+
+const makeApi = (): ApiStub => ({
+  sshSftpList: vi.fn().mockResolvedValue([] as any),
+  copyOrMoveBySftp: vi.fn().mockResolvedValue({ status: 'success' }),
+  openDirectoryDialog: vi.fn().mockResolvedValue(null),
+  openFileDialog: vi.fn().mockResolvedValue(null),
+  openSaveDialog: vi.fn().mockResolvedValue(null),
+  uploadFile: vi.fn().mockResolvedValue({ status: 'success' }),
+  uploadDirectory: vi.fn().mockResolvedValue({ status: 'success' }),
+  downloadFile: vi.fn().mockResolvedValue({ status: 'success' }),
+  renameFile: vi.fn().mockResolvedValue({ status: 'success' }),
+  deleteFile: vi.fn().mockResolvedValue({ status: 'success' }),
+  chmodFile: vi.fn().mockResolvedValue({ status: 'success' }),
+  sshConnExec: vi.fn().mockResolvedValue({ stdout: '', stderr: '' })
+})
+describe('files.vue (enhanced)', () => {
+  let api: ApiStub
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    api = makeApi()
+    ;(globalThis as any).api = api
+
+    // files.vue uses requestAnimationFrame in loadFiles (raf wrapper)
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb: any) => {
+      cb(0)
+      return 1
+    })
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    delete (globalThis as any).api
+  })
+
+  const mountView = (props?: Record<string, any>) =>
+    mount(Files as any, {
+      props: {
+        uuid: 'localhost@127.0.0.1:local',
+        connectType: 'ssh',
+        currentDirectoryInput: '/',
+        basePath: '',
+        uiMode: 'default',
+        panelSide: '',
+        cachedState: null,
+        ...props
+      },
+      global: {
+        plugins: [i18n],
+        stubs: { ...antdStubs, ...iconStubs }
+      }
+    })
+
+  const createDeferred = <T>() => {
+    let resolve!: (value: T) => void
+    let reject!: (reason?: unknown) => void
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res
+      reject = rej
+    })
+    return { promise, resolve, reject }
+  }
+
+  it('mount loads listing, sorts dirs/files, and inserts parent ".." when not root', async () => {
+    api.sshSftpList.mockResolvedValueOnce([
+      { name: 'b.txt', path: '/home/b.txt', isDir: false, mode: '0644', isLink: false, modTime: '', size: 2 },
+      { name: 'a', path: '/home/a', isDir: true, mode: '0755', isLink: false, modTime: '', size: 0 },
+      { name: 'c', path: '/home/c', isDir: true, mode: '0755', isLink: false, modTime: '', size: 0 },
+      { name: 'a.txt', path: '/home/a.txt', isDir: false, mode: '0644', isLink: false, modTime: '', size: 1 }
+    ] as any)
+
+    const wrapper = mountView({ currentDirectoryInput: '/home' })
+    await flushPromises()
+
+    const vm = wrapper.vm as any
+    expect(api.sshSftpList).toHaveBeenCalledWith({ path: '/home', id: 'localhost@127.0.0.1:local' })
+
+    // Expect parent inserted at front
+    expect(vm.files[0].name).toBe('..')
+
+    // Expect dirs sorted before files, each group sorted by name
+    const names = vm.files.map((x: any) => x.name)
+    expect(names).toEqual(['..', 'a', 'c', 'a.txt', 'b.txt'])
+
+    wrapper.unmount()
+  })
+
+  it('does not insert parent when root "/" or Windows drive root like "C:/"', async () => {
+    // Root
+    api.sshSftpList.mockResolvedValueOnce([] as any)
+    const w1 = mountView({ currentDirectoryInput: '/' })
+    await flushPromises()
+    expect((w1.vm as any).files.map((x: any) => x.name).includes('..')).toBe(false)
+    w1.unmount()
+
+    // Windows drive root
+    api.sshSftpList.mockResolvedValueOnce([{ name: 'x', path: 'C:/x', isDir: true, mode: '0755', isLink: false, modTime: '', size: 0 }] as any)
+    const w2 = mountView({ currentDirectoryInput: 'C:/' })
+    await flushPromises()
+    const names2 = (w2.vm as any).files.map((x: any) => x.name)
+    expect(names2.includes('..')).toBe(false)
+    w2.unmount()
+  })
+
+  it('openFile emits correct payload', async () => {
+    api.sshSftpList.mockResolvedValueOnce([] as any)
+    const wrapper = mountView()
+    await flushPromises()
+
+    const vm = wrapper.vm as any
+    vm.openFile({ name: 'a.txt', path: '/a.txt', isDir: false })
+    const emitted = wrapper.emitted('openFile') || []
+    expect(emitted.length).toBe(1)
+    expect(emitted[0][0]).toEqual({
+      filePath: '/a.txt',
+      terminalId: 'localhost@127.0.0.1:local',
+      connectType: 'ssh'
+    })
+
+    wrapper.unmount()
+  })
+
+  it('openLocalFolder: returns early when dialog cancelled; loads when path selected', async () => {
+    api.sshSftpList.mockResolvedValue([] as any)
+    const wrapper = mountView()
+    await flushPromises()
+
+    const vm = wrapper.vm as any
+
+    // cancelled
+    api.openDirectoryDialog.mockResolvedValueOnce(null)
+    const callsBefore = api.sshSftpList.mock.calls.length
+    await vm.openLocalFolder()
+    await flushPromises()
+    expect(api.openDirectoryDialog).toHaveBeenCalled()
+    expect(api.sshSftpList.mock.calls.length).toBe(callsBefore)
+
+    // selected
+    api.openDirectoryDialog.mockResolvedValueOnce('/tmp')
+    api.sshSftpList.mockResolvedValueOnce([] as any)
+    await vm.openLocalFolder()
+    await flushPromises()
+    expect(api.sshSftpList).toHaveBeenLastCalledWith({ path: '/tmp', id: 'localhost@127.0.0.1:local' })
+
+    wrapper.unmount()
+  })
+
+  it('uploadFile: covers success/cancelled/skipped/failed + catch', async () => {
+    const { message } = await import('ant-design-vue')
+
+    const wrapper = mountView()
+    await flushPromises()
+    const vm = wrapper.vm as any
+
+    // early return
+    api.openFileDialog.mockResolvedValueOnce(null)
+    await vm.uploadFile()
+    expect(api.uploadFile).not.toHaveBeenCalled()
+
+    const cases = [
+      { status: 'success', expectFn: 'success' },
+      { status: 'cancelled', expectFn: 'info' },
+      { status: 'skipped', expectFn: 'info' },
+      { status: 'failed', expectFn: 'error', message: 'x' }
+    ] as const
+
+    for (const c of cases) {
+      api.openFileDialog.mockResolvedValueOnce('/local/a.txt')
+      api.uploadFile.mockResolvedValueOnce({ status: c.status, message: (c as any).message })
+      api.sshSftpList.mockResolvedValueOnce([] as any) // refresh -> loadFiles
+      await vm.uploadFile()
+      await flushPromises()
+
+      expect(api.uploadFile).toHaveBeenLastCalledWith({
+        id: 'localhost@127.0.0.1:local',
+        remotePath: '/',
+        localPath: '/local/a.txt'
+      })
+
+      expect((message as any)[c.expectFn]).toHaveBeenCalled()
+    }
+
+    // catch
+    api.openFileDialog.mockResolvedValueOnce('/local/b.txt')
+    api.uploadFile.mockRejectedValueOnce(new Error('boom'))
+    await vm.uploadFile()
+    await flushPromises()
+    expect(message.error).toHaveBeenCalled()
+
+    wrapper.unmount()
+  })
+
+  it('uploadFolder: covers success and non-success + catch', async () => {
+    const { message } = await import('ant-design-vue')
+
+    const wrapper = mountView()
+    await flushPromises()
+    const vm = wrapper.vm as any
+
+    // early return
+    api.openDirectoryDialog.mockResolvedValueOnce(null)
+    await vm.uploadFolder()
+    expect(api.uploadDirectory).not.toHaveBeenCalled()
+
+    api.openDirectoryDialog.mockResolvedValueOnce('/local/dir')
+    api.uploadDirectory.mockResolvedValueOnce({ status: 'success' })
+    api.sshSftpList.mockResolvedValueOnce([] as any)
+    await vm.uploadFolder()
+    await flushPromises()
+    expect(message.success).toHaveBeenCalled()
+
+    api.openDirectoryDialog.mockResolvedValueOnce('/local/dir2')
+    api.uploadDirectory.mockResolvedValueOnce({ status: 'failed', message: 'nope' })
+    api.sshSftpList.mockResolvedValueOnce([] as any)
+    await vm.uploadFolder()
+    await flushPromises()
+    // files.vue uses message.success for all non-exception statuses (including failed)
+    expect(message.success).toHaveBeenCalled()
+
+    api.openDirectoryDialog.mockResolvedValueOnce('/local/dir3')
+    api.uploadDirectory.mockRejectedValueOnce(new Error('boom'))
+    await vm.uploadFolder()
+    await flushPromises()
+    expect(message.error).toHaveBeenCalled()
+
+    wrapper.unmount()
+  })
+
+  it('downloadFile: covers status mapping and catch', async () => {
+    const { message } = await import('ant-design-vue')
+
+    const wrapper = mountView()
+    await flushPromises()
+    const vm = wrapper.vm as any
+
+    // early return
+    api.openSaveDialog.mockResolvedValueOnce(null)
+    await vm.downloadFile({ name: 'x.txt', path: '/x.txt' })
+    expect(api.downloadFile).not.toHaveBeenCalled()
+
+    const cases = [
+      { status: 'success', expectFn: 'success' },
+      { status: 'cancelled', expectFn: 'info' },
+      { status: 'skipped', expectFn: 'info' },
+      { status: 'failed', expectFn: 'error', message: 'x' }
+    ] as const
+
+    for (const c of cases) {
+      api.openSaveDialog.mockResolvedValueOnce('/local/save.txt')
+      api.downloadFile.mockResolvedValueOnce({ status: c.status, message: (c as any).message })
+      await vm.downloadFile({ name: 'x.txt', path: '/x.txt' })
+      await flushPromises()
+      expect(api.downloadFile).toHaveBeenLastCalledWith({
+        id: 'localhost@127.0.0.1:local',
+        remotePath: '/x.txt',
+        localPath: '/local/save.txt'
+      })
+      expect((message as any)[c.expectFn]).toHaveBeenCalled()
+    }
+
+    // catch
+    api.openSaveDialog.mockResolvedValueOnce('/local/save2.txt')
+    api.downloadFile.mockRejectedValueOnce(new Error('boom'))
+    await vm.downloadFile({ name: 'y.txt', path: '/y.txt' })
+    await flushPromises()
+    expect(message.error).toHaveBeenCalled()
+
+    wrapper.unmount()
+  })
+
+  it('renameFile toggles editableData; renameOk covers success/fail/catch; renameCancel clears', async () => {
+    const { message } = await import('ant-design-vue')
+
+    api.sshSftpList.mockResolvedValueOnce([{ name: 'a.txt', path: '/a.txt', isDir: false, mode: '0644', isLink: false, modTime: '', size: 1 }] as any)
+
+    const wrapper = mountView({ currentDirectoryInput: '/' })
+    await flushPromises()
+    const vm = wrapper.vm as any
+    const record = vm.files.find((x: any) => x.name === 'a.txt')
+    expect(record).toBeTruthy()
+
+    // invalid record (missing key) should not throw
+    vm.renameFile({ name: 'bad' })
+
+    // toggle editableData on
+    vm.renameFile(record)
+    expect(vm.editableData[record.key]).toBeTruthy()
+
+    // success
+    vm.editableData[record.key].name = 'b.txt'
+    api.renameFile.mockResolvedValueOnce({ status: 'success' })
+    // renameOk() always calls refresh(); keep the file in the list so later renameFile() can find it again
+    api.sshSftpList.mockResolvedValueOnce([{ name: 'a.txt', path: '/a.txt', isDir: false, mode: '0644', isLink: false, modTime: '', size: 1 }] as any)
+    await vm.renameOk(record)
+    await flushPromises()
+    expect(api.renameFile).toHaveBeenLastCalledWith({
+      id: 'localhost@127.0.0.1:local',
+      oldPath: '/a.txt',
+      newPath: '/b.txt'
+    })
+    expect(message.success).toHaveBeenCalled()
+
+    // fail
+    vm.renameFile(record)
+    vm.editableData[record.key].name = 'c.txt'
+    api.renameFile.mockResolvedValueOnce({ status: 'failed', message: 'nope' })
+    // renameOk() calls refresh() even on failed status
+    api.sshSftpList.mockResolvedValueOnce([{ name: 'a.txt', path: '/a.txt', isDir: false, mode: '0644', isLink: false, modTime: '', size: 1 }] as any)
+    await vm.renameOk(record)
+    await flushPromises()
+    expect(message.error).toHaveBeenCalled()
+
+    // catch
+    vm.renameFile(record)
+    vm.editableData[record.key].name = 'd.txt'
+    api.renameFile.mockRejectedValueOnce(new Error('boom'))
+    await vm.renameOk(record)
+    await flushPromises()
+    expect(message.error).toHaveBeenCalled()
+
+    // cancel clears editableData
+    vm.renameFile(record)
+    expect(vm.editableData[record.key]).toBeTruthy()
+    vm.renameCancel(record)
+    expect(vm.editableData[record.key]).toBeUndefined()
+
+    wrapper.unmount()
+  })
+
+  it('deleteFile triggers Modal.confirm and confirmDeleteFile covers success/fail/catch', async () => {
+    const { Modal, message } = await import('ant-design-vue')
+
+    api.sshSftpList.mockResolvedValueOnce([{ name: 'a.txt', path: '/a.txt', isDir: false, mode: '0644', isLink: false, modTime: '', size: 1 }] as any)
+
+    const wrapper = mountView()
+    await flushPromises()
+    const vm = wrapper.vm as any
+    const record = vm.files.find((x: any) => x.name === 'a.txt')
+
+    // open dialog
+    vm.deleteFile(record)
+    expect(Modal.confirm).toHaveBeenCalled()
+    const cfg = (Modal.confirm as any).mock.calls.at(-1)[0]
+    expect(typeof cfg.onOk).toBe('function')
+
+    // success
+    api.deleteFile.mockResolvedValueOnce({ status: 'success' })
+    api.sshSftpList.mockResolvedValueOnce([] as any) // refresh
+    await cfg.onOk()
+    await flushPromises()
+    expect(api.deleteFile).toHaveBeenLastCalledWith({ id: 'localhost@127.0.0.1:local', remotePath: '/a.txt' })
+    expect(message.loading).toHaveBeenCalled()
+    expect(message.success).toHaveBeenCalled()
+
+    // fail
+    vm.deleteFile(record)
+    const cfg2 = (Modal.confirm as any).mock.calls.at(-1)[0]
+    api.deleteFile.mockResolvedValueOnce({ status: 'failed', message: 'nope' })
+    api.sshSftpList.mockResolvedValueOnce([] as any)
+    await cfg2.onOk()
+    await flushPromises()
+    expect(message.success).toHaveBeenCalled() // component uses success() even for failed status, but with different content
+
+    // catch
+    vm.deleteFile(record)
+    const cfg3 = (Modal.confirm as any).mock.calls.at(-1)[0]
+    api.deleteFile.mockRejectedValueOnce(new Error('boom'))
+    await cfg3.onOk()
+    await flushPromises()
+    expect(message.error).toHaveBeenCalled()
+
+    wrapper.unmount()
+  })
+
+  it('copy: shows error when sftp copy throws', async () => {
+    const { message } = await import('ant-design-vue')
+
+    api.sshSftpList.mockResolvedValueOnce([
+      {
+        name: 'a',
+        path: '/a',
+        isDir: true,
+        mode: '0755',
+        isLink: false,
+        modTime: '',
+        size: 0
+      }
+    ] as any)
+
+    const wrapper = mountView({ currentDirectoryInput: '/' })
+    await flushPromises()
+
+    const vm = wrapper.vm as any
+    const record = vm.files.find((x: any) => x.name === 'a')
+    expect(record).toBeTruthy()
+
+    vi.mocked(message.success).mockClear()
+    vi.mocked(message.error).mockClear()
+
+    vi.mocked(api.copyOrMoveBySftp).mockRejectedValueOnce(new Error('boom'))
+
+    vm.copyFile(record)
+    await vm.copyOrMoveModalOk('/dest/a4')
+    await flushPromises()
+
+    expect(api.copyOrMoveBySftp).toHaveBeenCalled()
+    expect(message.error).toHaveBeenCalled()
+    expect(message.success).not.toHaveBeenCalled()
+
+    wrapper.unmount()
+  })
+
+  it('move: shows success when sftp move succeeds', async () => {
+    const { message } = await import('ant-design-vue')
+
+    api.sshSftpList.mockResolvedValueOnce([
+      {
+        name: 'a',
+        path: '/a',
+        isDir: true,
+        mode: '0755',
+        isLink: false,
+        modTime: '',
+        size: 0
+      }
+    ] as any)
+
+    const wrapper = mountView({ currentDirectoryInput: '/' })
+    await flushPromises()
+
+    const vm = wrapper.vm as any
+    const record = vm.files.find((x: any) => x.name === 'a')
+    expect(record).toBeTruthy()
+
+    vi.mocked(message.success).mockClear()
+    vi.mocked(message.error).mockClear()
+    vi.mocked(api.copyOrMoveBySftp).mockResolvedValueOnce({
+      status: 'success',
+      path: '/dest/a3'
+    })
+    api.sshSftpList.mockResolvedValueOnce([] as any)
+
+    vm.moveFile(record)
+    await vm.copyOrMoveModalOk('/dest/a3')
+    await flushPromises()
+    expect(api.copyOrMoveBySftp).toHaveBeenCalledWith({
+      id: 'localhost@127.0.0.1:local',
+      srcPath: '/a',
+      targetPath: '/dest/a3',
+      action: 'move'
+    })
+    expect(message.success).toHaveBeenCalled()
+    expect(message.error).not.toHaveBeenCalled()
+
+    wrapper.unmount()
+  })
+
+  it('chmod: parsePermissions + chmodOk success/fail/catch + permission code watcher', async () => {
+    const { message } = await import('ant-design-vue')
+
+    api.sshSftpList.mockResolvedValueOnce([{ name: 'a.txt', path: '/a.txt', isDir: false, mode: '0644', isLink: false, modTime: '', size: 1 }] as any)
+
+    const wrapper = mountView()
+    await flushPromises()
+    const vm = wrapper.vm as any
+    const record = vm.files.find((x: any) => x.name === 'a.txt')
+
+    vm.chmodFile(record)
+    expect(vm.permissions.code).toBe('0644')
+    expect(vm.permissions.owner.includes('read')).toBe(true)
+
+    // watcher: tweak permissions -> code updates
+    vm.permissions.public = ['read', 'write']
+    await flushPromises()
+    expect(vm.permissions.code).toMatch(/\d{3}/)
+
+    // success
+    api.chmodFile.mockResolvedValueOnce({ status: 'success' })
+    api.sshSftpList.mockResolvedValueOnce([] as any)
+    await vm.chmodOk()
+    await flushPromises()
+    expect(api.chmodFile).toHaveBeenCalled()
+    // refresh called on success
+    expect(api.sshSftpList).toHaveBeenCalled()
+
+    // fail
+    vm.chmodFile(record)
+    api.chmodFile.mockResolvedValueOnce({ status: 'failed', message: 'nope' })
+    await vm.chmodOk()
+    await flushPromises()
+    expect(message.error).toHaveBeenCalled()
+
+    // catch
+    vm.chmodFile(record)
+    api.chmodFile.mockRejectedValueOnce(new Error('boom'))
+    await vm.chmodOk()
+    await flushPromises()
+    expect(message.error).toHaveBeenCalled()
+
+    wrapper.unmount()
+  })
+
+  it('dropdown/hover logic: enter/leave/visible/menu click clears timers and state', async () => {
+    vi.useFakeTimers()
+
+    api.sshSftpList.mockResolvedValueOnce([] as any)
+    const wrapper = mountView()
+    await flushPromises()
+
+    const vm = wrapper.vm as any
+
+    // enter row
+    vm.handleRowMouseEnter('row1')
+    expect(vm.currentHoverRow).toBe('row1')
+
+    // open dropdown locks hover
+    vm.handleDropdownVisibleChange(true, 'row1')
+    expect(vm.dropdownVisible['row1']).toBe(true)
+
+    // leaving row with dropdown open schedules close
+    vm.handleRowMouseLeave('row1')
+    vi.advanceTimersByTime(100)
+    await flushPromises()
+
+    // after timer it should be closed and hover cleared
+    expect(vm.dropdownVisible['row1']).toBe(false)
+
+    // dropdown menu enter forces hover
+    vm.handleDropdownVisibleChange(true, 'row2')
+    vm.handleDropdownMenuEnter('row2')
+    expect(vm.mouseInDropdown['row2']).toBe(true)
+    expect(vm.currentHoverRow).toBe('row2')
+
+    // menu leave closes dropdown and clears hover later
+    vm.dropdownVisible['row2'] = false
+    vm.handleDropdownMenuLeave('row2')
+    expect(vm.mouseInDropdown['row2']).toBeFalsy()
+    vi.advanceTimersByTime(100)
+    await flushPromises()
+
+    // menu click clears all
+    vm.dropdownVisible['a'] = true
+    vm.mouseInDropdown['a'] = true
+    vm.currentHoverRow = 'a'
+    vm.handleMenuClick()
+    expect(vm.currentHoverRow).toBe(null)
+    expect(vm.dropdownVisible['a']).toBe(false)
+    expect(vm.mouseInDropdown['a']).toBe(false)
+
+    wrapper.unmount()
+    vi.useRealTimers()
+  })
+
+  it('renameFile: file-not-found branch and delete branch are safe', async () => {
+    api.sshSftpList.mockResolvedValueOnce([] as any)
+    const wrapper = mountView()
+    await flushPromises()
+    const vm = wrapper.vm as any
+
+    // file not found in files.value
+    vm.renameFile({ key: 'missing', name: 'x.txt', path: '/x.txt', isDir: false })
+    expect(vm.editableData['missing']).toBeUndefined()
+
+    // delete branch
+    // create a fake file in list first
+    api.sshSftpList.mockResolvedValueOnce([{ name: 'a.txt', path: '/a.txt', isDir: false, mode: '0644', isLink: false, modTime: '', size: 1 }] as any)
+    await vm.refresh()
+    await flushPromises()
+
+    const record = vm.files.find((x: any) => x.name === 'a.txt')
+    vm.renameFile(record)
+    expect(vm.editableData[record.key]).toBeTruthy()
+    vm.renameFile(record)
+    expect(vm.editableData[record.key]).toBeUndefined()
+
+    wrapper.unmount()
+  })
+
+  it('deleteFile: executes onCancel branch', async () => {
+    const { Modal } = await import('ant-design-vue')
+
+    api.sshSftpList.mockResolvedValueOnce([{ name: 'a.txt', path: '/a.txt', isDir: false, mode: '0644', isLink: false, modTime: '', size: 1 }] as any)
+    const wrapper = mountView()
+    await flushPromises()
+
+    const vm = wrapper.vm as any
+    const record = vm.files.find((x: any) => x.name === 'a.txt')
+
+    vm.deleteFile(record)
+    const cfg = (Modal.confirm as any).mock.calls.at(-1)[0]
+    expect(typeof cfg.onCancel).toBe('function')
+
+    // onCancel should set deleteFileDialog false
+    vm.deleteFileDialog = true
+    cfg.onCancel()
+    expect(vm.deleteFileDialog).toBe(false)
+
+    wrapper.unmount()
+  })
+
+  it('isTeamCheck returns expected boolean', async () => {
+    api.sshSftpList.mockResolvedValueOnce([] as any)
+    const wrapper = mountView()
+    await flushPromises()
+
+    const vm = wrapper.vm as any
+
+    expect(vm.isTeamCheck('bad-uuid')).toBe(false)
+    expect(vm.isTeamCheck('user@127.0.0.1:local')).toBe(false)
+    expect(vm.isTeamCheck('user@127.0.0.1:local-team')).toBe(true)
+
+    wrapper.unmount()
+  })
+
+  it('chmodOk early return when no currentRecord; chmodCancel clears state', async () => {
+    api.sshSftpList.mockResolvedValueOnce([] as any)
+    const wrapper = mountView()
+    await flushPromises()
+
+    const vm = wrapper.vm as any
+
+    vm.currentRecord = null
+    await vm.chmodOk()
+    expect(api.chmodFile).not.toHaveBeenCalled()
+
+    vm.chmodFileDialog = true
+    vm.currentRecord = { name: 'x', path: '/x', isDir: false }
+    vm.chmodCancel()
+    expect(vm.chmodFileDialog).toBe(false)
+    expect(vm.currentRecord).toBe(null)
+
+    wrapper.unmount()
+  })
+
+  describe('hidden files toggle', () => {
+    const dotFilesListing = [
+      { name: '.bashrc', path: '/home/u/.bashrc', isDir: false, mode: '0644', isLink: false, modTime: '', size: 1 },
+      { name: '.ssh', path: '/home/u/.ssh', isDir: true, mode: '0700', isLink: false, modTime: '', size: 0 },
+      { name: 'notes.txt', path: '/home/u/notes.txt', isDir: false, mode: '0644', isLink: false, modTime: '', size: 2 },
+      { name: 'docs', path: '/home/u/docs', isDir: true, mode: '0755', isLink: false, modTime: '', size: 0 }
+    ]
+
+    it('defaults to showing hidden files (showHidden = true)', async () => {
+      api.sshSftpList.mockResolvedValueOnce(dotFilesListing as any)
+      const wrapper = mountView({ currentDirectoryInput: '/home/u' })
+      await flushPromises()
+
+      const vm = wrapper.vm as any
+      expect(vm.showHidden).toBe(true)
+
+      const names = vm.visibleFiles.map((f: any) => f.name)
+      // includes parent ("..") + dot entries + regular entries
+      expect(names).toContain('..')
+      expect(names).toContain('.bashrc')
+      expect(names).toContain('.ssh')
+      expect(names).toContain('notes.txt')
+      expect(names).toContain('docs')
+
+      wrapper.unmount()
+    })
+
+    it('toggleHidden flips the state and filters dot-prefixed files/dirs while keeping parent ".."', async () => {
+      api.sshSftpList.mockResolvedValueOnce(dotFilesListing as any)
+      const wrapper = mountView({ currentDirectoryInput: '/home/u' })
+      await flushPromises()
+
+      const vm = wrapper.vm as any
+
+      // hide hidden
+      vm.toggleHidden()
+      await flushPromises()
+      expect(vm.showHidden).toBe(false)
+
+      const hiddenOffNames = vm.visibleFiles.map((f: any) => f.name)
+      expect(hiddenOffNames).toContain('..')
+      expect(hiddenOffNames).toContain('docs')
+      expect(hiddenOffNames).toContain('notes.txt')
+      expect(hiddenOffNames).not.toContain('.bashrc')
+      expect(hiddenOffNames).not.toContain('.ssh')
+
+      // underlying files array is NOT mutated
+      const rawNames = vm.files.map((f: any) => f.name)
+      expect(rawNames).toContain('.bashrc')
+      expect(rawNames).toContain('.ssh')
+
+      // toggle back on
+      vm.toggleHidden()
+      await flushPromises()
+      expect(vm.showHidden).toBe(true)
+      const restored = vm.visibleFiles.map((f: any) => f.name)
+      expect(restored).toContain('.bashrc')
+      expect(restored).toContain('.ssh')
+
+      wrapper.unmount()
+    })
+
+    it('visibleFiles stays reactive when files list is reloaded while hidden is off', async () => {
+      api.sshSftpList.mockResolvedValueOnce(dotFilesListing as any)
+      const wrapper = mountView({ currentDirectoryInput: '/home/u' })
+      await flushPromises()
+
+      const vm = wrapper.vm as any
+      vm.toggleHidden()
+      await flushPromises()
+      expect(vm.showHidden).toBe(false)
+
+      // refresh with a new listing that contains a new dot-entry and a new regular entry
+      api.sshSftpList.mockResolvedValueOnce([
+        { name: '.env', path: '/home/u/.env', isDir: false, mode: '0644', isLink: false, modTime: '', size: 3 },
+        { name: 'readme.md', path: '/home/u/readme.md', isDir: false, mode: '0644', isLink: false, modTime: '', size: 4 }
+      ] as any)
+      await vm.refresh()
+      await flushPromises()
+
+      const names = vm.visibleFiles.map((f: any) => f.name)
+      expect(names).toContain('readme.md')
+      expect(names).not.toContain('.env')
+      // parent ".." is injected for non-root paths
+      expect(names).toContain('..')
+
+      wrapper.unmount()
+    })
+
+    it('parent entry ".." is always visible regardless of toggle state', async () => {
+      api.sshSftpList.mockResolvedValueOnce([
+        { name: '.secret', path: '/home/u/.secret', isDir: false, mode: '0600', isLink: false, modTime: '', size: 1 }
+      ] as any)
+      const wrapper = mountView({ currentDirectoryInput: '/home/u' })
+      await flushPromises()
+
+      const vm = wrapper.vm as any
+      // hide
+      vm.toggleHidden()
+      await flushPromises()
+      const names = vm.visibleFiles.map((f: any) => f.name)
+      expect(names).toContain('..')
+      expect(names).not.toContain('.secret')
+
+      wrapper.unmount()
+    })
+
+    it('does nothing visible when there are no dot-prefixed files', async () => {
+      api.sshSftpList.mockResolvedValueOnce([
+        { name: 'a.txt', path: '/home/u/a.txt', isDir: false, mode: '0644', isLink: false, modTime: '', size: 1 },
+        { name: 'b', path: '/home/u/b', isDir: true, mode: '0755', isLink: false, modTime: '', size: 0 }
+      ] as any)
+      const wrapper = mountView({ currentDirectoryInput: '/home/u' })
+      await flushPromises()
+
+      const vm = wrapper.vm as any
+      const before = vm.visibleFiles.map((f: any) => f.name)
+
+      vm.toggleHidden()
+      await flushPromises()
+      const after = vm.visibleFiles.map((f: any) => f.name)
+
+      expect(after).toEqual(before)
+
+      wrapper.unmount()
+    })
+  })
+
+  describe('copyAbsolutePath', () => {
+    const mountWithFile = async (basePath = '') => {
+      api.sshSftpList.mockResolvedValueOnce([
+        { name: 'webshell.pid', path: `${basePath}/tmp/webshell.pid`, isDir: false, mode: '0644', isLink: false, modTime: '', size: 4 }
+      ] as any)
+      const wrapper = mountView({ currentDirectoryInput: '/tmp', basePath })
+      await flushPromises()
+      const vm = wrapper.vm as any
+      const record = vm.files.find((x: any) => x.name === 'webshell.pid')
+      return { wrapper, vm, record }
+    }
+
+    it('copies the path to navigator.clipboard and shows success', async () => {
+      const { message } = await import('ant-design-vue')
+      const writeText = vi.fn().mockResolvedValue(undefined)
+      Object.defineProperty(globalThis.navigator, 'clipboard', {
+        configurable: true,
+        value: { writeText }
+      })
+
+      const { wrapper, vm, record } = await mountWithFile('')
+      vi.mocked(message.success).mockClear()
+      vi.mocked(message.error).mockClear()
+
+      await vm.copyAbsolutePath(record)
+      await flushPromises()
+
+      expect(writeText).toHaveBeenCalledWith('/tmp/webshell.pid')
+      expect(message.success).toHaveBeenCalled()
+      expect(message.error).not.toHaveBeenCalled()
+
+      wrapper.unmount()
+    })
+
+    it('strips basePath prefix before copying', async () => {
+      const writeText = vi.fn().mockResolvedValue(undefined)
+      Object.defineProperty(globalThis.navigator, 'clipboard', {
+        configurable: true,
+        value: { writeText }
+      })
+
+      const { wrapper, vm, record } = await mountWithFile('/Default/ubuntu-GuardianIdcPeer-2486')
+
+      await vm.copyAbsolutePath(record)
+      await flushPromises()
+
+      expect(writeText).toHaveBeenCalledWith('/tmp/webshell.pid')
+
+      wrapper.unmount()
+    })
+
+    it('falls back to execCommand when navigator.clipboard is unavailable', async () => {
+      const { message } = await import('ant-design-vue')
+      Object.defineProperty(globalThis.navigator, 'clipboard', {
+        configurable: true,
+        value: undefined
+      })
+      const execMock = vi.fn().mockReturnValue(true)
+      Object.defineProperty(document, 'execCommand', {
+        configurable: true,
+        writable: true,
+        value: execMock
+      })
+
+      const { wrapper, vm, record } = await mountWithFile('')
+      vi.mocked(message.success).mockClear()
+
+      await vm.copyAbsolutePath(record)
+      await flushPromises()
+
+      expect(execMock).toHaveBeenCalledWith('copy')
+      expect(message.success).toHaveBeenCalled()
+
+      delete (document as any).execCommand
+      wrapper.unmount()
+    })
+
+    it('shows error message when clipboard write throws', async () => {
+      const { message } = await import('ant-design-vue')
+      const writeText = vi.fn().mockRejectedValue(new Error('denied'))
+      Object.defineProperty(globalThis.navigator, 'clipboard', {
+        configurable: true,
+        value: { writeText }
+      })
+
+      const { wrapper, vm, record } = await mountWithFile('')
+      vi.mocked(message.success).mockClear()
+      vi.mocked(message.error).mockClear()
+
+      await vm.copyAbsolutePath(record)
+      await flushPromises()
+
+      expect(message.error).toHaveBeenCalled()
+      expect(message.success).not.toHaveBeenCalled()
+
+      wrapper.unmount()
+    })
+  })
+
+  describe('path helpers', () => {
+    it('renderSize formats bytes/KB/MB and handles 0/null', async () => {
+      api.sshSftpList.mockResolvedValueOnce([] as any)
+      const wrapper = mountView()
+      await flushPromises()
+      const vm = wrapper.vm as any
+
+      expect(vm.renderSize(0)).toBe('0 B')
+      expect(vm.renderSize(null as any)).toBe('0 B')
+      expect(vm.renderSize(512)).toBe('512 B')
+      expect(vm.renderSize(2048)).toBe('2 KB')
+      expect(vm.renderSize(1024 * 1024 * 5)).toBe('5 MB')
+
+      wrapper.unmount()
+    })
+
+    it('fixPath collapses duplicate slashes and passes through clean paths', async () => {
+      api.sshSftpList.mockResolvedValueOnce([] as any)
+      const wrapper = mountView()
+      await flushPromises()
+      const vm = wrapper.vm as any
+
+      expect(vm.fixPath('/a/b')).toBe('/a/b')
+      expect(vm.fixPath('//a///b//c')).toBe('/a/b/c')
+      expect(vm.fixPath('')).toBe('')
+      expect(vm.fixPath(null as any)).toBe(null)
+
+      wrapper.unmount()
+    })
+
+    it('hasDuplicateSlashes detects // and triple slashes', async () => {
+      api.sshSftpList.mockResolvedValueOnce([] as any)
+      const wrapper = mountView()
+      await flushPromises()
+      const vm = wrapper.vm as any
+
+      expect(vm.hasDuplicateSlashes('/a/b')).toBe(false)
+      expect(vm.hasDuplicateSlashes('/a//b')).toBe(true)
+      expect(vm.hasDuplicateSlashes('///')).toBe(true)
+
+      wrapper.unmount()
+    })
+
+    it('removeBasePathInContent strips configured basePath and dedupes slashes', async () => {
+      api.sshSftpList.mockResolvedValueOnce([] as any)
+      const wrapper = mountView({ basePath: '/Default/host-1' })
+      await flushPromises()
+      const vm = wrapper.vm as any
+
+      expect(vm.removeBasePathInContent('/Default/host-1/tmp/x.pid')).toBe('/tmp/x.pid')
+      // basePath occurring multiple times all stripped
+      expect(vm.removeBasePathInContent('/Default/host-1//Default/host-1/x')).toBe('/x')
+      // unrelated path unchanged
+      expect(vm.removeBasePathInContent('/var/log/y')).toBe('/var/log/y')
+
+      wrapper.unmount()
+    })
+
+    it('isWindowsDriveRoot recognizes drive roots and rejects others', async () => {
+      api.sshSftpList.mockResolvedValueOnce([] as any)
+      const wrapper = mountView()
+      await flushPromises()
+      const vm = wrapper.vm as any
+
+      expect(vm.isWindowsDriveRoot('C:/')).toBe(true)
+      expect(vm.isWindowsDriveRoot('C:')).toBe(true)
+      expect(vm.isWindowsDriveRoot('c:\\')).toBe(true)
+      expect(vm.isWindowsDriveRoot('/home')).toBe(false)
+      expect(vm.isWindowsDriveRoot('C:/Users')).toBe(false)
+
+      wrapper.unmount()
+    })
+
+    it('normalizeSlashes converts backslashes to forward slashes', async () => {
+      api.sshSftpList.mockResolvedValueOnce([] as any)
+      const wrapper = mountView()
+      await flushPromises()
+      const vm = wrapper.vm as any
+
+      expect(vm.normalizeSlashes('C:\\Users\\a')).toBe('C:/Users/a')
+      expect(vm.normalizeSlashes('/a/b')).toBe('/a/b')
+      expect(vm.normalizeSlashes(null as any)).toBe('')
+
+      wrapper.unmount()
+    })
+
+    it('isLocalId detects the local sentinel uuid', async () => {
+      api.sshSftpList.mockResolvedValueOnce([] as any)
+      const wrapper = mountView()
+      await flushPromises()
+      const vm = wrapper.vm as any
+
+      expect(vm.isLocalId('localhost@127.0.0.1:local')).toBe(true)
+      expect(vm.isLocalId('localhost@127.0.0.1:local-team')).toBe(true)
+      expect(vm.isLocalId('user@10.0.0.1:22')).toBe(false)
+      expect(vm.isLocalId('')).toBe(false)
+      expect(vm.isLocalId(undefined as any)).toBe(false)
+
+      wrapper.unmount()
+    })
+
+    it('getDirname returns parent directory and handles roots', async () => {
+      api.sshSftpList.mockResolvedValueOnce([] as any)
+      const wrapper = mountView()
+      await flushPromises()
+      const vm = wrapper.vm as any
+
+      expect(vm.getDirname('/a/b/c')).toBe('/a/b')
+      expect(vm.getDirname('/a')).toBe('/')
+      expect(vm.getDirname('plain')).toBe('plain')
+      expect(vm.getDirname('C:/')).toBe('C:/')
+      expect(vm.getDirname('C:\\Users\\a')).toBe('C:/Users')
+
+      wrapper.unmount()
+    })
+
+    it('joinPath joins parts and collapses duplicate slashes', async () => {
+      api.sshSftpList.mockResolvedValueOnce([] as any)
+      const wrapper = mountView()
+      await flushPromises()
+      const vm = wrapper.vm as any
+
+      expect(vm.joinPath('/a', 'b', 'c')).toBe('/a/b/c')
+      expect(vm.joinPath('/a/', '/b/', '/c')).toBe('/a/b/c')
+      expect(vm.joinPath('a', '', 'b')).toBe('a/b')
+
+      wrapper.unmount()
+    })
+
+    it('getLoadFilePath strips basePath prefix and falls back to "/"', async () => {
+      api.sshSftpList.mockResolvedValueOnce([] as any)
+      const wrapper = mountView({ basePath: '/Default/host-1' })
+      await flushPromises()
+      const vm = wrapper.vm as any
+
+      expect(vm.getLoadFilePath('/Default/host-1/tmp')).toBe('/tmp')
+      expect(vm.getLoadFilePath('/Default/host-1')).toBe('/')
+      // unrelated path passes through unchanged
+      expect(vm.getLoadFilePath('/var/log')).toBe('/var/log')
+
+      wrapper.unmount()
+    })
+
+    it('falls back from a missing JumpServer user directory to the asset root and hides parent navigation', async () => {
+      api.sshSftpList
+        .mockResolvedValueOnce(["cannot open directory '/Default/host-1/home/deploy': No such file or directory"] as any)
+        .mockResolvedValueOnce([{ name: 'tmp', path: '/Default/host-1/tmp', isDir: true, mode: '0755', isLink: false, modTime: '', size: 0 }] as any)
+
+      const wrapper = mountView({
+        basePath: '/Default/host-1',
+        currentDirectoryInput: '/home/deploy',
+        fallbackPath: '/Default'
+      })
+      await flushPromises()
+      const vm = wrapper.vm as any
+
+      expect(api.sshSftpList).toHaveBeenNthCalledWith(1, { path: '/Default/host-1/home/deploy', id: 'localhost@127.0.0.1:local' })
+      expect(api.sshSftpList).toHaveBeenNthCalledWith(2, { path: '/Default/host-1', id: 'localhost@127.0.0.1:local' })
+      expect(vm.localCurrentDirectoryInput).toBe('/')
+      expect(vm.files.map((x: any) => x.name)).toEqual(['tmp'])
+
+      const before = api.sshSftpList.mock.calls.length
+      vm.rollback()
+      await flushPromises()
+      expect(api.sshSftpList.mock.calls.length).toBe(before)
+
+      wrapper.unmount()
+    })
+
+    it('treats JumpServer Operation failed on the initial user directory as unavailable and falls back to the asset root', async () => {
+      api.sshSftpList
+        .mockResolvedValueOnce(["cannot open directory '/Default/host-1/home/zhishang_hu': Operation failed"] as any)
+        .mockResolvedValueOnce([{ name: 'tmp', path: '/Default/host-1/tmp', isDir: true, mode: '0755', isLink: false, modTime: '', size: 0 }] as any)
+
+      const wrapper = mountView({
+        basePath: '/Default/host-1',
+        currentDirectoryInput: '/home/zhishang_hu',
+        fallbackPath: '/Default'
+      })
+      await flushPromises()
+      const vm = wrapper.vm as any
+
+      expect(api.sshSftpList).toHaveBeenNthCalledWith(1, { path: '/Default/host-1/home/zhishang_hu', id: 'localhost@127.0.0.1:local' })
+      expect(api.sshSftpList).toHaveBeenNthCalledWith(2, { path: '/Default/host-1', id: 'localhost@127.0.0.1:local' })
+      expect(vm.localCurrentDirectoryInput).toBe('/')
+      expect(vm.showErr).toBe(false)
+
+      wrapper.unmount()
+    })
+
+    it('falls back to the JumpServer rootPath when the asset root is also missing', async () => {
+      api.sshSftpList
+        .mockResolvedValueOnce(["cannot open directory '/Default/missing-host/home/deploy': No such file or directory"] as any)
+        .mockResolvedValueOnce(["cannot open directory '/Default/missing-host': No such file or directory"] as any)
+        .mockResolvedValueOnce([{ name: 'Default', path: '/Default', isDir: true, mode: '0755', isLink: false, modTime: '', size: 0 }] as any)
+
+      const wrapper = mountView({
+        basePath: '/Default/missing-host',
+        currentDirectoryInput: '/home/deploy',
+        fallbackPath: '/Default'
+      })
+      await flushPromises()
+      const vm = wrapper.vm as any
+
+      expect(api.sshSftpList).toHaveBeenNthCalledWith(3, { path: '/Default', id: 'localhost@127.0.0.1:local' })
+      expect(vm.basePath).toBe('')
+      expect(vm.localCurrentDirectoryInput).toBe('/Default')
+
+      wrapper.unmount()
+    })
+
+    it('sortByName sorts case-insensitively and keeps equal names stable', async () => {
+      api.sshSftpList.mockResolvedValueOnce([] as any)
+      const wrapper = mountView()
+      await flushPromises()
+      const vm = wrapper.vm as any
+
+      const a = { name: 'apple' } as any
+      const b = { name: 'Banana' } as any
+      const c = { name: 'apple' } as any
+      expect(vm.sortByName(a, b)).toBe(-1)
+      expect(vm.sortByName(b, a)).toBe(1)
+      expect(vm.sortByName(a, c)).toBe(0)
+
+      wrapper.unmount()
+    })
+  })
+
+  describe('rowClick / refresh / rollback', () => {
+    it('reloads when currentDirectoryInput prop changes and ignores stale earlier failures', async () => {
+      const firstLoad = createDeferred<any>()
+      api.sshSftpList.mockImplementationOnce(() => firstLoad.promise)
+      api.sshSftpList.mockResolvedValueOnce([
+        { name: 'ok.txt', path: '/home/test_sftp/ok.txt', isDir: false, mode: '0644', isLink: false, modTime: '', size: 1 }
+      ] as any)
+
+      const wrapper = mountView({ currentDirectoryInput: '/home/zhishang_hu' })
+      await flushPromises()
+
+      await wrapper.setProps({ currentDirectoryInput: '/home/test_sftp' })
+      await flushPromises()
+
+      firstLoad.resolve(["cannot open directory '/home/zhishang_hu': JumpServer SFTP connection failed"] as any)
+      await flushPromises()
+
+      const vm = wrapper.vm as any
+      expect(api.sshSftpList).toHaveBeenNthCalledWith(1, { path: '/home/zhishang_hu', id: 'localhost@127.0.0.1:local' })
+      expect(api.sshSftpList).toHaveBeenNthCalledWith(2, { path: '/home/test_sftp', id: 'localhost@127.0.0.1:local' })
+      expect(vm.localCurrentDirectoryInput).toBe('/home/test_sftp')
+      expect(vm.showErr).toBe(false)
+      expect(vm.files.map((x: any) => x.name)).toContain('ok.txt')
+
+      wrapper.unmount()
+    })
+
+    it('shows an error when the user clicks into a forbidden directory after connection succeeds', async () => {
+      api.sshSftpList
+        .mockResolvedValueOnce([
+          { name: 'secret', path: '/Default/host-1/root/secret', isDir: true, mode: '0000', isLink: false, modTime: '', size: 0 }
+        ] as any)
+        .mockResolvedValueOnce(["cannot open directory '/Default/host-1/root/secret': Operation failed"] as any)
+
+      const wrapper = mountView({
+        basePath: '/Default/host-1',
+        currentDirectoryInput: '/root',
+        fallbackPath: '/Default'
+      })
+      await flushPromises()
+      const vm = wrapper.vm as any
+
+      vm.rowClick({ name: 'secret', path: '/Default/host-1/root/secret', isDir: true, isLink: false })
+      await flushPromises()
+
+      expect(vm.localCurrentDirectoryInput).toBe('/root/secret')
+      expect(vm.showErr).toBe(true)
+      expect(vm.errTips).toBe("cannot open directory '/root/secret': Operation failed")
+
+      wrapper.unmount()
+    })
+
+    it('shows an error when the user manually inputs a forbidden directory', async () => {
+      api.sshSftpList
+        .mockResolvedValueOnce([] as any)
+        .mockResolvedValueOnce(["cannot open directory '/Default/host-1/root/secret': Operation failed"] as any)
+
+      const wrapper = mountView({
+        basePath: '/Default/host-1',
+        currentDirectoryInput: '/root',
+        fallbackPath: '/Default'
+      })
+      await flushPromises()
+      const vm = wrapper.vm as any
+
+      vm.localCurrentDirectoryInput = '/root/secret'
+      vm.handleRefresh()
+      await flushPromises()
+
+      expect(vm.localCurrentDirectoryInput).toBe('/root/secret')
+      expect(vm.showErr).toBe(true)
+      expect(vm.errTips).toBe("cannot open directory '/root/secret': Operation failed")
+
+      wrapper.unmount()
+    })
+
+    it('rowClick on directory loads new path; on file does nothing', async () => {
+      api.sshSftpList.mockResolvedValueOnce([
+        { name: 'sub', path: '/home/sub', isDir: true, mode: '0755', isLink: false, modTime: '', size: 0 },
+        { name: 'a.txt', path: '/home/a.txt', isDir: false, mode: '0644', isLink: false, modTime: '', size: 1 }
+      ] as any)
+      const wrapper = mountView({ currentDirectoryInput: '/home' })
+      await flushPromises()
+      const vm = wrapper.vm as any
+
+      api.sshSftpList.mockResolvedValueOnce([] as any)
+      vm.rowClick({ name: 'sub', path: '/home/sub', isDir: true, isLink: false })
+      await flushPromises()
+      expect(api.sshSftpList).toHaveBeenLastCalledWith({ path: '/home/sub', id: 'localhost@127.0.0.1:local' })
+
+      const before = api.sshSftpList.mock.calls.length
+      vm.rowClick({ name: 'a.txt', path: '/home/a.txt', isDir: false, isLink: false })
+      await flushPromises()
+      expect(api.sshSftpList.mock.calls.length).toBe(before)
+
+      wrapper.unmount()
+    })
+
+    it('rowClick on ".." navigates to the parent directory', async () => {
+      api.sshSftpList.mockResolvedValueOnce([] as any)
+      const wrapper = mountView({ currentDirectoryInput: '/home/u' })
+      await flushPromises()
+      const vm = wrapper.vm as any
+
+      api.sshSftpList.mockResolvedValueOnce([] as any)
+      vm.rowClick({ name: '..', path: '..', isDir: true, isLink: false })
+      await flushPromises()
+
+      expect(api.sshSftpList).toHaveBeenLastCalledWith({ path: '/home', id: 'localhost@127.0.0.1:local' })
+
+      wrapper.unmount()
+    })
+
+    it('rowClick on ".." does nothing at Windows drive root', async () => {
+      api.sshSftpList.mockResolvedValueOnce([] as any)
+      const wrapper = mountView({ currentDirectoryInput: 'C:/' })
+      await flushPromises()
+      const vm = wrapper.vm as any
+
+      const before = api.sshSftpList.mock.calls.length
+      vm.rowClick({ name: '..', path: '..', isDir: true, isLink: false })
+      await flushPromises()
+      expect(api.sshSftpList.mock.calls.length).toBe(before)
+
+      wrapper.unmount()
+    })
+
+    it('refresh and handleRefresh re-fetch the current directory', async () => {
+      api.sshSftpList.mockResolvedValueOnce([] as any)
+      const wrapper = mountView({ currentDirectoryInput: '/etc' })
+      await flushPromises()
+      const vm = wrapper.vm as any
+
+      api.sshSftpList.mockResolvedValueOnce([] as any)
+      vm.refresh()
+      await flushPromises()
+      expect(api.sshSftpList).toHaveBeenLastCalledWith({ path: '/etc', id: 'localhost@127.0.0.1:local' })
+
+      api.sshSftpList.mockResolvedValueOnce([] as any)
+      vm.handleRefresh()
+      await flushPromises()
+      expect(api.sshSftpList).toHaveBeenLastCalledWith({ path: '/etc', id: 'localhost@127.0.0.1:local' })
+
+      wrapper.unmount()
+    })
+
+    it('rollback navigates to the parent directory', async () => {
+      api.sshSftpList.mockResolvedValueOnce([] as any)
+      const wrapper = mountView({ currentDirectoryInput: '/etc/nginx' })
+      await flushPromises()
+      const vm = wrapper.vm as any
+
+      api.sshSftpList.mockResolvedValueOnce([] as any)
+      vm.rollback()
+      await flushPromises()
+      expect(api.sshSftpList).toHaveBeenLastCalledWith({ path: '/etc', id: 'localhost@127.0.0.1:local' })
+
+      wrapper.unmount()
+    })
+  })
+
+  describe('chmod permissions math', () => {
+    it('parsePermissions decodes a 4-digit mode string', async () => {
+      api.sshSftpList.mockResolvedValueOnce([
+        { name: 'a.txt', path: '/a.txt', isDir: false, mode: '0750', isLink: false, modTime: '', size: 1 }
+      ] as any)
+      const wrapper = mountView()
+      await flushPromises()
+      const vm = wrapper.vm as any
+
+      vm.chmodFile(vm.files.find((x: any) => x.name === 'a.txt'))
+      expect(vm.permissions.owner).toEqual(['read', 'write', 'execute'])
+      expect(vm.permissions.group).toEqual(['read', 'execute'])
+      expect(vm.permissions.public).toEqual([])
+
+      wrapper.unmount()
+    })
+
+    it('calculatePermissionCode encodes selected boxes back to a 3-digit code', async () => {
+      api.sshSftpList.mockResolvedValueOnce([] as any)
+      const wrapper = mountView()
+      await flushPromises()
+      const vm = wrapper.vm as any
+
+      vm.permissions.owner = ['read', 'write', 'execute']
+      vm.permissions.group = ['read', 'execute']
+      vm.permissions.public = ['read']
+      expect(vm.calculatePermissionCode()).toBe('754')
+
+      vm.permissions.owner = []
+      vm.permissions.group = []
+      vm.permissions.public = []
+      expect(vm.calculatePermissionCode()).toBe('000')
+
+      wrapper.unmount()
+    })
+  })
+
+  describe('error and edge cases', () => {
+    it('loadFiles surfaces error string returned by api as errTips', async () => {
+      api.sshSftpList.mockResolvedValueOnce(['Permission denied: /Default/host-1/secret'] as any)
+      const wrapper = mountView({ basePath: '/Default/host-1', currentDirectoryInput: '/secret' })
+      await flushPromises()
+      const vm = wrapper.vm as any
+
+      expect(vm.showErr).toBe(true)
+      expect(vm.errTips).toBe('Permission denied: /secret')
+
+      wrapper.unmount()
+    })
+
+    it('copy: shows success when sftp copy succeeds', async () => {
+      const { message } = await import('ant-design-vue')
+
+      api.sshSftpList.mockResolvedValueOnce([{ name: 'a', path: '/a', isDir: true, mode: '0755', isLink: false, modTime: '', size: 0 }] as any)
+      const wrapper = mountView({ currentDirectoryInput: '/' })
+      await flushPromises()
+      const vm = wrapper.vm as any
+      const record = vm.files.find((x: any) => x.name === 'a')
+
+      vi.mocked(message.success).mockClear()
+      vi.mocked(message.error).mockClear()
+
+      api.copyOrMoveBySftp.mockResolvedValueOnce({ status: 'success' })
+      api.sshSftpList.mockResolvedValueOnce([] as any)
+
+      vm.copyFile(record)
+      await vm.copyOrMoveModalOk('/dest/a')
+      await flushPromises()
+
+      expect(api.copyOrMoveBySftp).toHaveBeenCalledWith({
+        id: 'localhost@127.0.0.1:local',
+        srcPath: '/a',
+        targetPath: '/dest/a',
+        action: 'copy'
+      })
+      expect(message.success).toHaveBeenCalled()
+      expect(message.error).not.toHaveBeenCalled()
+
+      wrapper.unmount()
+    })
+
+    it('copy: shows error when sftp returns non-success status', async () => {
+      const { message } = await import('ant-design-vue')
+
+      api.sshSftpList.mockResolvedValueOnce([{ name: 'a', path: '/a', isDir: true, mode: '0755', isLink: false, modTime: '', size: 0 }] as any)
+      const wrapper = mountView({ currentDirectoryInput: '/' })
+      await flushPromises()
+      const vm = wrapper.vm as any
+      const record = vm.files.find((x: any) => x.name === 'a')
+
+      vi.mocked(message.success).mockClear()
+      vi.mocked(message.error).mockClear()
+
+      api.copyOrMoveBySftp.mockResolvedValueOnce({ status: 'failed', message: 'nope' })
+
+      vm.copyFile(record)
+      await vm.copyOrMoveModalOk('/dest/a')
+      await flushPromises()
+
+      expect(message.error).toHaveBeenCalled()
+      expect(message.success).not.toHaveBeenCalled()
+
+      wrapper.unmount()
+    })
+
+    it('copyOrMoveModalOk returns early when there is no current record', async () => {
+      api.sshSftpList.mockResolvedValueOnce([] as any)
+      const wrapper = mountView()
+      await flushPromises()
+      const vm = wrapper.vm as any
+
+      vm.currentRecord = null
+      await vm.copyOrMoveModalOk('/dest/x')
+      expect(api.copyOrMoveBySftp).not.toHaveBeenCalled()
+
+      wrapper.unmount()
+    })
+  })
+})

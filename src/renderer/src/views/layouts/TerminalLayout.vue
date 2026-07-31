@@ -1,0 +1,3793 @@
+<template>
+  <a-watermark v-bind="watermarkContent">
+    <div
+      v-if="contextMenu.visible"
+      ref="contextMenuRef"
+      class="context-menu"
+      :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }"
+      @click.stop
+    >
+      <div
+        class="context-menu-item"
+        @click="() => closeCurrentPanel()"
+      >
+        <span>{{ $t('common.close') }}</span>
+      </div>
+      <div
+        class="context-menu-item"
+        @click="closeOtherPanelsAllGroups"
+      >
+        <span>{{ $t('common.closeOther') }}</span>
+      </div>
+      <div
+        class="context-menu-item"
+        @click="closeAllPanels"
+      >
+        <span>{{ $t('common.closeAll') }}</span>
+      </div>
+      <div
+        class="context-menu-item"
+        @click="renamePanelInline"
+      >
+        <span>{{ $t('common.rename') }}</span>
+      </div>
+      <div
+        class="context-menu-item"
+        @click="createNewPanel(true, 'within')"
+      >
+        <span>{{ $t('common.clone') }}</span>
+      </div>
+      <div
+        v-if="canForkSshChannel"
+        class="context-menu-item"
+        @click="forkSshChannel"
+      >
+        <span>{{ $t('common.forkSsh') }}</span>
+      </div>
+      <div
+        class="context-menu-item"
+        @click="createNewPanel(false, 'right')"
+      >
+        <span>{{ $t('common.splitRight') }}</span>
+      </div>
+      <div
+        class="context-menu-item"
+        @click="createNewPanel(false, 'below')"
+      >
+        <span>{{ $t('common.splitDown') }}</span>
+      </div>
+    </div>
+    <div
+      v-if="renaming"
+      :style="{
+        position: 'fixed',
+        left: renameRect.x + 'px',
+        top: renameRect.y + 'px',
+        width: renameRect.width + 'px',
+        height: renameRect.height + 'px',
+        zIndex: 9999,
+        display: 'flex',
+        alignItems: 'stretch'
+      }"
+    >
+      <input
+        ref="renameInputRef"
+        v-model="renamingTitle"
+        class="tab-title-input"
+        style="width: 100%; height: 100%; box-sizing: border-box; padding: 0 6px"
+        @blur="finishRename"
+        @keyup.enter="finishRename"
+        @keyup.esc="cancelRename"
+      />
+    </div>
+    <div
+      class="terminal-layout"
+      :class="{ 'transparent-bg': isTransparent, 'agents-mode': props.currentMode === 'agents' }"
+    >
+      <div
+        class="term_header"
+        data-onboarding-id="top-layout-controls"
+      >
+        <Header
+          ref="headerRef"
+          @toggle-sidebar="toggleSideBar"
+          @mode-change="handleModeChange"
+        ></Header>
+      </div>
+      <div class="term_body">
+        <!-- Agents Mode Layout -->
+        <div
+          class="agents-mode-layout"
+          :style="getLayoutStyle('agents')"
+        >
+          <div class="term_content">
+            <splitpanes
+              class="left-sidebar-container"
+              @resize="(params: ResizeParams) => handleLeftPaneResize(params)"
+            >
+              <pane
+                class="agents_content_left"
+                :class="{ collapsed: agentsLeftPaneSize <= 0 }"
+                :size="agentsLeftPaneSize"
+                :min-size="leftMinSize"
+              >
+                <AgentsSidebar
+                  @conversation-select="handleConversationSelect"
+                  @new-chat="handleNewChat"
+                  @conversation-delete="handleConversationDelete"
+                />
+              </pane>
+              <pane
+                :size="100 - agentsLeftPaneSize"
+                :min-size="aiMinSize"
+              >
+                <div class="agents-chat-container">
+                  <AiTab
+                    v-if="props.currentMode === 'agents'"
+                    ref="aiTabRef"
+                    :toggle-sidebar="() => {}"
+                    :saved-state="savedAiSidebarState || undefined"
+                    :is-agent-mode="true"
+                    @state-changed="handleAiTabStateChanged"
+                  />
+                </div>
+              </pane>
+            </splitpanes>
+          </div>
+        </div>
+        <!-- Terminal Mode Layout -->
+        <div
+          class="terminal-mode-layout"
+          :style="getLayoutStyle('terminal')"
+        >
+          <div
+            class="term_left_menu"
+            data-onboarding-id="left-module-switcher"
+          >
+            <LeftTab
+              @toggle-menu="toggleMenu"
+              @open-user-tab="openUserTab"
+            ></LeftTab>
+          </div>
+          <div class="term_content">
+            <!-- Database workspace mode: replaces terminal dock + AI sidebar -->
+            <div
+              v-if="currentMenu === 'database'"
+              class="database-workspace-mode"
+            >
+              <Database />
+            </div>
+            <!-- Normal splitpanes layout for all other menus -->
+            <splitpanes
+              v-else
+              class="left-sidebar-container"
+              @resize="(params: ResizeParams) => handleLeftPaneResize(params)"
+            >
+              <pane
+                class="term_content_left"
+                :class="{ collapsed: leftPaneSize <= 0 }"
+                :size="leftPaneSize"
+                :min-size="leftMinSize"
+                :max-size="50"
+                data-onboarding-id="left-function-panel"
+              >
+                <Workspace
+                  v-if="currentMenu == 'workspace'"
+                  :toggle-sidebar="toggleSideBar"
+                  @change-company="changeCompany"
+                  @current-click-server="currentClickServer"
+                  @open-user-tab="openUserTab"
+                />
+                <Extensions
+                  v-else-if="currentMenu == 'extensions'"
+                  :toggle-sidebar="toggleSideBar"
+                  @open-user-tab="openUserTab"
+                />
+                <Assets
+                  v-else-if="currentMenu == 'assets'"
+                  ref="assetsRef"
+                  :toggle-sidebar="toggleSideBar"
+                  @open-user-tab="openUserTab"
+                />
+                <Files
+                  v-else-if="currentMenu == 'files'"
+                  :toggle-sidebar="toggleSideBar"
+                  @open-user-tab="openUserTab"
+                />
+                <Snippets
+                  v-else-if="currentMenu == 'snippets'"
+                  :get-active-dock-terminal-tab-id="getActiveDockTerminalTabId"
+                />
+                <KnowledgeCenter v-else-if="currentMenu == 'knowledgecenter'" />
+                <K8sTerminal v-else-if="currentMenu == 'k8s-explorer' || currentMenu == 'kubernetes'" />
+
+                <ExtensionViewHost
+                  v-else
+                  :view-id="currentMenu"
+                  @open-user-tab="openUserTab"
+                />
+              </pane>
+              <pane :size="100 - leftPaneSize">
+                <splitpanes
+                  class="main-split-container"
+                  @resize="onMainSplitResize"
+                >
+                  <!-- Main terminal area (including vertical split) -->
+                  <pane
+                    :size="mainTerminalSize"
+                    :min-size="30"
+                  >
+                    <!-- Vertical split container, only affects main terminal area -->
+                    <splitpanes
+                      horizontal
+                      @resize="onVerticalSplitResize"
+                    >
+                      <!-- Main terminal window -->
+                      <pane
+                        :size="mainVerticalSize"
+                        :min-size="30"
+                      >
+                        <div
+                          class="main-terminal-area"
+                          :class="{ 'has-preview-actions': isPreviewActionsVisible }"
+                          data-onboarding-id="main-workspace"
+                          @mousedown="handleMainPaneFocus"
+                        >
+                          <div
+                            class="main-workspace-tabs-target"
+                            data-onboarding-id="main-workspace-tabs"
+                          ></div>
+                          <transition name="fade">
+                            <div
+                              v-if="!hasPanels"
+                              class="dashboard-overlay"
+                            >
+                              <Dashboard />
+                            </div>
+                          </transition>
+                          <DockviewVue
+                            v-if="configLoaded"
+                            ref="dockviewRef"
+                            :class="[
+                              currentTheme === 'light' ? 'dockview-theme-light' : 'dockview-theme-dark',
+                              { 'hide-tab-close-button': hideTabCloseButton }
+                            ]"
+                            :disable-tabs-overflow-list="true"
+                            :style="{
+                              width: '100%',
+                              height: '100%',
+                              visibility: hasPanels ? 'visible' : 'hidden'
+                            }"
+                            @ready="onDockReady"
+                          />
+                          <EditorActions
+                            v-if="dockApiInstance"
+                            :dock-api="dockApiInstance"
+                            class="dockview-actions-overlay"
+                          />
+                        </div>
+                      </pane>
+                    </splitpanes>
+                  </pane>
+                  <!-- AI sidebar -->
+                  <pane
+                    v-if="props.currentMode === 'terminal' && showAiSidebar"
+                    :size="aiSidebarSize"
+                    :min-size="aiMinSize"
+                  >
+                    <div
+                      class="rigth-sidebar"
+                      data-onboarding-id="right-ai-sidebar"
+                      tabindex="0"
+                    >
+                      <AiTab
+                        ref="aiTabRef"
+                        :toggle-sidebar="toggleAiSidebar"
+                        :saved-state="savedAiSidebarState || undefined"
+                        @state-changed="handleAiTabStateChanged"
+                      />
+                    </div>
+                  </pane>
+                </splitpanes>
+              </pane>
+            </splitpanes>
+            <div
+              v-if="isShowCommandBar"
+              class="toolbar"
+              :style="{ width: commandBarStyle.width + 'px', left: commandBarStyle.left + 'px' }"
+            >
+              <div
+                v-if="isGlobalInput"
+                class="globalInput"
+              >
+                <div class="broadcast-indicator">
+                  <span class="broadcast-icon">&#128226;</span>
+                  <span class="broadcast-text">{{ t('common.broadcastTo', { count: terminalCount }) }}</span>
+                </div>
+                <a-input
+                  v-model:value="globalInput"
+                  size="small"
+                  class="command-input"
+                  :placeholder="t('common.executeCommandToAllWindows')"
+                  allow-clear
+                  @press-enter="sendGlobalCommand"
+                >
+                </a-input>
+                <button
+                  class="close-btn"
+                  :title="t('common.close')"
+                  @click="closeGlobalInput"
+                >
+                  &times;
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </a-watermark>
+</template>
+<script setup lang="ts">
+interface ResizeParams {
+  prevPane: { size: number }
+  nextPane: { size: number }
+}
+
+import { useI18n } from 'vue-i18n'
+import { userConfigStore } from '@/services/userConfigStoreService'
+import { userConfigStore as piniaUserConfigStore } from '@/store/userConfigStore'
+import { computed, nextTick, onBeforeUnmount, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { Pane, Splitpanes } from 'splitpanes'
+import 'splitpanes/dist/splitpanes.css'
+import AiTab from '@views/components/AiTab/index.vue'
+import { isImageFile } from '@views/components/AiTab/utils'
+import { signalResizeStart } from '@views/components/AiTab/composables/useAutoScroll'
+import Header from '@views/components/Header/index.vue'
+import LeftTab from '@views/components/LeftTab/index.vue'
+import Workspace from '@views/components/Workspace/index.vue'
+import Files from '@views/components/Files/tabIndex.vue'
+import Extensions from '@views/components/Extensions/index.vue'
+import Assets from '@views/components/Assets/index.vue'
+import Database from '@views/components/Database/index.vue'
+import Snippets from '@views/components/LeftTab/config/snippets.vue'
+import KnowledgeCenter from '@views/components/KnowledgeCenter/KnowledgeCenter.vue'
+import K8sTerminal from '@views/k8s/terminal/index.vue'
+import AgentsSidebar from '@views/components/AgentsSidebar/index.vue'
+import TabsPanel from './tabsPanel.vue'
+import ExtensionViewHost from './ExtensionViewHost.vue'
+import EditorActions from './components/EditorActions.vue'
+import { getDockTerminalTabId, getMenuForDockBackedUserTab } from './terminalLayoutNavigation'
+import { v4 as uuidv4 } from 'uuid'
+import { userInfoStore } from '@/store'
+import { aliasConfigStore } from '@/store/aliasConfigStore'
+import { useDatabaseWorkspaceStore } from '@/store/databaseWorkspaceStore'
+import { useOnboardingStore } from '@/store/onboardingStore'
+import eventBus from '@/utils/eventBus'
+import { getActualTheme, initializeThemeFromDatabase } from '@/utils/themeUtils'
+import { componentInstances, inputManager, isGlobalInput, isShowCommandBar } from '@renderer/views/components/Ssh/utils/termInputManager'
+import { getSshConnectionId } from '@renderer/views/components/Ssh/utils/sshConnectionRegistry'
+import { shortcutService } from '@/services/shortcutService'
+import { captureExtensionUsage, ExtensionNames, ExtensionStatus } from '@/utils/telemetry'
+import Dashboard from '@renderer/views/components/Ssh/components/dashboard.vue'
+import { useAiSidebarModelRefresh } from './composables/useAiSidebarModelRefresh'
+import { isFocusInAiTab } from '@/utils/domUtils'
+import { aiTabStorageKey, migrateLegacyAiTabStorage } from '@/views/components/AiTab/workspace'
+import { mark } from '@/utils/perf'
+
+import 'dockview-vue/dist/styles/dockview.css'
+import { type DockviewReadyEvent, DockviewVue } from 'dockview-vue'
+import type { DockviewApi } from 'dockview-core'
+
+const props = defineProps<{
+  currentMode: 'terminal' | 'agents'
+}>()
+
+const { t } = useI18n()
+const logger = createRendererLogger('layout.terminal')
+
+// Computed styles for layout visibility
+const getLayoutStyle = (
+  mode: 'terminal' | 'agents'
+): {
+  visibility: 'visible' | 'hidden'
+  opacity: number
+  pointerEvents: 'auto' | 'none'
+} => {
+  const isVisible = props.currentMode === mode
+  return {
+    visibility: isVisible ? 'visible' : 'hidden',
+    opacity: isVisible ? 1 : 0,
+    pointerEvents: isVisible ? 'auto' : 'none'
+  }
+}
+const aliasConfig = aliasConfigStore()
+const databaseWorkspaceStore = useDatabaseWorkspaceStore()
+const onboardingStore = useOnboardingStore()
+const configStore = piniaUserConfigStore()
+const hideTabCloseButton = ref(false)
+const isTransparent = computed(() => !!configStore.getUserConfig.background.image)
+const headerRef = ref<InstanceType<typeof Header> | null>(null)
+const allTabs = ref<InstanceType<typeof TabsPanel> | null>(null)
+const assetsRef = ref<InstanceType<typeof Assets> | null>(null)
+const isSkippedLogin = computed(() => {
+  return localStorage.getItem('login-skipped') === 'true'
+})
+const watermarkContent = reactive({
+  content: computed(() => {
+    if (!showWatermark.value) {
+      return ['']
+    }
+    if (isSkippedLogin.value) {
+      return ['Guest User']
+    }
+    return [userInfoStore().userInfo.name, userInfoStore().userInfo.email]
+  }),
+  font: {
+    fontSize: 12,
+    color: computed(() => (currentTheme.value === 'dark' ? 'rgba(255, 255, 255, 0.05)' : 'rgba(0, 0, 0, 0.05)'))
+  },
+  rotate: -22,
+  gap: [150, 100] as [number, number]
+})
+
+const leftPaneSize = ref(21.097)
+const agentsLeftPaneSize = ref(27)
+const mainTerminalSize = ref(100)
+const showWatermark = ref(true)
+const currentTheme = ref('dark')
+const aiSidebarSize = ref(0)
+const aiMinSize = ref(0) // AI sidebar minimum size percentage
+const isDraggingSplitter = ref(false) // Whether the splitter is being dragged
+// Left sidebar state variables
+const leftMinSize = ref(0) // Left sidebar minimum size percentage
+const isDraggingLeftSplitter = ref(false) // Whether the left splitter is being dragged
+const savedLeftSidebarState = ref<LeftSidebarState | null>(null) // Saved left sidebar state
+const isQuickClosing = ref(false) // Flag to prevent resize events during quick close
+interface SplitPaneItem {
+  size: number
+  tabs: TabItem[]
+  activeTabId: string
+  verticalSplitPanes?: { size: number; tabs: TabItem[]; activeTabId: string }[]
+  mainVerticalSize?: number
+}
+
+type KbRemovedEntry = { relPath: string; isDir: boolean }
+
+const splitPanes = ref<SplitPaneItem[]>([])
+const showAiSidebar = ref(false)
+const showSplitPane = ref(false)
+const verticalSplitPanes = ref<{ size: number; tabs: TabItem[]; activeTabId: string }[]>([])
+const mainVerticalSize = ref(100)
+const globalInput = ref('')
+const focusedSplitPaneIndex = ref<number | null>(null)
+const focusedPane = ref<{
+  type: 'main' | 'horizontal' | 'vertical' | 'rightVertical'
+  index?: number
+  rightPaneIndex?: number
+}>({ type: 'main' })
+const lastFocusedElement = ref<HTMLElement | null>(null)
+
+interface AiSidebarState {
+  size: number
+  currentChatId: string | null
+  chatTabs: Array<{
+    id: string
+    title: string
+    hosts: any[]
+    chatType: string
+    modelValue: string
+    autoUpdateHost: boolean
+    chatInputParts: any[]
+    welcomeTip?: string
+    agentHosts?: any[]
+    session: {
+      chatHistory: any[]
+      lastChatMessageId: string
+      responseLoading: boolean
+      showSendButton: boolean
+      buttonsDisabled: boolean
+      isExecutingCommand: boolean
+      showRetryButton: boolean
+      shouldStickToBottom?: boolean
+    }
+  }>
+}
+
+interface LeftSidebarState {
+  size: number
+  currentMenu: string
+  isExpanded: boolean
+}
+
+const savedAiSidebarState = ref<AiSidebarState | null>(null)
+const aiTabRef = ref<InstanceType<typeof AiTab> | null>(null)
+useAiSidebarModelRefresh(showAiSidebar, aiTabRef)
+
+const handleAiTabStateChanged = (state: Record<string, unknown>) => {
+  savedAiSidebarState.value = state as unknown as AiSidebarState
+}
+
+const handleKbAddDocToChatRequest = (payload: Array<{ relPath: string; name?: string }>) => {
+  if (!showAiSidebar.value) {
+    toggleSideBar('right')
+  }
+
+  setTimeout(() => {
+    eventBus.emit('kbAddDocToChat', payload)
+  }, 100)
+}
+
+// Handle image add to chat request from knowledge base
+const handleKbAddImageToChatRequest = (payload: { mediaType: string; data: string }) => {
+  if (!showAiSidebar.value) {
+    toggleSideBar('right')
+  }
+
+  setTimeout(() => {
+    eventBus.emit('kbAddImageToChat', payload)
+  }, 100)
+}
+
+const saveAiSidebarState = () => {
+  if (aiTabRef.value) {
+    try {
+      const currentState = aiTabRef.value.getCurrentState?.()
+      if (currentState) {
+        savedAiSidebarState.value = {
+          ...currentState,
+          size: aiSidebarSize.value
+        }
+      } else if (savedAiSidebarState.value) {
+        savedAiSidebarState.value.size = aiSidebarSize.value
+      }
+    } catch (error) {
+      logger.warn('Failed to get AI Tab state', { error: error })
+      if (savedAiSidebarState.value) {
+        savedAiSidebarState.value.size = aiSidebarSize.value
+      }
+    }
+  } else {
+    if (savedAiSidebarState.value) {
+      savedAiSidebarState.value.size = aiSidebarSize.value
+    }
+  }
+}
+
+const savePreviousFocus = () => {
+  const activeElement = document.activeElement as HTMLElement
+  if (activeElement && activeElement !== document.body) {
+    lastFocusedElement.value = activeElement
+  }
+}
+
+const restorePreviousFocus = () => {
+  if (lastFocusedElement.value) {
+    nextTick(() => {
+      try {
+        lastFocusedElement.value?.focus()
+      } catch (error) {
+        logger.warn('Failed to restore focus', { error: error })
+      }
+    })
+  }
+}
+
+// Left sidebar unified management functions
+const getLeftSidebarSize = () => {
+  return props.currentMode === 'agents' ? agentsLeftPaneSize.value : leftPaneSize.value
+}
+
+const setLeftSidebarSize = (size: number) => {
+  if (props.currentMode === 'agents') {
+    agentsLeftPaneSize.value = size
+  } else {
+    leftPaneSize.value = size
+  }
+}
+
+const handleDockviewTabsWheel = (event: WheelEvent) => {
+  const target = event.target
+  if (!(target instanceof Element)) return
+
+  const tabsContainer = target.closest('.dv-tabs-container') as HTMLElement | null
+  if (!tabsContainer) return
+
+  const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY
+  if (delta === 0) return
+
+  const maxScrollLeft = tabsContainer.scrollWidth - tabsContainer.clientWidth
+  if (maxScrollLeft <= 0) return
+
+  const nextScrollLeft = Math.min(Math.max(tabsContainer.scrollLeft + delta, 0), maxScrollLeft)
+  if (nextScrollLeft === tabsContainer.scrollLeft) return
+
+  tabsContainer.scrollLeft = nextScrollLeft
+  event.preventDefault()
+  event.stopPropagation()
+}
+
+// Detect if splitter was clicked
+const handleMouseDown = (e: MouseEvent) => {
+  const target = e.target as HTMLElement
+  if (target.classList.contains('splitpanes__splitter') && target.closest('.main-split-container')) {
+    isDraggingSplitter.value = true
+  }
+  // Detect left sidebar splitter
+  if (target.classList.contains('splitpanes__splitter') && target.closest('.left-sidebar-container')) {
+    isDraggingLeftSplitter.value = true
+  }
+}
+
+// Global mouse move listener
+const handleGlobalMouseMove = (e: MouseEvent) => {
+  // Skip if already quick closing
+  if (isQuickClosing.value) {
+    return
+  }
+
+  // AI sidebar quick close logic
+  if (isDraggingSplitter.value && showAiSidebar.value) {
+    // In Agents mode, do not execute quick close logic
+    if (props.currentMode === 'agents') {
+      return
+    }
+
+    const distFromRight = window.innerWidth - e.clientX
+    // Close threshold: 50px (only in Terminal mode)
+    if (distFromRight < 50) {
+      isQuickClosing.value = true
+
+      // Force end the drag by triggering mouseup on document
+      const mouseUpEvent = new MouseEvent('mouseup', {
+        bubbles: true,
+        cancelable: true,
+        view: window
+      })
+      document.dispatchEvent(mouseUpEvent)
+
+      // Execute close after a short delay to let splitpanes finish its mouseup handling
+      setTimeout(() => {
+        saveAiSidebarState()
+        showAiSidebar.value = false
+        aiSidebarSize.value = 0
+        headerRef.value?.switchIcon('right', false)
+        if (showSplitPane.value) {
+          adjustSplitPaneToEqualWidth()
+        } else {
+          mainTerminalSize.value = 100
+        }
+        restorePreviousFocus()
+        isDraggingSplitter.value = false
+
+        // Reset flag
+        setTimeout(() => {
+          isQuickClosing.value = false
+        }, 100)
+      }, 10)
+    }
+  }
+
+  // Left sidebar sticky resistance and quick close logic
+  if (isDraggingLeftSplitter.value && getLeftSidebarSize() > 0) {
+    const distFromLeft = e.clientX
+    const container = document.querySelector('.left-sidebar-container') as HTMLElement
+    if (!container) return
+
+    // Sticky resistance controlled by CSS min-width
+    // Quick close: < 50px
+    if (distFromLeft < LEFT_QUICK_CLOSE_THRESHOLD_PX) {
+      isQuickClosing.value = true
+
+      // Force end the drag by triggering mouseup on document
+      const mouseUpEvent = new MouseEvent('mouseup', {
+        bubbles: true,
+        cancelable: true,
+        view: window
+      })
+      document.dispatchEvent(mouseUpEvent)
+
+      // Execute close after a short delay to let splitpanes finish its mouseup handling
+      setTimeout(() => {
+        saveLeftSidebarState()
+        setLeftSidebarSize(0)
+        const iconKey = props.currentMode === 'agents' ? 'agentsLeft' : 'left'
+        headerRef.value?.switchIcon(iconKey, false)
+        isDraggingLeftSplitter.value = false
+
+        // Reset flag
+        setTimeout(() => {
+          isQuickClosing.value = false
+        }, 100)
+      }, 10)
+    }
+  }
+}
+
+// Release mouse
+const handleGlobalMouseUp = () => {
+  isDraggingSplitter.value = false
+  isDraggingLeftSplitter.value = false
+}
+
+const focusRightSidebar = () => {
+  nextTick(() => {
+    const chatTextarea = document.querySelector('.rigth-sidebar .chat-textarea')
+    if (chatTextarea) {
+      ;(chatTextarea as HTMLElement).focus()
+    }
+  })
+}
+
+const switchToNextTab = () => {
+  if (!dockApi) {
+    return
+  }
+
+  // Get all panels
+  const panels = dockApi.panels
+
+  if (panels.length <= 1) {
+    return
+  }
+
+  // Get the currently active panel
+  const activePanel = dockApi.activePanel
+
+  if (!activePanel) {
+    if (panels.length > 0) {
+      panels[0].api.setActive()
+    }
+    return
+  }
+
+  // Find the index of the currently active panel
+  const currentIndex = panels.findIndex((panel) => panel.id === activePanel.id)
+
+  if (currentIndex === -1) {
+    return
+  }
+
+  // Calculate the next index (circular)
+  const nextIndex = (currentIndex + 1) % panels.length
+  const nextPanel = panels[nextIndex]
+
+  if (nextPanel) {
+    nextPanel.api.setActive()
+  }
+}
+
+const switchToPrevTab = () => {
+  if (!dockApi) {
+    return
+  }
+
+  const panels = dockApi.panels
+
+  if (panels.length <= 1) {
+    return
+  }
+
+  const activePanel = dockApi.activePanel
+
+  if (!activePanel) {
+    if (panels.length > 0) {
+      panels[panels.length - 1].api.setActive()
+    }
+    return
+  }
+
+  const currentIndex = panels.findIndex((panel) => panel.id === activePanel.id)
+
+  if (currentIndex === -1) {
+    return
+  }
+
+  const previousIndex = (currentIndex - 1 + panels.length) % panels.length
+  const previousPanel = panels[previousIndex]
+
+  if (previousPanel) {
+    previousPanel.api.setActive()
+  }
+}
+
+const switchToSpecificTab = (tabNumber: number) => {
+  if (!dockApi) {
+    return
+  }
+
+  if (tabNumber < 1 || tabNumber > 9) {
+    return
+  }
+
+  if (focusedPane.value.type !== 'main') {
+    focusedPane.value = { type: 'main' }
+    focusedSplitPaneIndex.value = null
+  }
+
+  const panels = dockApi.panels
+
+  if (panels.length < tabNumber) {
+    return
+  }
+
+  const targetIndex = tabNumber - 1
+  const targetPanel = panels[targetIndex]
+
+  if (targetPanel) {
+    switchTab(targetPanel.id)
+  }
+}
+
+const configLoaded = ref(false)
+
+onMounted(async () => {
+  mark('chaterm/renderer/willInitTerminalLayout')
+  const store = piniaUserConfigStore()
+  mark('chaterm/renderer/willLoadShortcuts')
+  await shortcutService.loadShortcuts()
+  mark('chaterm/renderer/didLoadShortcuts')
+
+  const handleCtrlW = (event: KeyboardEvent) => {
+    const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0
+    if (isMac) {
+      return
+    }
+
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'w') {
+      event.preventDefault()
+    }
+  }
+
+  document.addEventListener('keydown', handleCtrlW, true)
+  ;(globalThis as any).__ctrlWHandler = handleCtrlW
+  window.addEventListener('keydown', handleCloseTabKeyDown)
+
+  eventBus.on('updateWatermark', (watermark) => {
+    showWatermark.value = watermark !== 'close'
+  })
+  eventBus.on('updateTheme', (payload) => {
+    // Accept both legacy string ('dark'|'light'|'auto'|...) and the new
+    // ThemeChangePayload ({ themeId, appearance, preset }) shape.
+    const themeId = typeof payload === 'string' ? payload : payload?.themeId
+    if (!themeId) return
+    const actualTheme = getActualTheme(themeId)
+    currentTheme.value = actualTheme
+    if (dockApi) {
+      applyTheme()
+    }
+    // NOTE: do NOT rewrite document.documentElement.className here —
+    // applyThemeToDocument() in the theme pipeline already owns that, and
+    // overwriting it would lose data-theme-id plus any non-default theme class.
+  })
+  try {
+    mark('chaterm/renderer/willLoadTerminalUserConfig')
+    let config = await userConfigStore.getConfig()
+    if (!config.feature || config.feature < 1.0) {
+      config.autoCompleteStatus = 1
+      config.feature = 1.0
+      await userConfigStore.saveConfig(config)
+    }
+    store.setUserConfig(config)
+    configLoaded.value = true
+    currentTheme.value = getActualTheme(config.theme || 'dark')
+    hideTabCloseButton.value = config.showCloseButton === 2
+    mark('chaterm/renderer/didLoadTerminalUserConfig')
+
+    // Delay of 2 seconds to wait for the main thread to complete initializeTelemetrySetting
+    setTimeout(async () => {
+      const extensionStates = [
+        { name: ExtensionNames.AUTO_COMPLETE, enabled: config.autoCompleteStatus === 1 },
+        { name: ExtensionNames.VIM_EDITOR, enabled: config.quickVimStatus === 1 },
+        { name: ExtensionNames.ALIAS, enabled: config.aliasStatus === 1 },
+        { name: ExtensionNames.HIGHLIGHT, enabled: config.highlightStatus === 1 }
+      ]
+
+      for (const extension of extensionStates) {
+        const status = extension.enabled ? ExtensionStatus.ENABLED : ExtensionStatus.DISABLED
+        await captureExtensionUsage(extension.name, status, { trigger: 'app_startup' })
+      }
+    }, 2000)
+
+    nextTick(() => {
+      showWatermark.value = config.watermark !== 'close'
+    })
+  } catch (e) {
+    mark('chaterm/renderer/didFailLoadTerminalUserConfig')
+    currentTheme.value = getActualTheme('dark')
+    nextTick(() => {
+      showWatermark.value = true
+    })
+  }
+  nextTick(() => {
+    updateLeftSidebarMinSize()
+    if (props.currentMode === 'terminal') {
+      updatePaneSize()
+      if (headerRef.value) {
+        headerRef.value.switchIcon('right', showAiSidebar.value)
+        headerRef.value.switchIcon('left', leftPaneSize.value > 0)
+        headerRef.value.setMode(props.currentMode)
+      }
+    } else {
+      if (headerRef.value) {
+        headerRef.value.switchIcon('agentsLeft', agentsLeftPaneSize.value > 0)
+        headerRef.value.setMode(props.currentMode)
+      }
+      // In Agents mode, also need to initialize AI sidebar min-size
+      updateAiSidebarMinSize()
+    }
+  })
+
+  // Restore AI state (unified function since both modes use the same aiTabRef)
+  const restoreAiTabState = async () => {
+    try {
+      // Stage 1 of #18: promote any legacy blob to the terminal-namespaced
+      // key before the first read. Safe to call repeatedly — a no-op once
+      // the legacy key has been removed.
+      migrateLegacyAiTabStorage()
+      const terminalKey = aiTabStorageKey('terminal')
+      const savedStateStr = localStorage.getItem(terminalKey)
+      if (savedStateStr && aiTabRef.value && aiTabRef.value.restoreState) {
+        const savedState = JSON.parse(savedStateStr)
+        // Update savedAiSidebarState to match
+        savedAiSidebarState.value = savedState
+        // Restore state to the unified AiTab instance
+        await nextTick()
+        await aiTabRef.value.restoreState(savedState)
+        // Clear the shared state after restoring to avoid restoring again
+        localStorage.removeItem(terminalKey)
+        return true
+      }
+    } catch (error) {
+      logger.warn('Failed to restore AI Tab state', { error: error })
+      // Clear invalid state
+      localStorage.removeItem(aiTabStorageKey('terminal'))
+    }
+    return false
+  }
+
+  // Watch currentMode changes and sync to Header, also restore AI state when switching modes
+  watch(
+    () => props.currentMode,
+    async (newMode, oldMode) => {
+      if (headerRef.value) {
+        headerRef.value.setMode(newMode)
+      }
+
+      // When switching from agents to terminal, reset layout state
+      if (newMode === 'terminal' && oldMode === 'agents') {
+        await nextTick()
+        // Wait for element to become visible before recalculating
+        setTimeout(async () => {
+          // Reset layout state to ensure proper display
+          const container = document.querySelector('.terminal-mode-layout .splitpanes') as HTMLElement
+          if (container) {
+            const containerWidth = container.offsetWidth
+            // Preserve left pane collapsed state, only recalculate if expanded
+            const wasCollapsed = leftPaneSize.value === 0
+            if (!wasCollapsed) {
+              // Reset left pane size to default only if it was expanded
+              leftPaneSize.value = (DEFAULT_WIDTH_PX / containerWidth) * 100
+              // Update pane size to ensure correct layout
+              updatePaneSize()
+            }
+            // Update header icon state to match left pane state
+            if (headerRef.value) {
+              headerRef.value.switchIcon('left', !wasCollapsed)
+            }
+            // Reset main terminal size based on split panes and AI sidebar state
+            if (showSplitPane.value) {
+              // If there are split panes, adjust them to equal width
+              adjustSplitPaneToEqualWidth()
+            } else {
+              // Otherwise, set main terminal size based on AI sidebar
+              if (showAiSidebar.value) {
+                mainTerminalSize.value = 100 - aiSidebarSize.value
+              } else {
+                mainTerminalSize.value = 100
+              }
+            }
+            // Force resize of terminal components
+            if (allTabs.value) {
+              allTabs.value.resizeTerm()
+            }
+          }
+        }, 50)
+      } else if (newMode === 'agents' && oldMode === 'terminal') {
+        await nextTick()
+        // Initialize agents left pane state
+        if (headerRef.value) {
+          headerRef.value.switchIcon('agentsLeft', agentsLeftPaneSize.value > 0)
+        }
+        // When switching to Agents mode, recalculate AI sidebar min-size
+        updateAiSidebarMinSize()
+        // Update left sidebar min-size
+        updateLeftSidebarMinSize()
+      }
+
+      // Restore AI state after mode switch (unified for both directions since same aiTabRef)
+      // Wait a bit for aiTabRef to be ready after DOM update
+      setTimeout(async () => {
+        await restoreAiTabState()
+        if (newMode === 'agents') {
+          await nextTick()
+          const textarea = document.querySelector('[data-testid="ai-message-input"]') as HTMLTextAreaElement
+          if (textarea) {
+            textarea.scrollTop = textarea.scrollHeight
+            textarea.focus({ preventScroll: true })
+          }
+        }
+      }, 200)
+    },
+    { immediate: false }
+  )
+  window.addEventListener('resize', updatePaneSize)
+  window.addEventListener('resize', updateAiSidebarMinSize)
+  window.addEventListener('resize', updateLeftSidebarMinSize)
+
+  // Register global mouse event listeners for sticky resizing
+  document.addEventListener('mousedown', handleMouseDown)
+  document.addEventListener('mouseup', handleGlobalMouseUp)
+  document.addEventListener('mousemove', handleGlobalMouseMove)
+  document.addEventListener('wheel', handleDockviewTabsWheel, { capture: true, passive: false })
+
+  aliasConfig.initialize()
+
+  // Initialize shortcut service
+  shortcutService.init()
+
+  eventBus.on('showCloseButtonChanged', (checked) => {
+    hideTabCloseButton.value = !checked
+  })
+  eventBus.on('currentClickServer', currentClickServer)
+  eventBus.on('getActiveTabAssetInfo', handleGetActiveTabAssetInfo)
+  eventBus.on('getAllOpenedHosts', handleGetAllOpenedHosts)
+  eventBus.on('toggleSideBar', toggleSideBar)
+  eventBus.on('kbAddDocToChatRequest', handleKbAddDocToChatRequest)
+  eventBus.on('kbAddImageToChatRequest', handleKbAddImageToChatRequest)
+  eventBus.on('createSplitTab', handleCreateSplitTab)
+  eventBus.on('createVerticalSplitTab', handleCreateVerticalSplitTab)
+  eventBus.on('adjustSplitPaneToEqual', adjustSplitPaneToEqualWidth)
+  eventBus.on('sendOrToggleAiFromTerminal', handleSendOrToggleAiFromTerminal)
+  eventBus.on('switchToNextTab', switchToNextTab)
+  eventBus.on('switchToPrevTab', switchToPrevTab)
+  eventBus.on('switchToSpecificTab', switchToSpecificTab)
+  eventBus.on('createNewTerminal', handleCreateNewTerminal)
+  eventBus.on('open-user-tab', openUserTab)
+  eventBus.on('onboarding:openGuideTab', openOnboardingGuideTab)
+  eventBus.on('onboarding:showLeftMenu', showLeftMenuForOnboarding)
+  eventBus.on('kbEntriesRemoved', handleKbEntriesRemoved)
+  eventBus.on('kbFileRenamed', handleKbFileRenamed)
+  eventBus.on('openKbPreview', handleOpenKbPreview)
+  eventBus.on('searchHost', handleSearchHost)
+  eventBus.on('save-state-before-switch', () => {
+    // Save AI state before layout switch (unified since same aiTabRef)
+    if (aiTabRef.value) {
+      try {
+        const currentState = aiTabRef.value.getCurrentState?.()
+        if (currentState) {
+          localStorage.setItem(aiTabStorageKey('terminal'), JSON.stringify(currentState))
+          // Also update savedAiSidebarState for immediate use
+          savedAiSidebarState.value = currentState
+        }
+      } catch (error) {
+        logger.warn('Failed to save AI state before layout switch', { error: error })
+      }
+    }
+  })
+
+  mark('chaterm/renderer/willSetupXshellWakeupBridge')
+  await setupXshellWakeupBridge()
+  mark('chaterm/renderer/didSetupXshellWakeupBridge')
+
+  // Try to restore state on initial mount (unified for both modes)
+  nextTick(async () => {
+    if (!(await restoreAiTabState())) {
+      // If not restored yet, wait a bit more and try again
+      setTimeout(async () => {
+        await restoreAiTabState()
+        if (props.currentMode === 'agents') {
+          await nextTick()
+          const textarea = document.querySelector('[data-testid="ai-message-input"]') as HTMLTextAreaElement
+          if (textarea) {
+            textarea.scrollTop = textarea.scrollHeight
+            textarea.focus({ preventScroll: true })
+          }
+        }
+      }, 200)
+    } else {
+      if (props.currentMode === 'agents') {
+        setTimeout(async () => {
+          await nextTick()
+          const textarea = document.querySelector('[data-testid="ai-message-input"]') as HTMLTextAreaElement
+          if (textarea) {
+            textarea.scrollTop = textarea.scrollHeight
+            textarea.focus({ preventScroll: true })
+          }
+        }, 200)
+      }
+    }
+  })
+
+  nextTick(async () => {
+    mark('chaterm/renderer/willInitializeTheme')
+    await initializeThemeFromDatabase()
+    mark('chaterm/renderer/didInitializeTheme')
+  })
+  mark('chaterm/renderer/didInitTerminalLayout')
+})
+const timer = ref<number | null>(null)
+watch(mainTerminalSize, () => {
+  if (allTabs.value != null) {
+    if (timer.value) {
+      return
+    } else {
+      timer.value = window.setTimeout(() => {
+        allTabs.value?.resizeTerm()
+        timer.value = null
+      }, 200)
+    }
+  }
+})
+watch(leftPaneSize, () => {
+  if (allTabs.value != null) {
+    if (timer.value) {
+      return
+    } else {
+      timer.value = window.setTimeout(() => {
+        allTabs.value?.resizeTerm()
+        timer.value = null
+      }, 200)
+    }
+  }
+})
+watch(showAiSidebar, (newValue) => {
+  if (headerRef.value) {
+    headerRef.value.switchIcon('right', newValue)
+  }
+})
+const commandBarStyle = computed(() => {
+  const container = document.querySelector('.splitpanes') as HTMLElement
+  const containerWidth = container?.offsetWidth
+  const width = ((100 - leftPaneSize.value) * containerWidth * (100 - aiSidebarSize.value)) / 10000 - 10
+  const left = (leftPaneSize.value * containerWidth) / 100 + 45
+  return { width, left }
+})
+const terminalCount = computed(() => componentInstances.value.length)
+const closeGlobalInput = () => {
+  isGlobalInput.value = false
+}
+const DEFAULT_WIDTH_PX = 250
+const DEFAULT_WIDTH_RIGHT_PX = 350
+const ONBOARDING_AI_SIDEBAR_WIDTH_PX = 420
+const MIN_AI_SIDEBAR_WIDTH_PX = 320 // AI sidebar minimum usable width
+const SNAP_THRESHOLD_PX = 240 // Sticky resistance threshold
+// Left sidebar constants
+const MIN_LEFT_SIDEBAR_WIDTH_PX = 200 // Left sidebar minimum usable width
+const LEFT_QUICK_CLOSE_THRESHOLD_PX = 50 // Left sidebar quick close threshold
+const currentMenu = ref('workspace')
+
+const isAiChatOnboardingActive = () => onboardingStore.activeTour === 'aiChat'
+
+const getPreferredAiSidebarWidthPx = () => (isAiChatOnboardingActive() ? ONBOARDING_AI_SIDEBAR_WIDTH_PX : DEFAULT_WIDTH_RIGHT_PX)
+
+const getAiSidebarOpenSize = (containerWidth: number) => {
+  const safeContainerWidth = Math.max(containerWidth, 1)
+  const minSizePercent = (MIN_AI_SIDEBAR_WIDTH_PX / safeContainerWidth) * 100
+  const preferredSize = (getPreferredAiSidebarWidthPx() / safeContainerWidth) * 100
+  let restoredSize = savedAiSidebarState.value?.size || preferredSize
+
+  if (isAiChatOnboardingActive()) {
+    restoredSize = Math.max(restoredSize, preferredSize)
+  }
+
+  if ((restoredSize / 100) * safeContainerWidth < MIN_AI_SIDEBAR_WIDTH_PX) {
+    restoredSize = minSizePercent
+  }
+
+  return restoredSize
+}
+
+const applyAiSidebarSize = (size: number) => {
+  aiSidebarSize.value = size
+  if (showSplitPane.value) {
+    adjustSplitPaneToEqualWidth()
+  } else {
+    mainTerminalSize.value = 100 - aiSidebarSize.value
+  }
+}
+
+const ensureAiChatOnboardingSidebarWidth = (containerWidth: number) => {
+  if (!isAiChatOnboardingActive()) return
+
+  const targetSize = getAiSidebarOpenSize(containerWidth)
+  if (targetSize <= aiSidebarSize.value) return
+
+  applyAiSidebarSize(targetSize)
+}
+
+const updatePaneSize = () => {
+  const container = document.querySelector('.splitpanes') as HTMLElement
+  if (container) {
+    // Only update left pane size if it's expanded and we're in terminal mode
+    if (leftPaneSize.value > 0 && props.currentMode === 'terminal') {
+      const containerWidth = container.offsetWidth
+      const currentWidthPx = (leftPaneSize.value / 100) * containerWidth
+      // Only adjust if current width is significantly different from default
+      if (Math.abs(currentWidthPx - DEFAULT_WIDTH_PX) > 50) {
+        leftPaneSize.value = (DEFAULT_WIDTH_PX / containerWidth) * 100
+      }
+    }
+    // Update AI sidebar min-size
+    updateAiSidebarMinSize()
+    // Update left sidebar min-size
+    updateLeftSidebarMinSize()
+  }
+}
+
+// Watch left pane size to timely update AI sidebar min-size
+watch(
+  () => leftPaneSize.value,
+  () => {
+    if (props.currentMode === 'terminal') {
+      updateAiSidebarMinSize()
+      updateLeftSidebarMinSize()
+    }
+  }
+)
+
+// Calculate AI sidebar min-size percentage
+const updateAiSidebarMinSize = () => {
+  // In Agents mode, AI sidebar uses different container and stricter minimum width
+  if (props.currentMode === 'agents') {
+    const container = document.querySelector('.left-sidebar-container') as HTMLElement
+    if (container) {
+      const containerWidth = container.offsetWidth
+      // In Agents mode, AI sidebar occupies right panel with stricter minimum width limit
+      aiMinSize.value = (SNAP_THRESHOLD_PX / containerWidth) * 100
+    }
+    return
+  }
+
+  // Terminal mode logic
+  // Use .left-sidebar-container width and leftPaneSize to calculate available width
+  // This avoids issues where reading .main-split-container.offsetWidth returns stale values during resize events
+  const container = document.querySelector('.left-sidebar-container') as HTMLElement
+  if (container) {
+    const containerWidth = container.offsetWidth
+    // Consider left sidebar width to calculate the actual width available for the main split container
+    const availableWidth = (containerWidth * (100 - leftPaneSize.value)) / 100
+
+    // Safety check to avoid division by zero or negative values
+    if (availableWidth > 10) {
+      const minPercent = (SNAP_THRESHOLD_PX / availableWidth) * 100
+      aiMinSize.value = minPercent
+    }
+  }
+}
+
+// Calculate left sidebar min-size percentage
+const updateLeftSidebarMinSize = () => {
+  // Left sidebar does not use minSize limit, sticky resistance controlled by logic
+  leftMinSize.value = 0
+}
+
+// Save left sidebar state
+const saveLeftSidebarState = () => {
+  savedLeftSidebarState.value = {
+    size: getLeftSidebarSize(),
+    currentMenu: currentMenu.value,
+    isExpanded: getLeftSidebarSize() > 0
+  }
+}
+
+// Restore left sidebar state
+const restoreLeftSidebarState = () => {
+  if (savedLeftSidebarState.value) {
+    const container = document.querySelector('.left-sidebar-container') as HTMLElement
+    if (container && container.offsetWidth > 0) {
+      const containerWidth = container.offsetWidth
+      const minSizePercent = (MIN_LEFT_SIDEBAR_WIDTH_PX / containerWidth) * 100
+
+      // Ensure restored width is not less than minimum usable width
+      let restoredSize = savedLeftSidebarState.value.size
+      if ((restoredSize / 100) * containerWidth < MIN_LEFT_SIDEBAR_WIDTH_PX) {
+        restoredSize = minSizePercent
+      }
+
+      setLeftSidebarSize(restoredSize)
+      currentMenu.value = savedLeftSidebarState.value.currentMenu
+      const iconKey = props.currentMode === 'agents' ? 'agentsLeft' : 'left'
+      headerRef.value?.switchIcon(iconKey, true)
+    }
+  }
+}
+
+// Handle left pane resize
+const handleLeftPaneResize = (params: ResizeParams) => {
+  // Skip resize handling during quick close
+  if (isQuickClosing.value) {
+    return
+  }
+
+  // Signal resize to pause expensive chat observers
+  signalResizeStart()
+
+  const container = document.querySelector('.left-sidebar-container') as HTMLElement
+  const containerWidth = container ? container.offsetWidth : 1000
+  const sizePx = (params.prevPane.size / 100) * containerWidth
+
+  const oldLeftSize = props.currentMode === 'agents' ? agentsLeftPaneSize.value : leftPaneSize.value
+  const newLeftSize = params.prevPane.size
+
+  // Normal size update
+  if (props.currentMode === 'agents') {
+    agentsLeftPaneSize.value = params.prevPane.size
+    updateAiSidebarMinSize()
+    updateLeftSidebarMinSize()
+
+    // Sync icon state (use threshold to avoid conflict)
+    if (sizePx >= LEFT_QUICK_CLOSE_THRESHOLD_PX) {
+      headerRef.value?.switchIcon('agentsLeft', true)
+    } else {
+      headerRef.value?.switchIcon('agentsLeft', false)
+    }
+  } else {
+    leftPaneSize.value = params.prevPane.size
+    updateAiSidebarMinSize()
+    updateLeftSidebarMinSize()
+
+    // Sync icon state (use threshold to avoid conflict)
+    if (sizePx >= LEFT_QUICK_CLOSE_THRESHOLD_PX) {
+      headerRef.value?.switchIcon('left', true)
+    } else {
+      headerRef.value?.switchIcon('left', false)
+    }
+  }
+
+  // Adjust AI sidebar to maintain pixel width when left sidebar resizes
+  if (showAiSidebar.value && aiSidebarSize.value > 0 && Math.abs(100 - newLeftSize) > 0.1 && props.currentMode === 'terminal') {
+    // Calculate effective left sizes (clamped to minimum width constraint)
+    // This prevents the AI sidebar from shrinking when the left sidebar is conceptually shrinking but physically stuck at min-width
+    const minLeftPct = (MIN_LEFT_SIDEBAR_WIDTH_PX / containerWidth) * 100
+    const effectiveOldLeft = Math.max(oldLeftSize, minLeftPct)
+    const effectiveNewLeft = Math.max(newLeftSize, minLeftPct)
+
+    let newAiSize = (aiSidebarSize.value * (100 - effectiveOldLeft)) / (100 - effectiveNewLeft)
+
+    // Ensure the calculated size respects the minimum constraint
+    // This is critical: even if pixel maintenance suggests a smaller size, we must honor the 240px minimum
+    newAiSize = Math.max(newAiSize, aiMinSize.value)
+
+    // Clamp to reasonable bounds (e.g. max 90% of remaining space)
+    if (newAiSize > 0 && newAiSize < 90) {
+      aiSidebarSize.value = newAiSize
+      if (showSplitPane.value) {
+        adjustSplitPaneToEqualWidth()
+      } else {
+        mainTerminalSize.value = 100 - aiSidebarSize.value
+      }
+    }
+  }
+}
+
+// AI sidebar debounced auto-close
+let aiResizeTimeout: number | null = null
+const debouncedAiResizeCheck = () => {
+  if (aiResizeTimeout) {
+    clearTimeout(aiResizeTimeout)
+  }
+
+  aiResizeTimeout = window.setTimeout(() => {
+    // In Agents mode, do not execute auto-close logic
+    if (props.currentMode === 'agents') {
+      aiResizeTimeout = null
+      return
+    }
+
+    // Skip if we're in the middle of dragging (quick close will be handled by mouseup)
+    if (isDraggingSplitter.value) {
+      aiResizeTimeout = null
+      return
+    }
+
+    const container = (document.querySelector('.main-split-container') as HTMLElement) || (document.querySelector('.splitpanes') as HTMLElement)
+    if (container) {
+      const containerWidth = container.offsetWidth
+      const currentAiSidebarSize = aiSidebarSize.value
+      const aiSidebarWidthPx = (currentAiSidebarSize / 100) * containerWidth
+
+      // Auto-close if width < 50px (only in Terminal mode, and not during drag)
+      if (aiSidebarWidthPx < 50 && currentAiSidebarSize > 0) {
+        saveAiSidebarState()
+        showAiSidebar.value = false
+        aiSidebarSize.value = 0
+        headerRef.value?.switchIcon('right', false)
+        if (showSplitPane.value) {
+          adjustSplitPaneToEqualWidth()
+        } else {
+          mainTerminalSize.value = 100
+        }
+        restorePreviousFocus()
+      }
+    }
+    aiResizeTimeout = null
+  }, 50) // 50ms debounce
+}
+
+const toggleSideBar = (value: string) => {
+  if (value === 'right' && currentMenu.value === 'database') {
+    const nextOpen = !databaseWorkspaceStore.dbAi.aiPaneOpen
+    databaseWorkspaceStore.setDbAiPaneOpen(nextOpen)
+    headerRef.value?.switchIcon('right', nextOpen)
+    return
+  }
+
+  const container = (document.querySelector('.main-split-container') as HTMLElement) || (document.querySelector('.splitpanes') as HTMLElement)
+  const containerWidth = container ? container.offsetWidth : 1000
+
+  switch (value) {
+    case 'right':
+      if (showAiSidebar.value) {
+        saveAiSidebarState()
+        showAiSidebar.value = false
+        aiSidebarSize.value = 0
+        headerRef.value?.switchIcon('right', false)
+        if (showSplitPane.value) {
+          adjustSplitPaneToEqualWidth()
+        } else {
+          mainTerminalSize.value = 100
+        }
+        restorePreviousFocus()
+      } else {
+        savePreviousFocus()
+        showAiSidebar.value = true
+        applyAiSidebarSize(getAiSidebarOpenSize(containerWidth))
+        headerRef.value?.switchIcon('right', true)
+        nextTick(() => {
+          if (aiTabRef.value && savedAiSidebarState.value) {
+            aiTabRef.value.restoreState(savedAiSidebarState.value)
+          }
+        })
+        focusRightSidebar()
+      }
+      break
+    case 'left':
+    case 'agentsLeft':
+      {
+        const currentSize = getLeftSidebarSize()
+        if (currentSize > 0) {
+          // Close sidebar
+          saveLeftSidebarState()
+          setLeftSidebarSize(0)
+          const iconKey = props.currentMode === 'agents' ? 'agentsLeft' : 'left'
+          headerRef.value?.switchIcon(iconKey, false)
+        } else {
+          // Open sidebar
+          const leftContainer = document.querySelector('.left-sidebar-container') as HTMLElement
+          const leftContainerWidth = leftContainer ? leftContainer.offsetWidth : containerWidth
+          const minSizePercent = (MIN_LEFT_SIDEBAR_WIDTH_PX / leftContainerWidth) * 100
+
+          // Try to restore saved state, otherwise use default width
+          if (savedLeftSidebarState.value) {
+            restoreLeftSidebarState()
+          } else {
+            let defaultSize = props.currentMode === 'agents' ? 27 : (DEFAULT_WIDTH_PX / leftContainerWidth) * 100
+
+            // Ensure default width is not less than minimum usable width
+            if ((defaultSize / 100) * leftContainerWidth < MIN_LEFT_SIDEBAR_WIDTH_PX) {
+              defaultSize = minSizePercent
+            }
+
+            setLeftSidebarSize(defaultSize)
+            const iconKey = props.currentMode === 'agents' ? 'agentsLeft' : 'left'
+            headerRef.value?.switchIcon(iconKey, true)
+          }
+        }
+      }
+      break
+  }
+}
+
+// Handle host search shortcut
+const handleSearchHost = () => {
+  const needsMenuSwitch = currentMenu.value !== 'workspace'
+  const needsSidebarOpen = getLeftSidebarSize() === 0
+
+  // Ensure left sidebar is open
+  if (needsSidebarOpen) {
+    // Use the unified toggle function to open the sidebar
+    toggleSideBar('left')
+  }
+
+  // Switch to workspace menu if not already
+  if (needsMenuSwitch) {
+    currentMenu.value = 'workspace'
+  }
+
+  // Calculate delay based on what needs to happen
+  // If menu switch or sidebar open is needed, wait longer for DOM to be ready
+  const delay = needsMenuSwitch || needsSidebarOpen ? 200 : 50
+
+  // Focus search input after appropriate delay to ensure DOM is ready
+  nextTick(() => {
+    setTimeout(() => {
+      eventBus.emit('focusHostSearch')
+    }, delay)
+  })
+}
+
+const toggleMenu = function (params) {
+  const type = params?.type
+  const isDatabaseWorkspace = currentMenu.value === 'database' || params?.beforeActive === 'database'
+
+  if (isDatabaseWorkspace && (params.menu === 'ai' || params.menu === 'openAiRight')) {
+    currentMenu.value = 'database'
+    const shouldOpen = params.menu === 'openAiRight' ? true : !databaseWorkspaceStore.dbAi.aiPaneOpen
+    databaseWorkspaceStore.setDbAiPaneOpen(shouldOpen)
+    headerRef.value?.switchIcon('right', shouldOpen)
+    return
+  }
+
+  if (params.menu === 'database') {
+    currentMenu.value = 'database'
+    if (type === 'same') {
+      databaseWorkspaceStore.toggleDatabaseSidebar()
+    } else {
+      databaseWorkspaceStore.setDatabaseSidebarOpen(true)
+    }
+    return
+  }
+
+  const container = document.querySelector('.splitpanes') as HTMLElement
+  const containerWidth = container.offsetWidth
+  const expandFn = (dir) => {
+    if (dir == 'left') {
+      // Use unified function to set left sidebar size
+      const leftContainer = document.querySelector('.left-sidebar-container') as HTMLElement
+      const leftContainerWidth = leftContainer ? leftContainer.offsetWidth : containerWidth
+      const minSizePercent = (MIN_LEFT_SIDEBAR_WIDTH_PX / leftContainerWidth) * 100
+      let defaultSize = (DEFAULT_WIDTH_PX / leftContainerWidth) * 100
+
+      if ((defaultSize / 100) * leftContainerWidth < MIN_LEFT_SIDEBAR_WIDTH_PX) {
+        defaultSize = minSizePercent
+      }
+
+      setLeftSidebarSize(defaultSize)
+      const iconKey = props.currentMode === 'agents' ? 'agentsLeft' : 'left'
+      headerRef.value?.switchIcon(iconKey, true)
+    } else {
+      showAiSidebar.value = true
+      applyAiSidebarSize(getAiSidebarOpenSize(containerWidth))
+      if (splitPanes.value.length > 0) {
+        mainTerminalSize.value = 100 - aiSidebarSize.value - splitPanes.value.reduce((acc, pane) => acc + pane.size, 0)
+      }
+      headerRef.value?.switchIcon('right', true)
+      nextTick(() => {
+        if (aiTabRef.value && savedAiSidebarState.value) {
+          aiTabRef.value.restoreState(savedAiSidebarState.value)
+        }
+      })
+    }
+  }
+  const shrinkFn = (dir) => {
+    if (dir == 'left') {
+      setLeftSidebarSize(0)
+      const iconKey = props.currentMode === 'agents' ? 'agentsLeft' : 'left'
+      headerRef.value?.switchIcon(iconKey, false)
+    } else {
+      showAiSidebar.value = false
+      aiSidebarSize.value = 0
+      mainTerminalSize.value = 100 - (splitPanes.value.length > 0 ? splitPanes.value.reduce((acc, pane) => acc + pane.size, 0) : 0)
+      headerRef.value?.switchIcon('right', false)
+    }
+  }
+  if (params.menu == 'ai') {
+    currentMenu.value = params.beforeActive
+    if (!showAiSidebar.value) {
+      savePreviousFocus()
+      const container = (document.querySelector('.main-split-container') as HTMLElement) || (document.querySelector('.splitpanes') as HTMLElement)
+      if (container) {
+        const containerWidth = container.offsetWidth
+        showAiSidebar.value = true
+        applyAiSidebarSize(getAiSidebarOpenSize(containerWidth))
+        headerRef.value?.switchIcon('right', true)
+        nextTick(() => {
+          if (aiTabRef.value && savedAiSidebarState.value) {
+            aiTabRef.value.restoreState(savedAiSidebarState.value)
+          }
+        })
+        focusRightSidebar()
+      }
+    } else {
+      saveAiSidebarState()
+      showAiSidebar.value = false
+      aiSidebarSize.value = 0
+      headerRef.value?.switchIcon('right', false)
+      if (showSplitPane.value) {
+        adjustSplitPaneToEqualWidth()
+      } else {
+        mainTerminalSize.value = 100
+      }
+      restorePreviousFocus()
+    }
+  } else if (params.menu == 'openAiRight') {
+    currentMenu.value = params.beforeActive
+    if (!showAiSidebar.value) {
+      savePreviousFocus()
+      expandFn('right')
+      focusRightSidebar()
+    } else {
+      ensureAiChatOnboardingSidebarWidth(containerWidth)
+      focusRightSidebar()
+    }
+  } else {
+    currentMenu.value = params.menu
+    switch (type) {
+      case 'same':
+        if (leftPaneSize.value == 0) {
+          expandFn('left')
+        } else {
+          shrinkFn('left')
+        }
+        break
+      case 'dif':
+        if (leftPaneSize.value == 0) {
+          expandFn('left')
+        }
+        break
+    }
+  }
+}
+
+interface TabItem {
+  id: string
+  title: string
+  content: string
+  type: string
+  organizationId: string
+  ip: string
+  data: any
+}
+const openedTabs = ref<TabItem[]>([])
+const activeTabId = ref('')
+
+type XshellWakeupPayload = {
+  source?: string
+  url?: string
+  host?: string
+  port?: number
+  username?: string
+  password?: string
+  targetHint?: string
+  newTab?: boolean
+  receivedAt?: string
+}
+
+let removeXshellWakeupListener: (() => void) | null = null
+const xshellWakeupDedupTimestamps = new Map<string, number>()
+const XSHELL_WAKEUP_DEDUP_WINDOW_MS = 10 * 60 * 1000
+
+const makeXshellWakeupDedupKey = (payload: XshellWakeupPayload): string => {
+  const host = String(payload.host || '')
+  const port = Number(payload.port || 22)
+  const username = String(payload.username || '')
+  const targetHint = String(payload.targetHint || '')
+  const receivedAt = String(payload.receivedAt || '')
+  return `${host}:${port}:${username}:${targetHint}:${receivedAt}`
+}
+
+const shouldSkipDuplicateXshellWakeup = (payload: XshellWakeupPayload): boolean => {
+  const key = makeXshellWakeupDedupKey(payload)
+  const now = Date.now()
+
+  for (const [dedupKey, ts] of xshellWakeupDedupTimestamps.entries()) {
+    if (now - ts > XSHELL_WAKEUP_DEDUP_WINDOW_MS) {
+      xshellWakeupDedupTimestamps.delete(dedupKey)
+    }
+  }
+
+  const last = xshellWakeupDedupTimestamps.get(key)
+  xshellWakeupDedupTimestamps.set(key, now)
+  return typeof last === 'number' && now - last <= XSHELL_WAKEUP_DEDUP_WINDOW_MS
+}
+
+const openTerminalFromXshellWakeup = (payload: XshellWakeupPayload) => {
+  if (!payload || !payload.host || !payload.username) {
+    logger.warn('Invalid xshell wakeup payload, missing host or username', {
+      event: 'xshell.wakeup.invalid',
+      hasHost: !!payload.host,
+      hasUsername: !!payload.username
+    })
+    return
+  }
+
+  if (shouldSkipDuplicateXshellWakeup(payload)) {
+    logger.info('Skip duplicated xshell wakeup event', { event: 'xshell.wakeup.dedup', port: payload.port || 22 })
+    return
+  }
+
+  const host = String(payload.host)
+  const port = Number(payload.port || 22)
+  const username = String(payload.username)
+  const password = String(payload.password || '')
+  const targetHint = String(payload.targetHint || '')
+  const title = targetHint || `${username}@${host}`
+  const key = targetHint || host
+  const wakeupNewTab = payload.newTab === true
+
+  const wakeupUuid =
+    typeof globalThis.crypto?.randomUUID === 'function'
+      ? globalThis.crypto.randomUUID()
+      : `${Date.now()}-${performance.now().toString().replace('.', '')}`
+
+  const node = {
+    title,
+    key,
+    type: 'term',
+    organizationId: 'personal',
+    connection: 'personal',
+    uuid: `xshell-${wakeupUuid}`,
+    ip: host,
+    host,
+    hostname: host,
+    port,
+    username,
+    password,
+    authType: 'password',
+    asset_type: 'person',
+    comment: targetHint || host,
+    source: payload.source || 'xshell-direct',
+    wakeupSource: payload.source || 'xshell-direct',
+    wakeupNewTab,
+    disablePoolReuse: true,
+    skipAssetLookup: true
+  }
+
+  logger.info('Open terminal from xshell wakeup', {
+    source: payload.source || 'unknown',
+    port,
+    hasPassword: password.length > 0,
+    targetHint
+  })
+  currentClickServer(node)
+}
+
+const setupXshellWakeupBridge = async () => {
+  const api = (window as any).api
+  if (!api) return
+
+  if (typeof api.onXshellWakeup === 'function') {
+    removeXshellWakeupListener = api.onXshellWakeup((payload: XshellWakeupPayload) => {
+      openTerminalFromXshellWakeup(payload)
+    })
+  }
+
+  if (typeof api.consumePendingXshellWakeups === 'function') {
+    try {
+      const pending = await api.consumePendingXshellWakeups()
+      if (Array.isArray(pending)) {
+        pending.forEach((payload: XshellWakeupPayload) => openTerminalFromXshellWakeup(payload))
+      }
+    } catch (error) {
+      logger.error('Failed to consume pending xshell wakeups', { error: error })
+    }
+  }
+}
+
+const currentClickServer = async (item) => {
+  if (item.children) return
+
+  const id_ = uuidv4()
+  const newTab = {
+    id: id_,
+    title: item.title,
+    content: item.key,
+    type: item.type ? item.type : 'term',
+    organizationId: item.organizationId ? item.organizationId : '',
+    ip: item.ip ? item.ip : '',
+    data: item,
+    props: item?.props
+  }
+  if (focusedPane.value.type === 'rightVertical' && focusedPane.value.index !== undefined && focusedPane.value.rightPaneIndex !== undefined) {
+    const rightPane = splitPanes.value[focusedPane.value.rightPaneIndex]
+    if (rightPane && rightPane.verticalSplitPanes && focusedPane.value.index < rightPane.verticalSplitPanes.length) {
+      const targetPane = rightPane.verticalSplitPanes[focusedPane.value.index]
+      targetPane.tabs.push(newTab)
+      targetPane.activeTabId = id_
+    }
+  } else if (
+    focusedPane.value.type === 'vertical' &&
+    focusedPane.value.index !== undefined &&
+    focusedPane.value.index < verticalSplitPanes.value.length
+  ) {
+    const targetPane = verticalSplitPanes.value[focusedPane.value.index]
+    targetPane.tabs.push(newTab)
+    targetPane.activeTabId = id_
+  } else if (focusedPane.value.type === 'horizontal' && focusedPane.value.index !== undefined && focusedPane.value.index < splitPanes.value.length) {
+    const targetPane = splitPanes.value[focusedPane.value.index]
+    targetPane.tabs.push(newTab)
+    targetPane.activeTabId = id_
+  } else {
+    // openedTabs.value.push(newTab)
+    addDockPanel(newTab)
+    activeTabId.value = id_
+  }
+
+  checkActiveTab(item.type || 'term')
+}
+
+const createTab = (infos) => {
+  const id_ = uuidv4()
+  const tab = {
+    id: id_,
+    title: infos.title,
+    content: infos.content,
+    type: infos.type,
+    organizationId: infos.organizationId,
+    ip: infos.ip,
+    data: infos.data
+  }
+  // openedTabs.value.push(tab)
+  activeTabId.value = id_
+  checkActiveTab(infos.type)
+  addDockPanel(tab)
+}
+
+const adjustSplitPaneToEqualWidth = () => {
+  if (showSplitPane.value) {
+    const availableSpace = 100 - (showAiSidebar.value ? aiSidebarSize.value : 0)
+    const paneCount = splitPanes.value.length + 1
+    const equalSize = availableSpace / paneCount
+
+    mainTerminalSize.value = equalSize
+    splitPanes.value.forEach((pane) => {
+      pane.size = equalSize
+    })
+  }
+}
+
+const handleCreateSplitTab = (info) => {
+  createNewPanel(false, 'right', 'panel_' + info.id)
+}
+
+const handleCreateVerticalSplitTab = (info) => {
+  createNewPanel(false, 'below', 'panel_' + info.id)
+}
+
+const handleCreateNewTerminal = () => {
+  if (!dockApi) {
+    return
+  }
+  const activePanel = dockApi.activePanel
+
+  if (activePanel && activePanel.params) {
+    const params = activePanel.params
+    const data = params.data || {}
+
+    const newTerminalInfo = {
+      title: activePanel.api.title || params.title,
+      content: params.content,
+      type: params.type,
+      organizationId: params.organizationId || data.organizationId,
+      ip: params.ip || data.ip,
+      data: data
+    }
+
+    createTab(newTerminalInfo)
+  } else {
+    openUserTab('userConfig')
+  }
+}
+
+const switchTab = (panelId: string) => {
+  if (!dockApi) {
+    return
+  }
+
+  const panel = dockApi.getPanel(panelId)
+  if (!panel) {
+    return
+  }
+  panel.api.setActive()
+  activeTabId.value = panelId
+  const panelParams = panel.params
+  const panelType = panelParams?.type
+  if (panelType === 'term' || panelType === 'ssh') {
+    nextTick(() => {
+      handleActivePanelChange()
+    })
+  }
+  checkActiveTab(panelType)
+}
+
+const normalizeKbRelPath = (relPath: string): string => {
+  return relPath.replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+$/, '')
+}
+
+const shouldCloseKbTab = (tabRelPath: string, entry: KbRemovedEntry): boolean => {
+  const tabPath = normalizeKbRelPath(tabRelPath)
+  const entryPath = normalizeKbRelPath(entry.relPath)
+  if (!entryPath) return false
+  if (entry.isDir) {
+    return tabPath === entryPath || tabPath.startsWith(entryPath + '/')
+  }
+  return tabPath === entryPath
+}
+
+// Handle opening knowledge base preview panel via eventBus
+const handleOpenKbPreview = (payload: { relPath: string; referencePanel: string }) => {
+  if (!dockApi) return
+
+  const { relPath, referencePanel } = payload
+  const stableId = `kc_preview_${relPath.replaceAll('/', '__')}`
+  const newId = 'panel_' + stableId
+
+  // Check if preview already exists
+  const existing = dockApi.panels.find((p) => p.id === newId)
+  if (existing) {
+    existing.api.setActive()
+    return
+  }
+
+  // Verify reference panel exists
+  const refPanelExists = dockApi.panels.some((p) => p.id === referencePanel)
+
+  // Create preview panel with closeCurrentPanel callback
+  dockApi.addPanel({
+    id: newId,
+    component: 'TabsPanel',
+    title: `Preview ${relPath.split('/').pop()}`,
+    params: {
+      id: stableId,
+      content: 'KnowledgeCenterEditor',
+      mode: 'preview',
+      props: { relPath },
+      isMarkdown: true,
+      organizationId: '',
+      ip: '',
+      closeCurrentPanel: (panelId?: string) => closeCurrentPanel(panelId || newId)
+    },
+    // Only specify position if reference panel exists
+    ...(refPanelExists && {
+      position: {
+        direction: 'right',
+        referencePanel
+      }
+    })
+  })
+}
+
+const handleKbEntriesRemoved = (payload: { entries: KbRemovedEntry[] }) => {
+  if (!dockApi) return
+  const entries = payload?.entries ?? []
+  if (entries.length === 0) return
+
+  const panels = [...dockApi.panels]
+  for (const panel of panels) {
+    const params = panel.params
+    if (params?.content !== 'KnowledgeCenterEditor') continue
+    const relPath = String(params.props?.relPath || params.data?.props?.relPath || '')
+    if (!relPath) continue
+    if (entries.some((entry) => shouldCloseKbTab(relPath, entry))) {
+      panel.api.close()
+    }
+  }
+}
+
+// Update KnowledgeCenterEditor tabs when a file or folder is renamed
+const handleKbFileRenamed = (payload: { oldRelPath: string; newRelPath: string; newName: string }) => {
+  if (!dockApi) return
+  const { oldRelPath, newRelPath, newName } = payload
+  if (!oldRelPath || !newRelPath) return
+
+  const panels = [...dockApi.panels]
+  for (const panel of panels) {
+    const params = panel.params as Record<string, any> | undefined
+    if (!params || params.content !== 'KnowledgeCenterEditor') continue
+    const tabRelPath = String(params.props?.relPath || params.data?.props?.relPath || '')
+    if (!tabRelPath) continue
+
+    let updatedRelPath = ''
+    let updatedTitle = ''
+
+    if (tabRelPath === oldRelPath) {
+      // Exact match: the renamed file/folder itself
+      updatedRelPath = newRelPath
+      updatedTitle = newName
+    } else if (tabRelPath.startsWith(oldRelPath + '/')) {
+      // Child of renamed directory
+      updatedRelPath = newRelPath + tabRelPath.slice(oldRelPath.length)
+      updatedTitle = updatedRelPath.split('/').pop() || updatedRelPath
+    }
+
+    if (!updatedRelPath) continue
+
+    panel.api.setTitle(updatedTitle)
+    if (params.props) params.props.relPath = updatedRelPath
+    if (params.data?.props) params.data.props.relPath = updatedRelPath
+    params.title = updatedTitle
+    panel.api.updateParameters?.({ ...params })
+  }
+}
+
+onUnmounted(() => {
+  if (removeXshellWakeupListener) {
+    removeXshellWakeupListener()
+    removeXshellWakeupListener = null
+  }
+  eventBus.off('save-state-before-switch')
+  shortcutService.destroy()
+  window.removeEventListener('resize', updatePaneSize)
+  window.removeEventListener('resize', updateAiSidebarMinSize)
+  window.removeEventListener('resize', updateLeftSidebarMinSize)
+
+  // Unregister global mouse event listeners
+  document.removeEventListener('mousedown', handleMouseDown)
+  document.removeEventListener('mouseup', handleGlobalMouseUp)
+  document.removeEventListener('wheel', handleDockviewTabsWheel, true)
+
+  if ((globalThis as any).__ctrlWHandler) {
+    document.removeEventListener('keydown', (globalThis as any).__ctrlWHandler, true)
+    delete (globalThis as any).__ctrlWHandler
+  }
+  document.removeEventListener('mousemove', handleGlobalMouseMove)
+  window.removeEventListener('keydown', handleCloseTabKeyDown)
+
+  eventBus.off('currentClickServer', currentClickServer)
+  eventBus.off('getActiveTabAssetInfo', handleGetActiveTabAssetInfo)
+  eventBus.off('getAllOpenedHosts', handleGetAllOpenedHosts)
+  eventBus.off('toggleSideBar', toggleSideBar)
+  eventBus.off('kbAddDocToChatRequest', handleKbAddDocToChatRequest)
+  eventBus.off('kbAddImageToChatRequest', handleKbAddImageToChatRequest)
+  eventBus.off('createSplitTab', handleCreateSplitTab)
+  eventBus.off('createVerticalSplitTab', handleCreateVerticalSplitTab)
+  eventBus.off('adjustSplitPaneToEqual', adjustSplitPaneToEqualWidth)
+  eventBus.off('switchToNextTab', switchToNextTab)
+  eventBus.off('switchToPrevTab', switchToPrevTab)
+  eventBus.off('switchToSpecificTab', switchToSpecificTab)
+  eventBus.off('createNewTerminal', handleCreateNewTerminal)
+  eventBus.off('open-user-tab', openUserTab)
+  eventBus.off('onboarding:openGuideTab', openOnboardingGuideTab)
+  eventBus.off('onboarding:showLeftMenu', showLeftMenuForOnboarding)
+  eventBus.off('kbEntriesRemoved', handleKbEntriesRemoved)
+  eventBus.off('kbFileRenamed', handleKbFileRenamed)
+  eventBus.off('openKbPreview', handleOpenKbPreview)
+  eventBus.off('searchHost', handleSearchHost)
+})
+
+interface OpenUserTabObject {
+  key: string
+  content?: string
+  title?: string
+  id?: string
+  fromLocal?: boolean
+  pluginId?: string
+  props?: {
+    relPath?: string
+    startLine?: number
+    endLine?: number
+    jumpToken?: number | string
+    pluginId?: string
+    filePath?: string
+    initialContent?: string
+    [key: string]: any
+  }
+}
+
+type OpenUserTabArg = string | OpenUserTabObject
+
+const ensureDockWorkspaceVisibleForUserTab = async (value: string) => {
+  const nextMenu = getMenuForDockBackedUserTab(currentMenu.value, value)
+  if (nextMenu === currentMenu.value) return
+
+  currentMenu.value = nextMenu
+  await nextTick()
+}
+
+async function openOnboardingGuideTab() {
+  await openUserTab('onboardingGuide')
+}
+
+async function showLeftMenuForOnboarding(menu: string) {
+  currentMenu.value = menu
+  await nextTick()
+
+  if (getLeftSidebarSize() > 0) return
+
+  const leftContainer = document.querySelector('.left-sidebar-container') as HTMLElement | null
+  const containerWidth = leftContainer?.offsetWidth || 1200
+  const minSizePercent = (MIN_LEFT_SIDEBAR_WIDTH_PX / containerWidth) * 100
+  let defaultSize = (DEFAULT_WIDTH_PX / containerWidth) * 100
+
+  if ((defaultSize / 100) * containerWidth < MIN_LEFT_SIDEBAR_WIDTH_PX) {
+    defaultSize = minSizePercent
+  }
+
+  setLeftSidebarSize(defaultSize)
+  headerRef.value?.switchIcon(props.currentMode === 'agents' ? 'agentsLeft' : 'left', true)
+}
+
+const openUserTab = async function (arg: OpenUserTabArg) {
+  const isStringArg = typeof arg === 'string'
+
+  const value = isStringArg ? arg : arg.key || arg.content || ''
+  await ensureDockWorkspaceVisibleForUserTab(value)
+
+  if (value === 'CommonConfigEditor') {
+    if (isStringArg) return
+
+    const target = arg as Exclude<OpenUserTabArg, string>
+
+    const p = {
+      title: target.title || 'Plugin Editor',
+      key: 'CommonConfigEditor',
+      type: 'config',
+      id: target.id || `editor_${target.props?.pluginId || Date.now()}`,
+      props: target.props
+    }
+
+    if (dockApi) {
+      const existing = dockApi.panels.find((panel) => panel.params?.props?.pluginId === target.props?.pluginId)
+      if (existing) {
+        existing.api.setActive()
+        return
+      }
+    }
+
+    currentClickServer(p)
+    return
+  }
+
+  if (value === 'KnowledgeCenterEditor') {
+    if (isStringArg) return
+    if (!dockApi) return
+
+    const target = arg as Exclude<OpenUserTabArg, string>
+    const relPath = String(target.props?.relPath || '')
+    const targetProps = {
+      ...target.props,
+      relPath
+    }
+    // Only check for editor mode panels, not preview panels
+    const existing = dockApi.panels.find(
+      (panel) => panel.params?.content === 'KnowledgeCenterEditor' && panel.params?.props?.relPath === relPath && panel.params?.mode !== 'preview'
+    )
+    if (existing) {
+      const existingParams = existing.params || {}
+      const shouldUpdateJump = targetProps.startLine !== undefined || targetProps.endLine !== undefined || targetProps.jumpToken !== undefined
+      if (shouldUpdateJump) {
+        const nextProps = {
+          ...(existingParams.props || {}),
+          ...targetProps
+        }
+        if (existingParams.props) existingParams.props = nextProps
+        if (existingParams.data?.props) existingParams.data.props = nextProps
+        existing.api.updateParameters?.({
+          ...existingParams,
+          props: nextProps,
+          data: existingParams.data ? { ...existingParams.data, props: nextProps } : existingParams.data
+        })
+      }
+      existing.api.setActive()
+      return
+    }
+
+    const stableId = `kc_${relPath.replaceAll('/', '__') || Date.now()}`
+    addDockPanel({
+      id: stableId,
+      title: target.title || relPath.split('/').pop() || 'KnowledgeCenter',
+      content: 'KnowledgeCenterEditor',
+      type: 'config',
+      organizationId: '',
+      ip: '',
+      data: {
+        title: target.title || relPath.split('/').pop() || 'KnowledgeCenter',
+        key: 'KnowledgeCenterEditor',
+        type: 'KnowledgeCenterEditor',
+        props: targetProps
+      },
+      props: targetProps,
+      isMarkdown: relPath.toLowerCase().endsWith('.md') || relPath.toLowerCase().endsWith('.markdown'),
+      mode: 'editor'
+    })
+    checkActiveTab('config')
+    return
+  }
+
+  if (value === 'assetManagement') {
+    if (isStringArg) return
+    if (!dockApi) return
+
+    const target = arg as Exclude<OpenUserTabArg, string>
+    const orgUuid = String(target.props?.organizationUuid || '')
+    const existing = dockApi.panels.find((panel) => panel.params?.content === 'assetManagement' && panel.params?.props?.organizationUuid === orgUuid)
+    if (existing) {
+      existing.api.setActive()
+      return
+    }
+
+    const stableId = `assetManage_${orgUuid || Date.now()}`
+    addDockPanel({
+      id: stableId,
+      title: target.title || 'Asset Management',
+      content: 'assetManagement',
+      type: 'config',
+      organizationId: '',
+      ip: '',
+      data: {
+        title: target.title || 'Asset Management',
+        key: 'assetManagement',
+        type: 'assetManagement',
+        props: target.props
+      },
+      props: target.props
+    })
+    checkActiveTab('config')
+    return
+  }
+
+  if (
+    value === 'assetConfig' ||
+    value === 'keyManagement' ||
+    value === 'onboardingGuide' ||
+    value === 'userInfo' ||
+    value === 'userConfig' ||
+    value === 'mcpConfigEditor' ||
+    value === 'securityConfigEditor' ||
+    value === 'keywordHighlightEditor' ||
+    value === 'jumpserverSupport' ||
+    value === 'aliasConfig' ||
+    value === 'k8sClusterConfig' ||
+    value === 'files' ||
+    value.startsWith('plugins:')
+  ) {
+    if (!dockApi) return
+
+    const existingPanel = dockApi.panels.find((panel) => panel.params?.content === value || panel.params?.type === value)
+    if (existingPanel) {
+      existingPanel.api.setActive()
+      return
+    }
+  }
+  const p = {
+    title: value,
+    key: value,
+    type: value,
+    props: {}
+  }
+  switch (value) {
+    case 'onboardingGuide':
+      p.title = 'onboardingGuide'
+      p.type = 'config'
+      break
+    case 'aliasConfig':
+      p.title = 'alias'
+      p.type = 'extensions'
+      break
+    case 'jumpserverSupport':
+      p.title = 'jumpserverSupportPlugin'
+      p.type = 'extensions'
+      break
+    case 'k8sClusterConfig':
+      p.title = t('k8s.terminal.k8sClusterConfig')
+      break
+    case 'securityConfigEditor': {
+      // Get config file path and extract file name
+      try {
+        const { securityConfigService } = await import('@/services/securityConfigService')
+        const configPath = await securityConfigService.getConfigPath()
+        // Extract file name (compatible with Windows and Unix paths)
+        const fileName = configPath.split(/[/\\]/).pop() || 'chaterm-security.json'
+        p.title = fileName
+      } catch (error) {
+        logger.error('Failed to get security config path', { error: error })
+        p.title = 'chaterm-security.json' // Default file name
+      }
+      break
+    }
+    case 'keywordHighlightEditor': {
+      // Get config file path and extract file name
+      try {
+        const { keywordHighlightConfigService } = await import('@/services/keywordHighlightConfigService')
+        const configPath = await keywordHighlightConfigService.getConfigPath()
+        // Extract file name (compatible with Windows and Unix paths)
+        const fileName = configPath.split(/[/\\]/).pop() || 'keyword-highlight.json'
+        p.title = fileName
+      } catch (error) {
+        logger.error('Failed to get keyword highlight config path', { error: error })
+        p.title = 'keyword-highlight.json' // Default file name
+      }
+      break
+    }
+  }
+  if (value.startsWith('plugins:')) {
+    const fromLocal = typeof arg === 'string' ? true : (arg.fromLocal ?? true)
+    p.title = value.split(':')[1]
+    const pluginId = typeof arg === 'string' ? p.title : (arg.pluginId ?? p.title)
+    p.type = 'extensions'
+    p.key = value
+    p.props = {
+      fromLocal,
+      pluginId
+    }
+  }
+  currentClickServer(p)
+}
+
+async function openInitialOnboardingGuideTab() {
+  onboardingStore.ensureV2State()
+  if (onboardingStore.guideTabAutoOpened) return
+
+  await openUserTab('onboardingGuide')
+  onboardingStore.markGuideTabAutoOpened()
+}
+
+const changeCompany = () => {
+  openedTabs.value = []
+}
+
+const getActiveTabAssetInfo = async () => {
+  if (!dockApi) {
+    return null
+  }
+
+  const activePanel = dockApi.activePanel
+  if (!activePanel) {
+    return null
+  }
+
+  const params = activePanel.params
+  if (!params) {
+    return null
+  }
+
+  // K8s tab: use cluster.id as uuid and server_url as ip
+  if (params.type === 'k8s') {
+    const cluster = params.data?.data || params.data
+    if (!cluster || !cluster.id) {
+      return null
+    }
+    return {
+      uuid: cluster.id,
+      title: activePanel.api.title || params.title || cluster.name,
+      ip: cluster.server_url || params.ip || '',
+      organizationId: undefined,
+      type: 'k8s',
+      outputContext: 'Output context not applicable for this tab type.',
+      tabSessionId: activePanel.id,
+      assetType: undefined
+    }
+  }
+
+  const ip = params.data?.ip || params.ip
+  if (!ip) {
+    return null
+  }
+
+  let outputContext = 'Output context not applicable for this tab type.'
+
+  const uuid = params.data?.uuid || params.uuid
+
+  return {
+    uuid: uuid,
+    title: activePanel.api.title || params.title,
+    ip: params.data?.ip || params.ip,
+    organizationId: params.organizationId || params.data?.organizationId,
+    type: params.type || params.data?.type,
+    outputContext: outputContext,
+    tabSessionId: activePanel.id,
+    assetType: params.data?.asset_type
+  }
+}
+
+const handleGetActiveTabAssetInfo = async () => {
+  const assetInfo = await getActiveTabAssetInfo()
+  eventBus.emit('assetInfoResult', assetInfo)
+}
+
+/**
+ * Get all opened hosts from terminal tabs (unique by uuid)
+ */
+const getAllOpenedHosts = () => {
+  if (!dockApi) {
+    return []
+  }
+
+  const hostsMap = new Map<string, { uuid: string; ip: string; title: string; organizationId?: string; assetType?: string }>()
+
+  for (const panel of dockApi.panels) {
+    const params = panel.params
+    if (!params) continue
+
+    const ip = params.data?.ip || params.ip
+    const uuid = params.data?.uuid || params.uuid
+    if (!ip || !uuid) continue
+
+    // Skip if already added (dedupe by uuid)
+    if (hostsMap.has(uuid)) continue
+
+    hostsMap.set(uuid, {
+      uuid,
+      ip,
+      title: panel.api.title || params.title || ip,
+      organizationId: params.organizationId || params.data?.organizationId,
+      assetType: params.data?.asset_type
+    })
+  }
+
+  return Array.from(hostsMap.values())
+}
+
+const handleGetAllOpenedHosts = () => {
+  const hosts = getAllOpenedHosts()
+  eventBus.emit('allOpenedHostsResult', hosts)
+}
+
+const toggleAiSidebar = () => {
+  const container = (document.querySelector('.main-split-container') as HTMLElement) || (document.querySelector('.splitpanes') as HTMLElement)
+  if (container) {
+    const containerWidth = container.offsetWidth
+    if (showAiSidebar.value) {
+      saveAiSidebarState()
+      showAiSidebar.value = false
+      aiSidebarSize.value = 0
+      headerRef.value?.switchIcon('right', false)
+      if (showSplitPane.value) {
+        adjustSplitPaneToEqualWidth()
+      } else {
+        mainTerminalSize.value = 100
+      }
+      restorePreviousFocus()
+    } else {
+      savePreviousFocus()
+      showAiSidebar.value = true
+      applyAiSidebarSize(getAiSidebarOpenSize(containerWidth))
+      headerRef.value?.switchIcon('right', true)
+      focusRightSidebar()
+    }
+  }
+}
+
+const onMainSplitResize = (params) => {
+  // Skip resize handling during quick close
+  if (isQuickClosing.value) {
+    return
+  }
+
+  // Signal resize to pause expensive chat observers
+  signalResizeStart()
+
+  mainTerminalSize.value = params.prevPane.size
+  if (showAiSidebar.value) {
+    aiSidebarSize.value = params.panes[params.panes.length - 1].size
+    debouncedAiResizeCheck()
+  }
+  if (splitPanes.value.length > 0) {
+    const startIndex = 1
+    const endIndex = showAiSidebar.value ? params.panes.length - 2 : params.panes.length - 1
+    for (let i = startIndex; i <= endIndex; i++) {
+      if (splitPanes.value[i - 1]) {
+        splitPanes.value[i - 1].size = params.panes[i].size
+      }
+    }
+  }
+}
+const sendGlobalCommand = () => {
+  if (globalInput.value != '') {
+    inputManager.globalSend(globalInput.value)
+    inputManager.globalSend('\r')
+    globalInput.value = ''
+  }
+}
+const checkActiveTab = (type) => {
+  isShowCommandBar.value = type == 'term' ? true : false
+}
+
+const onVerticalSplitResize = (params) => {
+  mainVerticalSize.value = params.prevPane.size
+  if (verticalSplitPanes.value.length > 0) {
+    const startIndex = 1
+    const endIndex = params.panes.length - 1
+    for (let i = startIndex; i <= endIndex; i++) {
+      if (verticalSplitPanes.value[i - 1]) {
+        verticalSplitPanes.value[i - 1].size = params.panes[i].size
+      }
+    }
+  }
+}
+
+const handleMainPaneFocus = () => {
+  focusedPane.value = { type: 'main' }
+  focusedSplitPaneIndex.value = null
+}
+
+const handleSendOrToggleAiFromTerminal = () => {
+  if (!dockApi || !dockApi.activePanel) {
+    toggleSideBar('right')
+    return
+  }
+  const activePanel = dockApi.activePanel
+  const params = activePanel.params
+  if (params && params.organizationId && params.organizationId !== '') {
+    const currentActiveTabId = params.id
+    if (currentActiveTabId) {
+      eventBus.emit('sendOrToggleAiFromTerminalForTab', currentActiveTabId)
+      return
+    }
+  }
+  toggleSideBar('right')
+}
+
+const handleModeChange = (mode: 'terminal' | 'agents') => {
+  // Save AI state before switching modes (unified since same aiTabRef)
+  if (aiTabRef.value) {
+    try {
+      const currentState = aiTabRef.value.getCurrentState?.()
+      if (currentState) {
+        // Save state to localStorage for persistence across mode switches
+        localStorage.setItem(aiTabStorageKey('terminal'), JSON.stringify(currentState))
+        // Also update savedAiSidebarState for immediate use
+        savedAiSidebarState.value = currentState
+      }
+    } catch (error) {
+      logger.warn('Failed to save AI state before mode switch', { error: error })
+    }
+  }
+  eventBus.emit('switch-mode', mode)
+}
+
+// Agents mode handlers
+const handleConversationSelect = async (conversation: { id: string; title: string; ts: number; favorite?: boolean }) => {
+  if (aiTabRef.value) {
+    const history = {
+      id: conversation.id,
+      chatTitle: conversation.title || 'New Chat',
+      chatContent: [],
+      isFavorite: conversation.favorite || false,
+      ts: conversation.ts
+    }
+
+    const aiTabInstance = aiTabRef.value as any
+    if (aiTabInstance && typeof aiTabInstance.restoreHistoryTab === 'function') {
+      await aiTabInstance.restoreHistoryTab(history)
+    } else {
+      eventBus.emit('restore-history-tab', history)
+    }
+  }
+}
+
+const handleNewChat = async () => {
+  if (aiTabRef.value) {
+    try {
+      const aiTabInstance = aiTabRef.value as any
+      if (aiTabInstance && typeof aiTabInstance.createNewEmptyTab === 'function') {
+        await aiTabInstance.createNewEmptyTab()
+      } else {
+        eventBus.emit('create-new-empty-tab')
+      }
+    } catch (error) {
+      logger.error('Failed to create new chat', { error: error })
+    }
+  }
+}
+
+const handleConversationDelete = async (conversationId: string) => {
+  if (aiTabRef.value) {
+    try {
+      const aiTabInstance = aiTabRef.value as any
+      if (aiTabInstance && typeof aiTabInstance.handleTabRemove === 'function') {
+        await aiTabInstance.handleTabRemove(conversationId)
+      } else {
+        eventBus.emit('remove-tab', conversationId)
+      }
+    } catch (error) {
+      logger.error('Failed to delete conversation tab', { error: error })
+    }
+  }
+}
+
+const dockviewRef = ref<InstanceType<typeof DockviewVue> | null>(null)
+const panelCount = ref(0)
+const hasPanels = computed(() => panelCount.value > 0)
+let dockApi: DockviewApi | null = null
+const dockApiInstance = ref<DockviewApi | null>(null)
+const isPreviewActionsVisible = ref(false)
+
+const getActiveDockTerminalTabId = (): string | null => getDockTerminalTabId(dockApi?.activePanel)
+
+const computePreviewActionsVisible = (): boolean => {
+  const panel = dockApi?.activePanel
+  if (!panel) return false
+  // Keep in sync with `EditorActions.vue` showActions logic.
+  return panel.params?.content === 'KnowledgeCenterEditor' && panel.params?.mode !== 'preview' && panel.params?.isMarkdown
+}
+
+const isFocusInTerminal = (event: KeyboardEvent): boolean => {
+  const target = event.target as HTMLElement | null
+  const activeElement = document.activeElement as HTMLElement | null
+  const terminalContainer = target?.closest('.terminal-container') || activeElement?.closest('.terminal-container')
+  const xtermElement = target?.closest('.xterm') || activeElement?.closest('.xterm')
+
+  return !!(terminalContainer || xtermElement)
+}
+
+const handleCloseTabKeyDown = (event: KeyboardEvent) => {
+  const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0
+  const isCloseShortcut = (isMac && event.metaKey && event.key === 'w') || (!isMac && event.ctrlKey && event.shiftKey && event.key === 'W')
+
+  if (!isCloseShortcut) {
+    return
+  }
+
+  if (isFocusInAiTab(event)) {
+    return
+  }
+
+  if (!dockApi || !dockApi.activePanel) {
+    return
+  }
+
+  const activePanel = dockApi.activePanel
+  const params = activePanel.params as Record<string, any> | undefined
+
+  if (isFocusInTerminal(event) && params?.organizationId && params.organizationId !== '') {
+    return
+  }
+
+  const CLOSE_DEBOUNCE_TIME = 100
+  const currentTime = Date.now()
+  if (currentTime - ((window as any).lastCloseTime || 0) < CLOSE_DEBOUNCE_TIME) {
+    event.preventDefault()
+    event.stopPropagation()
+    return
+  }
+  ;(window as any).lastCloseTime = currentTime
+
+  event.preventDefault()
+  event.stopPropagation()
+  activePanel.api.close()
+}
+
+defineOptions({
+  name: 'TerminalLayout',
+  components: {
+    TabsPanel
+  }
+})
+
+const applyTheme = () => {
+  const updateContainerTheme = (container: Element | null) => {
+    if (!container) return
+
+    container.classList.remove('dockview-theme-abyss')
+
+    if (currentTheme.value === 'light') {
+      container.classList.remove('dockview-theme-dark')
+      container.classList.add('dockview-theme-light')
+    } else {
+      container.classList.remove('dockview-theme-light')
+      container.classList.add('dockview-theme-dark')
+    }
+  }
+
+  updateContainerTheme(document.querySelector('.dockview-theme-abyss'))
+  updateContainerTheme(document.querySelector('.dockview-theme-light'))
+  updateContainerTheme(document.querySelector('.dockview-theme-dark'))
+}
+
+const handleActivePanelChange = async () => {
+  if (!dockApi) {
+    return
+  }
+
+  const activePanel = dockApi.activePanel
+  if (!activePanel) {
+    return
+  }
+
+  const params = activePanel.params
+  if (!params) {
+    return
+  }
+
+  const panelType = params.type || params.data?.type
+  const panelContent = params.content || params.data?.type // Identify non-terminal content type
+
+  if (panelContent === 'KnowledgeCenterEditor') {
+    const relPath = String(params.props?.relPath || params.data?.props?.relPath || '') // Active knowledge file path
+    if (relPath) {
+      eventBus.emit('kbActiveFileChanged', { relPath })
+    }
+    return
+  }
+
+  // Handle K8s tab changes: use cluster.id as uuid and server_url as ip
+  if (panelType === 'k8s') {
+    const cluster = params.data?.data || params.data
+    if (cluster && cluster.id && cluster.server_url) {
+      eventBus.emit('activeTabChanged', {
+        ip: cluster.server_url,
+        data: {
+          uuid: cluster.id,
+          asset_type: undefined
+        },
+        connection: 'k8s',
+        title: activePanel.api.title || params.title || cluster.name,
+        organizationId: undefined,
+        type: 'k8s'
+      })
+    }
+    return
+  }
+
+  // Handle terminal and SSH tab changes
+  if (panelType !== 'term' && panelType !== 'ssh') {
+    return
+  }
+
+  const ip = params.data?.ip || params.ip
+  const uuid = params.data?.uuid || params.uuid
+
+  if (ip && uuid) {
+    eventBus.emit('activeTabChanged', {
+      ip,
+      data: {
+        uuid,
+        asset_type: params.data?.asset_type
+      },
+      connection: params.data?.connection || 'personal',
+      title: activePanel.api.title || params.title,
+      organizationId: params.organizationId || params.data?.organizationId,
+      type: panelType
+    })
+  }
+}
+
+const onDockReady = (event: DockviewReadyEvent) => {
+  dockApi = event.api
+  dockApiInstance.value = event.api
+  isPreviewActionsVisible.value = computePreviewActionsVisible()
+
+  dockApi.onDidAddPanel(() => {
+    panelCount.value = dockApi?.panels.length ?? 0
+  })
+
+  dockApi.onDidRemovePanel((panel) => {
+    panelCount.value = dockApi?.panels.length ?? 0
+    // Clear Assets menu selection when corresponding tab is closed
+    const content = panel.params?.content
+    if (content === 'assetConfig' || content === 'keyManagement') {
+      assetsRef.value?.handleExplorerActive(content)
+    }
+  })
+
+  dockApi.onDidActivePanelChange(() => {
+    isPreviewActionsVisible.value = computePreviewActionsVisible()
+    handleActivePanelChange()
+  })
+
+  panelCount.value = dockApi.panels.length
+  nextTick(() => {
+    applyTheme()
+    setupTabContextMenu()
+    setupTabDragToAi()
+    handleActivePanelChange()
+    openInitialOnboardingGuideTab()
+  })
+}
+const addDockPanel = (params) => {
+  if (!dockApi) return
+
+  const id = 'panel_' + params.id
+  let displayTitle
+
+  if (params.content === 'CommonConfigEditor') {
+    displayTitle = params.title
+  } else if (params.ip || params.content.startsWith('plugins:')) {
+    displayTitle = params.title
+  } else if (params.title === 'mcpConfigEditor') {
+    displayTitle = t('mcp.configEditor')
+  } else if (params.content === 'securityConfigEditor' || params.content === 'keywordHighlightEditor') {
+    // For config editors, title is already set to file name in switch statement, use it directly
+    displayTitle = params.title
+  } else {
+    displayTitle = t(`common.${params.title}`) === `common.${params.title}` ? params.title : t(`common.${params.title}`)
+  }
+  dockApi.addPanel({
+    id,
+    component: 'TabsPanel',
+    title: displayTitle,
+    params: {
+      ...params,
+      closeCurrentPanel: (panelId?: string) => closeCurrentPanel(panelId || id),
+      createNewPanel: (isClone: boolean, direction: string, panelId?: string) => createNewPanel(isClone, direction as any, panelId || id)
+    }
+  })
+}
+
+const contextMenu = ref({
+  visible: false,
+  x: 0,
+  y: 0,
+  panelId: null as string | null,
+  tabEl: null as HTMLElement | null
+})
+const contextMenuRef = ref<HTMLElement | null>(null)
+
+const hideContextMenu = () => {
+  contextMenu.value.visible = false
+}
+const setupTabContextMenu = () => {
+  // Listen to dockview container
+  const container = dockviewRef.value?.$el
+  if (!container) return
+  container.addEventListener('contextmenu', (e: MouseEvent) => {
+    const target = e.target as HTMLElement
+    const tabElement = target.closest('.dv-tab') as HTMLElement | null
+    if (tabElement) {
+      e.preventDefault()
+
+      const panelId = findPanelIdFromTab(tabElement)
+      contextMenu.value = {
+        visible: true,
+        x: e.clientX,
+        y: e.clientY,
+        panelId,
+        tabEl: tabElement
+      }
+    } else {
+      hideContextMenu()
+    }
+  })
+
+  const handleMouseDown = (e: MouseEvent) => {
+    if (!contextMenu.value.visible) return
+
+    const target = e.target as HTMLElement
+    const inMenu = contextMenuRef.value?.contains(target)
+
+    if (inMenu) return
+
+    e.preventDefault()
+    e.stopPropagation()
+    hideContextMenu()
+  }
+
+  document.addEventListener('mousedown', handleMouseDown, true)
+
+  onBeforeUnmount(() => {
+    document.removeEventListener('mousedown', handleMouseDown, true)
+  })
+}
+
+const findPanelIdFromTab = (tabElement: HTMLElement): string | null => {
+  try {
+    if (!dockApi) return null
+
+    for (const panel of dockApi.panels) {
+      const panelGroup = panel.api.group
+      if (!panelGroup?.element?.contains(tabElement)) continue
+
+      // Get all tab elements in the group
+      const tabs = Array.from(panelGroup.element.querySelectorAll('.dv-tab'))
+      // Find the index of the clicked tab
+      const tabIndex = tabs.indexOf(tabElement)
+
+      if (tabIndex === -1) continue
+
+      // Get panels in the group (in tab order)
+      const groupPanels = panelGroup.panels
+
+      // Return the panel ID based on index
+      if (groupPanels && tabIndex < groupPanels.length) {
+        return groupPanels[tabIndex].id
+      }
+    }
+    return null
+  } catch (error) {
+    return null
+  }
+}
+
+const setupTabDragToAi = () => {
+  const container = dockviewRef.value?.$el
+  if (!container) return
+
+  container.addEventListener('dragstart', (e: DragEvent) => {
+    const target = e.target as HTMLElement
+    const tabElement = target.closest('.dv-tab') as HTMLElement | null
+    if (!tabElement || !e.dataTransfer) return
+
+    const panelId = findPanelIdFromTab(tabElement)
+    if (!panelId || !dockApi) return
+
+    const panel = dockApi.getPanel(panelId)
+    if (!panel) return
+
+    const params = panel.params as Record<string, any> | undefined
+    if (!params) return
+
+    // Handle KnowledgeCenterEditor (doc or image)
+    if (params.content === 'KnowledgeCenterEditor' && params.props?.relPath) {
+      const relPath = params.props.relPath as string
+      const name = params.title || relPath.split('/').pop() || 'KnowledgeCenter'
+      const contextType = isImageFile(relPath) ? 'image' : 'doc'
+      const dragPayload = { contextType, relPath, name }
+      const payload = JSON.stringify(dragPayload)
+      e.dataTransfer.setData('text/html', `<span data-chaterm-context="${encodeURIComponent(payload)}"></span>`)
+      e.dataTransfer.effectAllowed = 'copy'
+      return
+    }
+
+    // Handle host/terminal tabs
+    if (params.ip || params.organizationId) {
+      const data = params.data || {}
+      const dragPayload = {
+        contextType: 'host',
+        uuid: data.uuid || params.id,
+        label: params.title || params.ip,
+        connect: data.connect || params.ip,
+        assetType: data.asset_type || data.assetType,
+        isLocalHost: data.isLocalHost,
+        organizationUuid: data.organizationUuid || data.organizationId || params.organizationId
+      }
+      const payload = JSON.stringify(dragPayload)
+      e.dataTransfer.setData('text/html', `<span data-chaterm-context="${encodeURIComponent(payload)}"></span>`)
+      e.dataTransfer.effectAllowed = 'copy'
+    }
+  })
+}
+
+const canForkSshChannel = computed(() => {
+  const panelId = contextMenu.value.panelId
+  if (!panelId || !dockApi) return false
+  const panel = dockApi.getPanel(panelId)
+  if (!panel) return false
+  const params = (panel as any).api?.panel?._params ?? (panel as any).panel?._params
+  const panelType = params?.type || params?.data?.type
+  if (panelType !== 'term' && panelType !== 'ssh') return false
+  // params.id is the pure uuid that maps to sshConnect's currentConnectionId prop
+  const tabId = params?.id
+  return !!tabId && !!getSshConnectionId(tabId)
+})
+
+const forkSshChannel = () => {
+  const targetPanelId = contextMenu.value.panelId
+  if (!dockApi || !targetPanelId) {
+    hideContextMenu()
+    return
+  }
+
+  const sourcePanel = dockApi.getPanel(targetPanelId)
+  if (!sourcePanel) {
+    hideContextMenu()
+    return
+  }
+
+  const sourceTitle = sourcePanel.api.title ?? sourcePanel.id
+  const sourceComponent = sourcePanel.api.component
+  const rawParams = (sourcePanel as any).api?.panel?._params ?? (sourcePanel as any).panel?._params
+
+  // Get the SSH connectionId from registry using the tab's id (pure uuid)
+  const tabId = rawParams?.id
+  const sshConnectionId = tabId ? getSshConnectionId(tabId) : undefined
+  if (!sshConnectionId) {
+    hideContextMenu()
+    return
+  }
+
+  const newIdV4 = uuidv4()
+  const newId = 'panel_' + newIdV4
+
+  const params = {
+    ...safeCloneParams(rawParams),
+    currentPanelId: newId,
+    closeCurrentPanel: (pid?: string) => closeCurrentPanel(pid || newId),
+    createNewPanel: (isClone: boolean, direction: string, pid?: string) => createNewPanel(isClone, direction as any, pid || newId)
+  }
+
+  params.id = newIdV4
+  // Inject forkFromConnectionId so sshConnect.vue takes the fork path
+  if (params.data) {
+    params.data = { ...params.data, forkFromConnectionId: sshConnectionId }
+  } else {
+    params.data = { forkFromConnectionId: sshConnectionId }
+  }
+
+  dockApi.addPanel({
+    id: newId,
+    component: sourceComponent,
+    title: sourceTitle,
+    params: params,
+    position: {
+      referencePanel: sourcePanel,
+      direction: 'within'
+    }
+  })
+
+  hideContextMenu()
+}
+
+const createNewPanel = (isClone: boolean, direction: 'left' | 'right' | 'above' | 'below' | 'within', panelId?: string) => {
+  const targetPanelId = panelId || contextMenu.value.panelId
+  if (!dockApi || !targetPanelId) {
+    hideContextMenu()
+    return
+  }
+
+  const sourcePanel = dockApi.getPanel(targetPanelId)
+  if (!sourcePanel) {
+    hideContextMenu()
+    return
+  }
+
+  const sourceTitle = sourcePanel.api.title ?? sourcePanel.id
+  const sourceComponent = sourcePanel.api.component
+  const rawParams = (sourcePanel as any).api?.panel?._params ?? (sourcePanel as any).panel?._params
+
+  const newIdV4 = uuidv4()
+  let newId = 'panel_' + newIdV4
+  if (isClone) {
+    newId = 'panel_' + rawParams.id + '_clone_' + +Date.now()
+  }
+
+  const params = {
+    ...safeCloneParams(rawParams),
+    currentPanelId: newId,
+    closeCurrentPanel: (pid?: string) => closeCurrentPanel(pid || newId),
+    createNewPanel: (isClone: boolean, direction: string, pid?: string) => createNewPanel(isClone, direction as any, pid || newId)
+  }
+
+  params.id = newIdV4
+
+  // Tag clone/split origin on the tab data consumed by sshConnect so bastion
+  // plugins (e.g. qizhi) can auto-apply the previous multi-user selection.
+  if (params.data) {
+    if (isClone) {
+      params.data = { ...params.data, source: 'clone' }
+      logger.info('Tagged cloned terminal panel source for bastion reuse', {
+        event: 'layout.terminal.clone_split_source_tagged',
+        panelDirection: direction,
+        panelSource: 'clone',
+        panelId: targetPanelId,
+        nextPanelId: newId,
+        previousSource: typeof rawParams?.data?.source === 'string' ? rawParams.data.source : 'none'
+      })
+    } else if (direction !== 'within') {
+      params.data = { ...params.data, source: 'split' }
+      logger.info('Tagged split terminal panel source for bastion reuse', {
+        event: 'layout.terminal.clone_split_source_tagged',
+        panelDirection: direction,
+        panelSource: 'split',
+        panelId: targetPanelId,
+        nextPanelId: newId,
+        previousSource: typeof rawParams?.data?.source === 'string' ? rawParams.data.source : 'none'
+      })
+    }
+  } else if (isClone || direction !== 'within') {
+    logger.warn('Clone/split terminal panel missing connection data for bastion reuse tagging', {
+      event: 'layout.terminal.clone_split_source_missing_data',
+      panelDirection: direction,
+      panelSource: isClone ? 'clone' : 'split',
+      panelId: targetPanelId,
+      nextPanelId: newId
+    })
+  }
+
+  dockApi.addPanel({
+    id: newId,
+    component: sourceComponent,
+    title: sourceTitle,
+    params: params,
+    position: {
+      referencePanel: sourcePanel,
+      direction: direction
+    }
+  })
+
+  hideContextMenu()
+}
+
+const closeCurrentPanel = (panelId?: string) => {
+  let targetPanelId = panelId
+  if (!targetPanelId || typeof panelId !== 'string') {
+    targetPanelId = contextMenu.value.panelId || undefined
+  }
+  if (!dockApi || !targetPanelId) {
+    closeContextMenu()
+    return
+  }
+
+  const panel = dockApi.getPanel(targetPanelId)
+
+  if (panel) {
+    panel.api.close()
+  }
+
+  closeContextMenu()
+}
+
+const renaming = ref(false)
+const renamingPanelId = ref<string | null>(null)
+const renamingTitle = ref('')
+const renameInputRef = ref<HTMLInputElement | null>(null)
+const renameRect = ref({
+  x: 0,
+  y: 0,
+  width: 0,
+  height: 0
+})
+const renamePanelInline = () => {
+  if (!dockApi || !contextMenu.value.panelId || !contextMenu.value.tabEl) {
+    hideContextMenu()
+    return
+  }
+
+  const panelId = contextMenu.value.panelId
+  const tabEl = contextMenu.value.tabEl
+  const panel = dockApi.getPanel(panelId)
+
+  if (!panel) {
+    hideContextMenu()
+    return
+  }
+
+  const currentTitle = panel.api.title ?? panel.id
+
+  const rect = tabEl.getBoundingClientRect()
+  renameRect.value = {
+    x: rect.left,
+    y: rect.top,
+    width: rect.width,
+    height: rect.height
+  }
+
+  renaming.value = true
+  renamingPanelId.value = panelId
+  renamingTitle.value = currentTitle
+
+  hideContextMenu()
+
+  nextTick(() => {
+    const input = renameInputRef.value
+    if (input) {
+      input.focus()
+      input.select()
+    }
+  })
+}
+
+const finishRename = () => {
+  if (!dockApi || !renamingPanelId.value) {
+    cancelRename()
+    return
+  }
+
+  const title = renamingTitle.value.trim()
+  if (!title) {
+    cancelRename()
+    return
+  }
+
+  const panel = dockApi.getPanel(renamingPanelId.value)
+  if (!panel) {
+    cancelRename()
+    return
+  }
+
+  panel.api.setTitle(title)
+
+  const rawParams = panel.params
+
+  if (rawParams && typeof rawParams === 'object') {
+    ;(rawParams as any).title = title
+    panel.api.updateParameters?.({ ...rawParams })
+  }
+
+  renaming.value = false
+  renamingPanelId.value = null
+  renamingTitle.value = ''
+}
+
+const cancelRename = () => {
+  renaming.value = false
+  renamingPanelId.value = null
+  renamingTitle.value = ''
+}
+
+const closeOtherPanelsAllGroups = () => {
+  if (!dockApi || !contextMenu.value.panelId) {
+    hideContextMenu()
+    return
+  }
+
+  const currentId = contextMenu.value.panelId
+  const panels = [...dockApi.panels]
+
+  for (const panel of panels) {
+    if (panel.id !== currentId) {
+      panel.api.close()
+    }
+  }
+
+  hideContextMenu()
+}
+
+const closeContextMenu = () => {
+  contextMenu.value.visible = false
+}
+
+const closeAllPanels = () => {
+  if (!dockApi || !contextMenu.value.panelId) {
+    hideContextMenu()
+    return
+  }
+  const panels = [...dockApi.panels]
+
+  for (const panel of panels) {
+    panel.api.close()
+  }
+
+  hideContextMenu()
+}
+
+function safeCloneParams<T>(value: T): T {
+  if (
+    value === null ||
+    typeof value === 'string' ||
+    typeof value === 'number' ||
+    typeof value === 'boolean' ||
+    typeof value === 'bigint' ||
+    typeof value === 'symbol'
+  ) {
+    return value
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => safeCloneParams(item)) as unknown as T
+  }
+
+  if (typeof value !== 'object') {
+    return value
+  }
+
+  const proto = Object.getPrototypeOf(value)
+  if (proto !== Object.prototype && proto !== null) {
+    return value
+  }
+
+  const result: any = {}
+  for (const [key, val] of Object.entries(value as any)) {
+    result[key] = safeCloneParams(val as any)
+  }
+  return result as T
+}
+
+defineExpose({
+  resizeTerm: () => {
+    allTabs.value?.resizeTerm()
+  },
+  getActiveTabAssetInfo,
+  adjustSplitPaneToEqualWidth
+})
+</script>
+<style lang="less">
+.terminal-layout {
+  height: 100vh;
+  width: 100vw;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-color);
+  color: var(--text-color);
+  margin: 0;
+
+  &.agents-mode {
+    .term_body {
+      .term_content {
+        width: 100%;
+        height: 100%;
+        box-sizing: border-box;
+
+        .agents-chat-container {
+          width: 100%;
+          height: 100%;
+          background: var(--bg-color);
+        }
+      }
+    }
+  }
+
+  &.transparent-bg {
+    background: transparent !important;
+
+    .dockview-theme-dark,
+    .dockview-theme-light {
+      --dv-group-view-background-color: transparent !important;
+      --dv-tabs-and-actions-container-background-color: transparent !important;
+      --dv-activegroup-visiblepanel-tab-background-color: rgba(60, 60, 60, 0.3) !important;
+      --dv-activegroup-hiddenpanel-tab-background-color: transparent !important;
+      --dv-inactivegroup-visiblepanel-tab-background-color: transparent !important;
+      --dv-inactivegroup-hiddenpanel-tab-background-color: transparent !important;
+      --dv-paneview-header-border-color: rgba(255, 255, 255, 0.1) !important;
+    }
+  }
+
+  ::-webkit-scrollbar {
+    width: 2px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background-color: var(--bg-color-secondary) !important;
+    border-radius: 5px;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background-color: var(--bg-color-secondary) !important;
+    border-radius: 5px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: var(--bg-color-secondary) !important;
+  }
+
+  .term_header {
+    width: 100%;
+    height: 28px;
+  }
+
+  .term_body {
+    width: 100%;
+    height: calc(100% - 29px);
+    position: relative;
+
+    .agents-mode-layout,
+    .terminal-mode-layout {
+      width: 100%;
+      height: 100%;
+      position: absolute;
+      top: 0;
+      left: 0;
+      transition: opacity 0.2s ease;
+    }
+
+    .agents-mode-layout {
+      .term_content {
+        width: 100%;
+        height: 100%;
+        box-sizing: border-box;
+      }
+    }
+
+    .terminal-mode-layout {
+      display: flex;
+    }
+
+    .term_left_menu {
+      width: 40px;
+      height: 100%;
+      box-sizing: border-box;
+    }
+
+    .term_content {
+      width: calc(100% - 40px);
+      height: 100%;
+      box-sizing: border-box;
+
+      .termBoxs::-webkit-scrollbar {
+        display: none;
+      }
+
+      .term_content_left {
+        width: 250px;
+        min-width: 200px;
+
+        &.collapsed {
+          min-width: 0 !important;
+        }
+      }
+
+      .agents_content_left {
+        min-width: 200px;
+
+        &.collapsed {
+          min-width: 0 !important;
+        }
+      }
+    }
+  }
+}
+
+.rigth-sidebar {
+  width: 100%;
+  height: 100%;
+  background: var(--bg-color) !important;
+  transition: width 0.3s ease;
+  position: relative;
+  outline: none;
+}
+
+.rigth-sidebar.collapsed {
+  width: 0px;
+}
+
+.bottom-sidebar {
+  width: 100%;
+  height: 100%;
+  background: var(--bg-color) !important;
+  transition: height 0.3s ease;
+  position: relative;
+  outline: none;
+}
+
+.bottom-sidebar:focus-within {
+  box-shadow: inset 0 2px 0 var(--primary-color, #1890ff);
+}
+
+.main-terminal-area {
+  position: relative;
+
+  width: 100%;
+  height: 100%;
+
+  .main-workspace-tabs-target {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 34px;
+    height: 34px;
+    z-index: 11;
+    pointer-events: none;
+  }
+
+  .dockview-actions-overlay {
+    position: absolute;
+    top: 0;
+    right: 0;
+    z-index: 10;
+  }
+
+  // Reserve space for the preview actions overlay so it never covers
+  // Dockview header tabs when they overflow/clamp.
+  &.has-preview-actions {
+    .dockview-theme-light .dv-tabs-and-actions-container,
+    .dockview-theme-dark .dv-tabs-and-actions-container {
+      padding-right: 30px;
+      box-sizing: border-box;
+    }
+  }
+}
+
+.ant-input-group-wrapper {
+  background-color: #202020 !important;
+
+  .ant-input {
+    background-color: #202020 !important;
+    border: none;
+    color: #fff !important;
+  }
+
+  .ant-input-group-addon {
+    background-color: #202020 !important;
+    border: none;
+    color: #fff !important;
+
+    button {
+      background-color: #202020 !important;
+      border: none;
+      color: #fff !important;
+    }
+  }
+}
+
+.toolbar {
+  position: absolute;
+  left: 0;
+  bottom: 2px;
+  color: var(--text-color);
+  width: 100%;
+  z-index: 10;
+}
+
+.globalInput {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+
+  .ant-input {
+    background-color: transparent;
+    color: var(--text-color);
+
+    &::placeholder {
+      color: var(--text-color-tertiary);
+    }
+  }
+
+  .ant-input-affix-wrapper {
+    background-color: var(--globalInput-bg-color);
+    border-color: var(--border-color-light);
+
+    &:hover,
+    &:focus,
+    &:active {
+      border-color: var(--primary-color, #1677ff) !important;
+      box-shadow: none !important;
+    }
+  }
+}
+
+.broadcast-indicator {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  background: var(--primary-color-light, rgba(22, 119, 255, 0.1));
+  border: 1px solid var(--primary-color, #1677ff);
+  border-radius: 4px;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--primary-color, #1677ff);
+}
+
+.broadcast-icon {
+  font-size: 10px;
+}
+
+.broadcast-text {
+  font-weight: 500;
+}
+
+.close-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-color-secondary);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 4px;
+  transition: all 0.2s;
+
+  &:hover {
+    background: var(--hover-bg-color);
+    color: var(--text-color);
+  }
+}
+
+.command-input {
+  background: var(--globalInput-bg-color);
+  border: 1px solid var(--border-color-light);
+  height: 30px;
+  flex: 1;
+}
+
+.menu-action-btn {
+  background: var(--globalInput-bg-color);
+  border: none;
+  color: var(--text-color);
+  height: 32px !important;
+  margin-left: 8px;
+
+  &:hover,
+  &:focus,
+  &:active {
+    background: var(--globalInput-bg-color);
+    color: var(--text-color) !important;
+    box-shadow: none !important;
+  }
+}
+
+.hide-tab-close-button .dv-default-tab-action {
+  display: none !important;
+}
+</style>
+<style lang="less">
+.splitpanes__splitter {
+  background-color: var(--border-color);
+  position: relative;
+}
+
+.splitpanes__splitter:before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  transition: opacity 0.4s;
+  background-color: rgba(77, 77, 77, 0.3);
+  opacity: 0;
+  z-index: 1;
+}
+
+.splitpanes__splitter:hover:before {
+  opacity: 1;
+}
+
+.splitpanes--vertical > .splitpanes__splitter:before {
+  left: -8px;
+  right: -8px;
+  height: 100%;
+}
+
+.splitpanes--horizontal > .splitpanes__splitter:before {
+  left: -8px;
+  right: -8px;
+  height: 100%;
+}
+
+// Ensure left sidebar container and all its panes have no transitions
+.left-sidebar-container .splitpanes__pane {
+  transition: none !important;
+  animation: none !important;
+}
+
+// Database workspace mode fills the full term_content area
+.database-workspace-mode {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+.context-menu {
+  position: fixed;
+  background-color: var(--bg-color);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 4px;
+  z-index: 1000;
+  box-shadow:
+    0 4px 20px rgba(0, 0, 0, 0.15),
+    0 2px 8px rgba(0, 0, 0, 0.1);
+  min-width: 180px;
+  font-size: 13px;
+  backdrop-filter: blur(10px);
+}
+
+.context-menu-item {
+  padding: 6px 12px;
+  margin: 1px 0;
+  cursor: pointer;
+  color: var(--text-color);
+  border-radius: 6px;
+  font-weight: 500;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  user-select: none;
+}
+
+.context-menu-item:hover {
+  background-color: var(--hover-bg-color);
+  transform: translateX(2px);
+}
+
+.context-menu-item:active {
+  background-color: var(--active-bg-color);
+  transform: translateX(2px) scale(0.98);
+}
+
+.tab-title-input {
+  flex: 1;
+  font-size: 13px;
+  border: 1px solid #007acc;
+  border-radius: 2px;
+  background-color: var(--bg-color);
+  color: var(--text-color);
+  outline: none;
+}
+
+.tab-title-input:focus {
+  border-color: #007acc;
+  box-shadow: 0 0 0 1px #007acc;
+}
+
+.dockview-theme-light {
+  --dv-paneview-active-outline-color: dodgerblue;
+  --dv-tabs-and-actions-container-font-size: 13px;
+  --dv-tabs-and-actions-container-height: 35px;
+  --dv-drag-over-background-color: rgba(83, 89, 93, 0.5);
+  --dv-drag-over-border-color: transparent;
+  --dv-tabs-container-scrollbar-color: #888;
+  --dv-icon-hover-background-color: rgba(90, 93, 94, 0.31);
+  --dv-floating-box-shadow: 8px 8px 8px 0px rgba(83, 89, 93, 0.5);
+  --dv-overlay-z-index: 999;
+  --dv-tab-font-size: inherit;
+  --dv-border-radius: 0px;
+  --dv-tab-margin: 0;
+  --dv-sash-color: var(--bg-color-secondary);
+  --dv-active-sash-color: transparent;
+  --dv-active-sash-transition-duration: 0.1s;
+  --dv-active-sash-transition-delay: 0.5s;
+  --dv-group-view-background-color: var(--bg-color);
+  --dv-tabs-and-actions-container-background-color: var(--bg-color);
+  --dv-activegroup-visiblepanel-tab-background-color: var(--bg-color-tertiary);
+  --dv-activegroup-hiddenpanel-tab-background-color: var(--bg-color);
+  --dv-inactivegroup-visiblepanel-tab-background-color: var(--bg-color-secondary);
+  --dv-inactivegroup-hiddenpanel-tab-background-color: var(--bg-color);
+  --dv-tab-divider-color: var(--border-color);
+  --dv-activegroup-visiblepanel-tab-color: rgb(51, 51, 51);
+  --dv-activegroup-hiddenpanel-tab-color: rgba(51, 51, 51, 0.7);
+  --dv-inactivegroup-visiblepanel-tab-color: rgba(51, 51, 51, 0.7);
+  --dv-inactivegroup-hiddenpanel-tab-color: rgba(51, 51, 51, 0.35);
+  --dv-separator-border: rgba(128, 128, 128, 0.35);
+  --dv-paneview-header-border-color: rgb(51, 51, 51);
+  --dv-scrollbar-background-color: rgba(0, 0, 0, 0.25);
+}
+
+.dockview-theme-light .dv-tabs-and-actions-container {
+  border-bottom: 1px solid var(--border-color);
+}
+
+.dockview-theme-light .dv-groupview.dv-active-group > .dv-tabs-and-actions-container .dv-tab.dv-active-tab {
+  border: 1px solid var(--border-color);
+  border-bottom: none;
+  border-radius: 4px 4px 0 0;
+}
+
+.dockview-theme-light .dv-drop-target-container .dv-drop-target-anchor.dv-drop-target-anchor-container-changed {
+  opacity: 0;
+  transition: none;
+}
+
+.dockview-theme-dark {
+  --dv-paneview-active-outline-color: dodgerblue;
+  --dv-tabs-and-actions-container-font-size: 13px;
+  --dv-tabs-and-actions-container-height: 35px;
+  --dv-drag-over-background-color: rgba(83, 89, 93, 0.5);
+  --dv-drag-over-border-color: transparent;
+  --dv-tabs-container-scrollbar-color: #888;
+  --dv-icon-hover-background-color: rgba(90, 93, 94, 0.31);
+  --dv-floating-box-shadow: 8px 8px 8px 0px rgba(83, 89, 93, 0.5);
+  --dv-overlay-z-index: 999;
+  --dv-tab-font-size: inherit;
+  --dv-border-radius: 0px;
+  --dv-tab-margin: 0;
+  --dv-sash-color: var(--bg-color-secondary);
+  --dv-active-sash-color: transparent;
+  --dv-active-sash-transition-duration: 0.1s;
+  --dv-active-sash-transition-delay: 0.5s;
+  --dv-group-view-background-color: #1e1e1e;
+  --dv-tabs-and-actions-container-background-color: var(--bg-color);
+  --dv-activegroup-visiblepanel-tab-background-color: var(--bg-color-tertiary);
+  --dv-activegroup-hiddenpanel-tab-background-color: var(--bg-color);
+  --dv-inactivegroup-visiblepanel-tab-background-color: #1e1e1e;
+  --dv-inactivegroup-hiddenpanel-tab-background-color: var(--bg-color);
+  --dv-tab-divider-color: #1e1e1e;
+  --dv-activegroup-visiblepanel-tab-color: white;
+  --dv-activegroup-hiddenpanel-tab-color: #969696;
+  --dv-inactivegroup-visiblepanel-tab-color: #8f8f8f;
+  --dv-inactivegroup-hiddenpanel-tab-color: #626262;
+  --dv-separator-border: rgb(68, 68, 68);
+  --dv-paneview-header-border-color: rgba(204, 204, 204, 0.2);
+}
+
+.dockview-theme-dark .dv-drop-target-container .dv-drop-target-anchor.dv-drop-target-anchor-container-changed {
+  opacity: 0;
+  transition: none;
+}
+
+.dockview-theme-light .dv-tab,
+.dockview-theme-dark .dv-tab {
+  max-width: 180px;
+  min-width: 0;
+}
+
+.dockview-theme-light .dv-default-tab,
+.dockview-theme-dark .dv-default-tab {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.dockview-theme-light .dv-default-tab .dv-default-tab-content,
+.dockview-theme-dark .dv-default-tab .dv-default-tab-content {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+</style>

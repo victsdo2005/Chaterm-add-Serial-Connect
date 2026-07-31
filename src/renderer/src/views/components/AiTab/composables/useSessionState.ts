@@ -1,0 +1,424 @@
+import { ref, computed, watch, type ComputedRef } from 'vue'
+import { createGlobalState } from '@vueuse/core'
+import type { ChatMessage, Host } from '../types'
+import type { ContentPart } from '@shared/WebviewMessage'
+import type { ExtensionMessage } from '@shared/ExtensionMessage'
+
+export interface HistoryPaginationState {
+  beforeCursor: number | null
+  hasMoreBefore: boolean
+  isLoadingBefore: boolean
+  pageSize: number
+}
+
+/**
+ * Session state interface
+ * Defines the session state structure for each Tab
+ */
+export interface SessionState {
+  chatHistory: ChatMessage[] // Chat history list
+  lastChatMessageId: string // ID of the last message
+  responseLoading: boolean // Whether response is loading
+  showRetryButton: boolean // Whether to show retry button
+  showSendButton: boolean // Whether to show send button
+  buttonsDisabled: boolean // Whether buttons are disabled
+  isExecutingCommand: boolean // Whether command is executing
+  lastStreamMessage: ExtensionMessage | null // Last stream message
+  lastPartialMessage: ExtensionMessage | null // Last partial message
+  lastStateChatermMessages: unknown[] | null // Cached chatermMessages from last state message, survives partialMessage overwrites
+  shouldStickToBottom: boolean // Whether should stick to bottom
+  isCancelled: boolean // Whether the current task has been cancelled/interrupted
+  historyPagination?: HistoryPaginationState
+}
+
+/**
+ * Tab information interface
+ */
+export interface ChatTab {
+  id: string // Tab ID (UUID)
+  title: string // Tab title
+  hosts: Host[] // Associated host list
+  agentHosts?: Host[] // Saved hosts for agent mode (restored when switching back from chat mode)
+  chatType: string // Chat type (agent/cmd/chat)
+  autoUpdateHost: boolean // Whether to auto-update host
+  session: SessionState // Session state
+  chatInputParts?: ContentPart[] // Draft content parts for mixed input
+  modelValue: string // Selected AI model for this tab
+  welcomeTip: string // Welcome tip for this tab
+}
+
+export interface UserAssistantPairItem {
+  message: ChatMessage
+  historyIndex: number
+}
+
+export interface UserAssistantPair {
+  user?: UserAssistantPairItem
+  assistants: UserAssistantPairItem[]
+}
+
+/**
+ * Composable for session state management (core - global singleton)
+ * Manages all Tabs and session states
+ * Uses createGlobalState to ensure global unique instance
+ */
+export const useSessionState = createGlobalState(() => {
+  const isRenderableChatMessage = (msg: ChatMessage): boolean => {
+    return msg.say !== 'api_req_started'
+  }
+
+  const currentChatId = ref<string | undefined>(undefined)
+
+  const chatTabs = ref<ChatTab[]>([])
+
+  const chatTextareaRef = ref<HTMLTextAreaElement | null>(null)
+
+  const chatContainerScrollSignal = ref(0)
+
+  const messageFeedbacks = ref<Record<string, 'like' | 'dislike'>>({})
+
+  const isMessageEditing = ref(false) // Global flag to track if any user message is being edited
+
+  // Per-tab computed cache for user-assistant pairs
+  const tabPairsCache = new Map<string, ComputedRef<UserAssistantPair[]>>()
+
+  const createEmptySessionState = (): SessionState => ({
+    chatHistory: [],
+    lastChatMessageId: '',
+    responseLoading: false,
+    showRetryButton: false,
+    showSendButton: true,
+    buttonsDisabled: false,
+    isExecutingCommand: false,
+    lastStreamMessage: null,
+    lastPartialMessage: null,
+    lastStateChatermMessages: null,
+    shouldStickToBottom: true,
+    isCancelled: false,
+    historyPagination: {
+      beforeCursor: null,
+      hasMoreBefore: false,
+      isLoadingBefore: false,
+      pageSize: 40
+    }
+  })
+
+  const currentTab = computed(() => {
+    return chatTabs.value.find((tab) => tab.id === currentChatId.value)
+  })
+
+  const currentSession = computed(() => currentTab.value?.session)
+
+  const currentChatTitle = computed({
+    get: () => currentTab.value?.title ?? 'New chat',
+    set: (value: string) => {
+      if (currentTab.value) {
+        currentTab.value.title = value
+      }
+    }
+  })
+
+  const chatTypeValue = computed({
+    get: () => currentTab.value?.chatType ?? '',
+    set: (value: string) => {
+      if (currentTab.value) {
+        currentTab.value.chatType = value
+      }
+    }
+  })
+
+  const hosts = computed({
+    get: () => currentTab.value?.hosts ?? [],
+    set: (value: Host[]) => {
+      if (currentTab.value) {
+        currentTab.value.hosts = value
+      }
+    }
+  })
+
+  const chatInputParts = computed({
+    get: () => currentTab.value?.chatInputParts ?? [],
+    set: (value: ContentPart[]) => {
+      if (currentTab.value) {
+        currentTab.value.chatInputParts = value
+      }
+    }
+  })
+
+  const autoUpdateHost = computed({
+    get: () => currentTab.value?.autoUpdateHost ?? true,
+    set: (value: boolean) => {
+      if (currentTab.value) {
+        currentTab.value.autoUpdateHost = value
+      }
+    }
+  })
+
+  const shouldStickToBottom = computed({
+    get: () => currentSession.value?.shouldStickToBottom ?? true,
+    set: (value: boolean) => {
+      if (currentSession.value) {
+        currentSession.value.shouldStickToBottom = value
+      }
+    }
+  })
+
+  const lastChatMessageId = computed(() => currentSession.value?.lastChatMessageId ?? '')
+  const responseLoading = computed(() => currentSession.value?.responseLoading ?? false)
+  const chatHistory = computed(() => currentSession.value?.chatHistory ?? [])
+  const showSendButton = computed(() => currentSession.value?.showSendButton ?? true)
+  const buttonsDisabled = computed(() => currentSession.value?.buttonsDisabled ?? false)
+  const isExecutingCommand = computed(() => currentSession.value?.isExecutingCommand ?? false)
+  const showRetryButton = computed(() => currentSession.value?.showRetryButton ?? false)
+
+  /**
+   * Filtered chat history
+   * Hides sshInfo messages after Agent reply
+   */
+  const filteredChatHistory = computed(() => {
+    const history = currentSession.value?.chatHistory ?? []
+    const hasAgentReply = history.some(
+      (msg) =>
+        isRenderableChatMessage(msg) &&
+        msg.role === 'assistant' &&
+        msg.say !== 'sshInfo' &&
+        (msg.say === 'text' || msg.say === 'completion_result' || msg.ask === 'command')
+    )
+    const base = hasAgentReply ? history.filter((msg) => msg.say !== 'sshInfo') : history
+    return base.filter(isRenderableChatMessage)
+  })
+
+  const shouldShowSendButton = computed(() => {
+    const hasText = chatInputParts.value.some((part) => part.type === 'text' && part.text.trim().length > 0)
+    const hasChip = chatInputParts.value.some((part) => part.type === 'chip')
+    return hasText || hasChip
+  })
+
+  const chatAiModelValue = computed({
+    get: () => currentTab.value?.modelValue ?? '',
+    set: (value: string) => {
+      if (currentTab.value) {
+        currentTab.value.modelValue = value
+      }
+    }
+  })
+
+  watch(
+    () => currentSession.value?.chatHistory.length,
+    () => {
+      const session = currentSession.value
+      if (session) {
+        session.buttonsDisabled = false
+      }
+    }
+  )
+
+  /**
+   * Sync send button state to session
+   */
+  watch(
+    shouldShowSendButton,
+    (newValue) => {
+      const session = currentSession.value
+      if (session) {
+        session.showSendButton = newValue
+      }
+    },
+    { immediate: true }
+  )
+
+  const attachTabContext = <T extends Record<string, any>>(payload: T): T & { tabId?: string; taskId?: string } => {
+    const tabId = currentChatId.value
+    if (!tabId) {
+      return payload
+    }
+
+    return {
+      ...payload,
+      tabId: payload?.tabId ?? tabId,
+      taskId: payload?.taskId ?? tabId
+    }
+  }
+
+  const isEmptyTab = (tabId: string): boolean => {
+    const tab = chatTabs.value.find((t) => t.id === tabId)
+    if (!tab) {
+      return false
+    }
+    return tab.session.chatHistory.length === 0
+  }
+
+  /**
+   * Check if a message is the last one in the chat history
+   */
+  const isLastMessage = (tabId: string, messageId: string): boolean => {
+    const tab = chatTabs.value.find((t) => t.id === tabId)
+    if (!tab || !tab.session.chatHistory || tab.session.chatHistory.length === 0) {
+      return false
+    }
+
+    const lastMessage = tab.session.chatHistory[tab.session.chatHistory.length - 1]
+    return lastMessage?.id === messageId
+  }
+
+  /**
+   * Create or get computed pairs for a specific tab
+   * Ensures fine-grained reactivity - only recompute when specific tab's data changes
+   */
+  const getOrCreateTabPairsComputed = (tabId: string): ComputedRef<UserAssistantPair[]> => {
+    if (tabPairsCache.has(tabId)) {
+      return tabPairsCache.get(tabId)!
+    }
+
+    // Create new computed for this tab
+    const pairsComputed = computed(() => {
+      const tab = chatTabs.value.find((item) => item.id === tabId)
+      if (!tab) {
+        return []
+      }
+
+      let history = tab.session.chatHistory ?? []
+
+      const hasAgentReply = history.some(
+        (msg) =>
+          isRenderableChatMessage(msg) &&
+          msg.role === 'assistant' &&
+          msg.say !== 'sshInfo' &&
+          (msg.say === 'text' || msg.say === 'completion_result' || msg.ask === 'command')
+      )
+      const baseHistory = hasAgentReply ? history.filter((msg) => msg.say !== 'sshInfo') : history
+      history = baseHistory.filter(isRenderableChatMessage)
+
+      // Group into user-assistant pairs
+      const pairs: UserAssistantPair[] = []
+      let currentPair: UserAssistantPair | null = null
+
+      history.forEach((msg, idx) => {
+        if (msg.role !== 'assistant') {
+          currentPair = { user: { message: msg, historyIndex: idx }, assistants: [] }
+          pairs.push(currentPair)
+          return
+        }
+
+        if (!currentPair) {
+          currentPair = { assistants: [] }
+          pairs.push(currentPair)
+        }
+        currentPair.assistants.push({ message: msg, historyIndex: idx })
+      })
+
+      return pairs
+    })
+
+    tabPairsCache.set(tabId, pairsComputed)
+
+    return pairsComputed
+  }
+
+  /**
+   * Clean up computed cache for removed tabs
+   */
+  const cleanupTabPairsCache = (tabId: string) => {
+    if (tabPairsCache.has(tabId)) {
+      tabPairsCache.delete(tabId)
+    }
+  }
+
+  /**
+   * Group messages into user + assistant(s) pairs for rendering
+   */
+  const getTabUserAssistantPairs = (tabId: string): UserAssistantPair[] => {
+    if (!chatTabs.value.find((t) => t.id === tabId)) return []
+
+    const pairsComputed = getOrCreateTabPairsComputed(tabId)
+    return pairsComputed.value
+  }
+
+  /**
+   * Get chat type value for a specific tab
+   */
+  const getTabChatTypeValue = (tabId: string): string => {
+    const tab = chatTabs.value.find((t) => t.id === tabId)
+    return tab?.chatType ?? ''
+  }
+
+  /**
+   * Get last chat message ID for a specific tab
+   */
+  const getTabLastChatMessageId = (tabId: string): string => {
+    const tab = chatTabs.value.find((t) => t.id === tabId)
+    return tab?.session.lastChatMessageId ?? ''
+  }
+
+  /**
+   * Get response loading state for a specific tab
+   */
+  const getTabResponseLoading = (tabId: string): boolean => {
+    const tab = chatTabs.value.find((t) => t.id === tabId)
+    return tab?.session.responseLoading ?? false
+  }
+
+  /**
+   * Whether the specified tab still has older history available.
+   */
+  const getTabHasOlderHistory = (tabId: string): boolean => {
+    const tab = chatTabs.value.find((t) => t.id === tabId)
+    return tab?.session.historyPagination?.hasMoreBefore ?? false
+  }
+
+  /**
+   * Append text to input parts
+   * @param text - Text to append
+   * @param prefix - Prefix when parts is not empty (default: ' ')
+   * @param suffix - Suffix to append after text (default: '')
+   */
+  const appendTextToInputParts = (text: string, prefix: string = ' ', suffix: string = '') => {
+    const parts = [...chatInputParts.value]
+    const last = parts[parts.length - 1]
+    const textToAppend = parts.length > 0 ? `${prefix}${text}${suffix}` : `${text}${suffix}`
+    if (last && last.type === 'text') {
+      parts[parts.length - 1] = { ...last, text: last.text + textToAppend }
+    } else {
+      parts.push({ type: 'text', text: textToAppend })
+    }
+    chatInputParts.value = parts
+  }
+
+  return {
+    currentChatId,
+    chatTabs,
+    currentTab,
+    currentSession,
+    createEmptySessionState,
+    currentChatTitle,
+    chatTypeValue,
+    chatAiModelValue,
+    hosts,
+    chatInputParts,
+    autoUpdateHost,
+    shouldStickToBottom,
+    lastChatMessageId,
+    responseLoading,
+    chatHistory,
+    filteredChatHistory,
+    showSendButton,
+    buttonsDisabled,
+    isExecutingCommand,
+    showRetryButton,
+    shouldShowSendButton,
+    attachTabContext,
+    isEmptyTab,
+    chatTextareaRef,
+    chatContainerScrollSignal,
+    messageFeedbacks,
+    isMessageEditing,
+    isLastMessage,
+    getTabUserAssistantPairs,
+    getTabChatTypeValue,
+    getTabLastChatMessageId,
+    getTabResponseLoading,
+    getTabHasOlderHistory,
+    cleanupTabPairsCache,
+    appendTextToInputParts
+  }
+})

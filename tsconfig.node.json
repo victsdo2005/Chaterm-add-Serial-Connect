@@ -1,0 +1,31 @@
+{
+  "extends": "@electron-toolkit/tsconfig/tsconfig.node.json",
+  "include": ["electron.vite.config.*", "src/main/**/*", "src/preload/**/*", "src/shared/**/*", "package.json"],
+  "exclude": ["node_modules","dist"],
+  "compilerOptions": {
+    "composite": true,
+    "types": ["electron-vite/node"],
+    "baseUrl": ".",
+    "outDir": "dist/main",
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "sourceMap": true,
+    "moduleResolution": "bundler",
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "paths": {
+      "@services/*": ["src/main/agent/services/*"],
+      "@api/*": ["src/main/agent/api/*"],
+      "@integrations/*": ["src/main/agent/integrations/*"],
+      "@utils/*": ["src/main/agent/utils/*"],
+      "@shared/*": ["src/main/agent/shared/*"],
+      "@storage/*": ["src/main/storage/*"],
+      "@core/*": ["src/main/agent/core/*"],
+      "@logging": ["src/main/services/logging/index.ts"],
+      "@logging/*": ["src/main/services/logging/*"],
+      "@perf": ["src/main/services/perf/index.ts"],
+      "@perf/*": ["src/main/services/perf/*"],
+      "@common/*": ["src/shared/*"]
+    }
+  }
+}

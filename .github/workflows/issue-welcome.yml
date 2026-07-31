@@ -1,0 +1,36 @@
+name: Issue Welcome
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+
+jobs:
+  welcome:
+    name: Welcome New Issues
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Welcome message
+        uses: actions-cool/issues-helper@200c78641dbf33838311e5a1e0c31bbdb92d7cf0 # v3
+        with:
+          actions: 'create-comment'
+          token: ${{ secrets.GITHUB_TOKEN }}
+          issue-number: ${{ github.event.issue.number }}
+          body: |
+            👋 Thanks for opening an issue!
+
+            To help us better understand and resolve your issue, please ensure:
+            - ✅ You've searched [existing issues](https://github.com/${{ github.repository }}/issues) to avoid duplicates
+            - ✅ You've provided a clear description and reproduction steps
+            - ✅ For bugs, please provide environment info (OS, Chaterm version, etc.)
+            - ✅ For feature requests, please describe the use case and expected behavior
+
+            We'll review and respond as soon as possible. 🙏

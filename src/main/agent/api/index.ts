@@ -1,0 +1,106 @@
+//  Copyright (c) 2025-present, chaterm.ai  All rights reserved.
+//  This source code is licensed under the GPL-3.0
+//
+// Copyright (c) 2025 cline Authors, All rights reserved.
+// Licensed under the Apache License, Version 2.0
+
+import { Anthropic } from '@anthropic-ai/sdk'
+import { ApiConfiguration, ModelInfo, liteLlmModelInfoSaneDefaults } from '../shared/api'
+import { AwsBedrockHandler } from './providers/bedrock'
+import { LiteLlmHandler } from './providers/litellm'
+import { DeepSeekHandler } from './providers/deepseek'
+import { OpenAiHandler } from './providers/openai'
+import { AnthropicHandler } from './providers/anthropic'
+import { OllamaHandler } from './providers/ollama'
+import { ApiStream, ApiStreamUsageChunk } from './transform/stream'
+
+export interface ApiHandler {
+  createMessage(systemPrompt: string, messages: Anthropic.Messages.MessageParam[]): ApiStream
+  getModel(): { id: string; info: ModelInfo }
+  getApiStreamUsage?(): Promise<ApiStreamUsageChunk | undefined>
+  validateApiKey(): Promise<{ isValid: boolean; error?: string }>
+}
+
+export interface SingleCompletionHandler {
+  completePrompt(prompt: string): Promise<string>
+}
+
+class MockApiHandler implements ApiHandler {
+  private lastUsage?: ApiStreamUsageChunk
+
+  async *createMessage(_systemPrompt: string, messages: Anthropic.Messages.MessageParam[]): ApiStream {
+    const last = messages[messages.length - 1]
+    const lastText =
+      typeof last?.content === 'string'
+        ? last.content
+        : Array.isArray(last?.content)
+          ? last.content
+              .map((c: any) => (typeof c?.text === 'string' ? c.text : ''))
+              .filter(Boolean)
+              .join(' ')
+          : ''
+
+    const reply = /\bping\b/i.test(lastText) ? 'pong' : 'ok'
+
+    // Keep it deterministic and lightweight for CI smoke
+    yield { type: 'text', text: reply }
+    this.lastUsage = { type: 'usage', inputTokens: 1, outputTokens: 1 }
+    yield this.lastUsage
+  }
+
+  getModel(): { id: string; info: ModelInfo } {
+    return {
+      id: 'mock-llm',
+      info: {
+        supportsPromptCache: false,
+        maxTokens: 8192,
+        contextWindow: 8192,
+        description: 'Deterministic mock LLM for tests'
+      }
+    }
+  }
+
+  async getApiStreamUsage(): Promise<ApiStreamUsageChunk | undefined> {
+    return this.lastUsage
+  }
+
+  async validateApiKey(): Promise<{ isValid: boolean; error?: string }> {
+    return { isValid: true }
+  }
+}
+
+export function buildApiHandler(configuration: ApiConfiguration): ApiHandler {
+  if (process.env.CHATERM_TEST_MOCK_LLM === '1') {
+    return new MockApiHandler()
+  }
+
+  const { apiProvider, ...options } = configuration
+  switch (apiProvider) {
+    case 'anthropic':
+      return new AnthropicHandler(options)
+    case 'bedrock':
+      return new AwsBedrockHandler(options)
+    case 'litellm':
+      return LiteLlmHandler.createSync(options)
+    case 'deepseek':
+      return new DeepSeekHandler(options)
+    case 'openai':
+      return new OpenAiHandler(options)
+    case 'ollama':
+      return new OllamaHandler(options)
+    case 'default': {
+      const modelName = options.defaultModelId
+      const infoFromMap = modelName ? options.defaultModelInfoMap?.[modelName] : undefined
+      const liteLlmModelInfo = infoFromMap ? { ...liteLlmModelInfoSaneDefaults, ...infoFromMap } : undefined
+      return LiteLlmHandler.createSync({
+        ...options,
+        liteLlmModelId: options.defaultModelId,
+        liteLlmBaseUrl: options.defaultBaseUrl,
+        liteLlmApiKey: options.defaultApiKey,
+        liteLlmModelInfo
+      })
+    }
+    default:
+      throw new Error(`Unsupported API provider: ${apiProvider}`)
+  }
+}

@@ -1,0 +1,1655 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { ref } from 'vue'
+import { useChatMessages } from '../useChatMessages'
+import { useSessionState } from '../useSessionState'
+import type { ChatMessage, Host } from '../../types'
+import type { ExtensionMessage } from '@shared/ExtensionMessage'
+import type { Todo } from '@/types/todo'
+import eventBus from '@/utils/eventBus'
+
+// Mock dependencies
+vi.mock('../useSessionState')
+vi.mock('@/utils/eventBus', () => ({
+  default: {
+    on: vi.fn(),
+    off: vi.fn(),
+    emit: vi.fn()
+  }
+}))
+vi.mock('@/store/currentCwdStore', () => ({
+  useCurrentCwdStore: vi.fn(() => ({
+    keyValueMap: {}
+  }))
+}))
+vi.mock('@renderer/agent/storage/state', () => ({
+  getGlobalState: vi.fn(),
+  updateGlobalState: vi.fn()
+}))
+vi.mock('@/locales', () => ({
+  default: {
+    global: {
+      t: (key: string) => key
+    }
+  }
+}))
+
+// Mock window.api
+const mockSendToMain = vi.fn()
+const mockOnMainMessage = vi.fn()
+const mockGetLocalWorkingDirectory = vi.fn()
+const mockKbCreateFile = vi.fn()
+const mockKbWriteFile = vi.fn()
+global.window = {
+  api: {
+    sendToMain: mockSendToMain,
+    onMainMessage: mockOnMainMessage,
+    getLocalWorkingDirectory: mockGetLocalWorkingDirectory,
+    kbCreateFile: mockKbCreateFile,
+    kbWriteFile: mockKbWriteFile
+  }
+} as any
+
+// Mock ant-design-vue notification
+vi.mock('ant-design-vue', () => ({
+  notification: {
+    error: vi.fn(),
+    success: vi.fn(),
+    warning: vi.fn()
+  }
+}))
+
+vi.mock('@/views/components/Notice', () => ({
+  Notice: {
+    open: vi.fn()
+  }
+}))
+
+describe('useChatMessages', () => {
+  let mockScrollToBottom: (force?: boolean) => void
+  let mockClearTodoState: (messages: ChatMessage[]) => void
+  let mockMarkLatestMessageWithTodoUpdate: (messages: ChatMessage[], todos: Todo[]) => void
+  let mockCheckModelConfig: ReturnType<typeof vi.fn<() => Promise<{ success: boolean; message?: string; description?: string }>>>
+  let mockCurrentTodos: ReturnType<typeof ref<any[]>>
+  let mockTab: ReturnType<typeof createMockTab>
+
+  const createMockSession = () => ({
+    chatHistory: [] as ChatMessage[],
+    lastChatMessageId: '',
+    responseLoading: false,
+    showRetryButton: false,
+    showSendButton: true,
+    buttonsDisabled: false,
+    isExecutingCommand: false,
+    lastStreamMessage: null,
+    lastPartialMessage: null,
+    lastStateChatermMessages: null,
+    shouldStickToBottom: true,
+    isCancelled: false
+  })
+
+  const createMockTab = (id: string, session = createMockSession()) => ({
+    id,
+    title: 'Test Tab',
+    hosts: [{ host: '127.0.0.1', uuid: 'localhost', connection: 'localhost' }] as Host[],
+    chatType: 'agent' as const,
+    autoUpdateHost: true,
+    session,
+    inputValue: '',
+    modelValue: ''
+  })
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+
+    mockScrollToBottom = vi.fn()
+    mockClearTodoState = vi.fn()
+    mockMarkLatestMessageWithTodoUpdate = vi.fn()
+    mockCheckModelConfig = vi.fn().mockResolvedValue({ success: true })
+    mockCurrentTodos = ref([])
+
+    mockTab = createMockTab('test-tab-1')
+    const chatTabs = ref([mockTab])
+    const currentChatId = ref('test-tab-1')
+    const chatInputParts = ref([])
+    const hosts = ref<Host[]>([{ host: '127.0.0.1', uuid: 'localhost', connection: 'localhost' }])
+    const chatTypeValue = ref('agent')
+    const messageFeedbacks = ref<Record<string, 'like' | 'dislike'>>({})
+
+    vi.mocked(useSessionState).mockReturnValue({
+      chatTabs,
+      currentChatId,
+      currentTab: ref(mockTab),
+      currentSession: ref(mockTab.session),
+      chatInputParts,
+      hosts,
+      chatTypeValue,
+      messageFeedbacks
+    } as any)
+
+    mockSendToMain.mockResolvedValue({ success: true })
+    mockKbCreateFile.mockResolvedValue({ relPath: '2026-01-28_test.md' })
+    mockKbWriteFile.mockResolvedValue({ mtimeMs: Date.now() })
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  describe('formatParamValue', () => {
+    it('should format null value', () => {
+      const { formatParamValue } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      expect(formatParamValue(null)).toBe('null')
+    })
+
+    it('should format undefined value', () => {
+      const { formatParamValue } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      expect(formatParamValue(undefined)).toBe('undefined')
+    })
+
+    it('should format string value', () => {
+      const { formatParamValue } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      expect(formatParamValue('test')).toBe('test')
+    })
+
+    it('should format number value', () => {
+      const { formatParamValue } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      expect(formatParamValue(123)).toBe('123')
+    })
+
+    it('should format boolean value', () => {
+      const { formatParamValue } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      expect(formatParamValue(true)).toBe('true')
+      expect(formatParamValue(false)).toBe('false')
+    })
+
+    it('should format object value as JSON', () => {
+      const { formatParamValue } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const obj = { key: 'value', nested: { prop: 123 } }
+      const result = formatParamValue(obj)
+      expect(result).toContain('"key"')
+      expect(result).toContain('"value"')
+      expect(result).toContain('"nested"')
+    })
+  })
+
+  describe('cleanupPartialCommandMessages', () => {
+    it('should remove partial command messages from chat history', () => {
+      const { cleanupPartialCommandMessages } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const chatHistory: ChatMessage[] = [
+        {
+          id: '1',
+          role: 'user',
+          content: 'Hello',
+          type: 'message',
+          ask: '',
+          say: '',
+          ts: 100
+        },
+        {
+          id: '2',
+          role: 'assistant',
+          content: 'ls -la',
+          type: 'ask',
+          ask: 'command',
+          say: '',
+          ts: 200,
+          partial: true
+        }
+      ]
+
+      cleanupPartialCommandMessages(chatHistory)
+
+      expect(chatHistory).toHaveLength(1)
+      expect(chatHistory[0].id).toBe('1')
+    })
+
+    it('should not remove non-partial messages', () => {
+      const { cleanupPartialCommandMessages } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const chatHistory: ChatMessage[] = [
+        {
+          id: '1',
+          role: 'assistant',
+          content: 'ls -la',
+          type: 'ask',
+          ask: 'command',
+          say: '',
+          ts: 100,
+          partial: false
+        }
+      ]
+
+      cleanupPartialCommandMessages(chatHistory)
+
+      expect(chatHistory).toHaveLength(1)
+    })
+  })
+
+  describe('handleIncomingMainMessage', () => {
+    it('coalesces streamed partial messages and only renders the latest chunk per throttle window', async () => {
+      vi.useFakeTimers()
+      mockTab.session.chatHistory.push({
+        id: 'user-1',
+        role: 'user',
+        content: 'hello',
+        type: 'message',
+        ask: '',
+        say: '',
+        ts: 1
+      })
+
+      const { handleIncomingMainMessage } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      await handleIncomingMainMessage({
+        type: 'partialMessage',
+        tabId: 'test-tab-1',
+        taskId: 'test-tab-1',
+        partialMessage: {
+          type: 'say',
+          say: 'text',
+          text: 'first chunk',
+          ts: 10,
+          partial: true
+        }
+      } as any)
+
+      await handleIncomingMainMessage({
+        type: 'partialMessage',
+        tabId: 'test-tab-1',
+        taskId: 'test-tab-1',
+        partialMessage: {
+          type: 'say',
+          say: 'text',
+          text: 'latest chunk',
+          ts: 10,
+          partial: true
+        }
+      } as any)
+
+      expect(mockTab.session.chatHistory).toHaveLength(1)
+
+      await vi.advanceTimersByTimeAsync(32)
+
+      expect(mockTab.session.chatHistory).toHaveLength(2)
+      expect(mockTab.session.chatHistory[1].content).toBe('latest chunk')
+      expect(mockScrollToBottom).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  describe('isLocalHost', () => {
+    it('should identify localhost IP addresses', () => {
+      const { isLocalHost } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      expect(isLocalHost('127.0.0.1')).toBe(true)
+      expect(isLocalHost('localhost')).toBe(true)
+      expect(isLocalHost('::1')).toBe(true)
+      expect(isLocalHost('192.168.1.1')).toBe(false)
+    })
+  })
+
+  describe('sendMessage', () => {
+    it('should return error when model config check fails', async () => {
+      const { notification } = await import('ant-design-vue')
+      const eventBus = (await import('@/utils/eventBus')).default
+
+      mockCheckModelConfig.mockResolvedValue({ success: false })
+
+      const { sendMessage } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      mockState.chatInputParts.value = [{ type: 'text', text: 'Test message' }]
+
+      const result = await sendMessage('send')
+
+      expect(result).toBe('SEND_ERROR')
+      expect(mockSendToMain).not.toHaveBeenCalled()
+      expect(notification.error).toHaveBeenCalledWith({
+        message: 'user.checkModelConfigFailMessage',
+        description: 'user.checkModelConfigFailDescription',
+        duration: 5
+      })
+
+      // Wait for nested setTimeout to execute (500ms + 200ms = 700ms)
+      await new Promise((resolve) => setTimeout(resolve, 800))
+      expect(eventBus.emit).toHaveBeenCalledWith('openUserTab', 'userConfig')
+      expect(eventBus.emit).toHaveBeenCalledWith('switchToModelSettingsTab')
+    })
+
+    it('should use custom message and description when provided', async () => {
+      const { notification } = await import('ant-design-vue')
+
+      mockCheckModelConfig.mockResolvedValue({
+        success: false,
+        message: 'user.noAvailableModelMessage',
+        description: 'user.noAvailableModelDescription'
+      })
+
+      const { sendMessage } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      mockState.chatInputParts.value = [{ type: 'text', text: 'Test message' }]
+
+      const result = await sendMessage('send')
+
+      expect(result).toBe('SEND_ERROR')
+      expect(notification.error).toHaveBeenCalledWith({
+        message: 'user.noAvailableModelMessage',
+        description: 'user.noAvailableModelDescription',
+        duration: 5
+      })
+    })
+
+    it('should return error when input is empty', async () => {
+      const { notification } = await import('ant-design-vue')
+
+      const { sendMessage } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      mockState.chatInputParts.value = [{ type: 'text', text: '   ' }]
+
+      const result = await sendMessage('send')
+
+      expect(result).toBe('SEND_ERROR')
+      expect(notification.error).toHaveBeenCalled()
+    })
+
+    it('should send message even when hosts are empty for non-chat type', async () => {
+      const { sendMessage } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      mockState.chatInputParts.value = [{ type: 'text', text: 'Test message' }]
+      mockState.hosts.value = []
+      mockState.chatTypeValue.value = 'cmd'
+
+      await sendMessage('send')
+
+      expect(mockSendToMain).toHaveBeenCalled()
+    })
+
+    it('should switch to cmd when switch host is selected in agent mode', async () => {
+      const { Notice } = await import('@/views/components/Notice')
+
+      const { sendMessage } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      mockState.chatInputParts.value = [{ type: 'text', text: 'Test message' }]
+      mockState.chatTypeValue.value = 'agent'
+      mockState.hosts.value = [{ host: '10.0.0.1', uuid: 'switch-uuid', connection: 'ssh', assetType: 'person-switch-huawei' }]
+
+      const result = await sendMessage('send')
+
+      expect(result).toBe('SEND_ERROR')
+      expect(mockState.chatTypeValue.value).toBe('cmd')
+      expect(vi.mocked(Notice.open)).toHaveBeenCalledWith(
+        expect.objectContaining({
+          description: 'ai.switchNotSupportAgent'
+        })
+      )
+      expect(mockSendToMain).not.toHaveBeenCalled()
+    })
+
+    it('should send message successfully', async () => {
+      const { sendMessage } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      mockState.chatInputParts.value = [{ type: 'text', text: 'Test message' }]
+
+      await sendMessage('send')
+
+      expect(mockSendToMain).toHaveBeenCalled()
+      expect(mockState.chatInputParts.value).toEqual([])
+    })
+
+    it('should include assetType in hosts when creating a new task', async () => {
+      // Set up hosts with assetType on currentTab before calling useChatMessages
+      const mockState = vi.mocked(useSessionState)()
+      mockState.chatInputParts.value = [{ type: 'text', text: 'Test message' }]
+      mockState.chatTypeValue.value = 'cmd'
+      // The useChatMessages uses targetTab.hosts, not hosts from useSessionState
+      mockState.currentTab.value!.hosts = [{ host: '10.0.0.1', uuid: 'switch-uuid', connection: 'ssh', assetType: 'person-switch-huawei' }]
+
+      const { sendMessage } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      await sendMessage('send')
+
+      expect(mockSendToMain).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'newTask',
+          hosts: [{ host: '10.0.0.1', uuid: 'switch-uuid', connection: 'ssh', assetType: 'person-switch-huawei' }]
+        })
+      )
+    })
+
+    it('should clear todo state when sending new message', async () => {
+      mockCurrentTodos.value = [{ id: '1', content: 'Test', status: 'pending' }] as any
+
+      const { sendMessage } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      mockState.chatInputParts.value = [{ type: 'text', text: 'Test message' }]
+
+      await sendMessage('send')
+
+      expect(mockClearTodoState).toHaveBeenCalled()
+    })
+  })
+
+  describe('sendMessageWithContent', () => {
+    it('should add user message to chat history', async () => {
+      const { sendMessageWithContent } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      const session = mockState.currentSession.value!
+
+      await sendMessageWithContent('Test message', 'send')
+
+      expect(session.chatHistory).toHaveLength(1)
+      expect(session.chatHistory[0].role).toBe('user')
+      expect(session.chatHistory[0].content).toBe('Test message')
+      expect(session.responseLoading).toBe(true)
+    })
+
+    it('should mark message as assistant for commandSend type', async () => {
+      const { sendMessageWithContent } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      const session = mockState.currentSession.value!
+
+      await sendMessageWithContent('ls -la', 'commandSend')
+
+      expect(session.chatHistory[0].role).toBe('assistant')
+      expect(session.chatHistory[0].say).toBe('command_output')
+    })
+
+    it('should scroll to bottom after sending', async () => {
+      const { sendMessageWithContent } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      await sendMessageWithContent('Test message', 'send')
+
+      expect(mockScrollToBottom).toHaveBeenCalledWith(true)
+    })
+  })
+
+  describe('handleFeedback', () => {
+    it('should record like feedback', async () => {
+      const { getGlobalState, updateGlobalState } = await import('@renderer/agent/storage/state')
+      vi.mocked(getGlobalState).mockResolvedValue({})
+
+      const { handleFeedback, getMessageFeedback } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const message: ChatMessage = {
+        id: 'msg-1',
+        role: 'assistant',
+        content: 'Test',
+        type: 'message',
+        ask: '',
+        say: '',
+        ts: 100
+      }
+
+      await handleFeedback(message, 'like')
+
+      expect(getMessageFeedback(100)).toBe('like')
+      expect(updateGlobalState).toHaveBeenCalledWith(
+        'messageFeedbacks',
+        expect.objectContaining({
+          '100': 'like'
+        })
+      )
+      expect(mockSendToMain).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'taskFeedback',
+          feedbackType: 'thumbs_up'
+        })
+      )
+    })
+
+    it('should record dislike feedback', async () => {
+      const { getGlobalState, updateGlobalState } = await import('@renderer/agent/storage/state')
+      vi.mocked(getGlobalState).mockResolvedValue({})
+
+      const { handleFeedback, getMessageFeedback } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const message: ChatMessage = {
+        id: 'msg-2',
+        role: 'assistant',
+        content: 'Test',
+        type: 'message',
+        ask: '',
+        say: '',
+        ts: 100
+      }
+
+      await handleFeedback(message, 'dislike')
+
+      expect(getMessageFeedback(100)).toBe('dislike')
+      expect(updateGlobalState).toHaveBeenCalledWith(
+        'messageFeedbacks',
+        expect.objectContaining({
+          '100': 'dislike'
+        })
+      )
+      expect(mockSendToMain).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'taskFeedback',
+          feedbackType: 'thumbs_down'
+        })
+      )
+    })
+
+    it('should clear feedback when clicking same type', async () => {
+      const { getGlobalState, updateGlobalState } = await import('@renderer/agent/storage/state')
+      vi.mocked(getGlobalState).mockResolvedValueOnce({}).mockResolvedValueOnce({ '100': 'like' })
+
+      const { handleFeedback, isMessageFeedbackSubmitted } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+
+      const message: ChatMessage = {
+        id: 'msg-3',
+        role: 'assistant',
+        content: 'Test',
+        type: 'message',
+        ask: '',
+        say: '',
+        ts: 100
+      }
+
+      await handleFeedback(message, 'like')
+      expect(isMessageFeedbackSubmitted(100)).toBe(true)
+
+      mockSendToMain.mockClear()
+      await handleFeedback(message, 'like')
+
+      expect(isMessageFeedbackSubmitted(100)).toBe(false)
+      expect(updateGlobalState).toHaveBeenLastCalledWith('messageFeedbacks', {})
+      expect(mockSendToMain).not.toHaveBeenCalled()
+      expect(mockState.messageFeedbacks.value['100']).toBeUndefined()
+    })
+
+    it('should switch feedback and send new event', async () => {
+      const { getGlobalState } = await import('@renderer/agent/storage/state')
+      vi.mocked(getGlobalState).mockResolvedValueOnce({}).mockResolvedValueOnce({ '100': 'like' })
+
+      const { handleFeedback } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      const messageFeedbacks = mockState.messageFeedbacks.value
+
+      const message: ChatMessage = {
+        id: 'msg-4',
+        role: 'assistant',
+        content: 'Test',
+        type: 'message',
+        ask: '',
+        say: '',
+        ts: 100
+      }
+
+      await handleFeedback(message, 'like')
+      await handleFeedback(message, 'dislike')
+
+      expect(mockSendToMain).toHaveBeenCalledTimes(2)
+      expect(mockSendToMain).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({
+          type: 'taskFeedback',
+          feedbackType: 'thumbs_up'
+        })
+      )
+      expect(mockSendToMain).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({
+          type: 'taskFeedback',
+          feedbackType: 'thumbs_down'
+        })
+      )
+      expect(messageFeedbacks['100']).toBe('dislike')
+    })
+  })
+
+  describe('processMainMessage', () => {
+    it('should ignore messages without tabId or taskId', async () => {
+      const { processMainMessage } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+      const message: any = { type: 'partialMessage' }
+      await processMainMessage(message)
+
+      expect(consoleSpy).toHaveBeenCalledWith('[ai.chatMessages] Ignoring message for no target tab', { data: 'partialMessage' })
+      consoleSpy.mockRestore()
+    })
+
+    it('should ignore messages for deleted tabs', async () => {
+      const { processMainMessage } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+      const message: any = {
+        type: 'partialMessage',
+        tabId: 'non-existent-tab',
+        partialMessage: { text: 'test' }
+      }
+      await processMainMessage(message)
+
+      expect(consoleSpy).toHaveBeenCalledWith('[ai.chatMessages] Ignoring message for deleted tab', { detail: 'non-existent-tab' })
+      consoleSpy.mockRestore()
+    })
+
+    it('should add partial message to chat history', async () => {
+      const { processMainMessage } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      const session = mockState.currentSession.value!
+
+      const message: ExtensionMessage = {
+        type: 'partialMessage',
+        tabId: 'test-tab-1',
+        partialMessage: {
+          text: 'Assistant response',
+          type: 'say',
+          say: 'text',
+          partial: true,
+          ts: 100
+        }
+      }
+
+      await processMainMessage(message)
+
+      expect(session.chatHistory).toHaveLength(1)
+      expect(session.chatHistory[0].content).toBe('Assistant response')
+      expect(session.chatHistory[0].role).toBe('assistant')
+      expect(session.chatHistory[0].partial).toBe(true)
+    })
+
+    it('should preserve contentParts on new and updated assistant partial messages', async () => {
+      const { processMainMessage } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      const session = mockState.currentSession.value!
+      const firstContentParts = [
+        { type: 'text' as const, text: '知识库检索:' },
+        {
+          type: 'chip' as const,
+          chipType: 'doc' as const,
+          ref: {
+            absPath: '/mock/knowledgebase/rss2.md',
+            relPath: 'rss2.md',
+            name: 'rss2.md',
+            type: 'file' as const,
+            startLine: 1,
+            endLine: 3
+          }
+        }
+      ]
+      const secondContentParts = [
+        { type: 'text' as const, text: '知识库检索:' },
+        {
+          type: 'chip' as const,
+          chipType: 'doc' as const,
+          ref: {
+            absPath: '/mock/knowledgebase/rss2.md',
+            relPath: 'rss2.md',
+            name: 'rss2.md',
+            type: 'file' as const,
+            startLine: 4,
+            endLine: 6
+          }
+        }
+      ]
+
+      await processMainMessage({
+        type: 'partialMessage',
+        tabId: 'test-tab-1',
+        partialMessage: {
+          text: '知识库检索',
+          type: 'say',
+          say: 'text',
+          partial: true,
+          ts: 100,
+          contentParts: firstContentParts
+        }
+      } as ExtensionMessage)
+
+      expect(session.chatHistory).toHaveLength(1)
+      expect(session.chatHistory[0].contentParts).toEqual(firstContentParts)
+
+      await processMainMessage({
+        type: 'partialMessage',
+        tabId: 'test-tab-1',
+        partialMessage: {
+          text: '知识库检索',
+          type: 'say',
+          say: 'text',
+          partial: false,
+          ts: 100,
+          contentParts: secondContentParts
+        }
+      } as ExtensionMessage)
+
+      expect(session.chatHistory).toHaveLength(1)
+      expect(session.chatHistory[0].contentParts).toEqual(secondContentParts)
+    })
+
+    it('should handle completion_result message', async () => {
+      const { processMainMessage } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      const session = mockState.currentSession.value!
+
+      const message: ExtensionMessage = {
+        type: 'partialMessage',
+        tabId: 'test-tab-1',
+        partialMessage: {
+          text: 'Task completed',
+          type: 'ask',
+          ask: 'completion_result',
+          partial: false,
+          ts: 100
+        }
+      }
+
+      await processMainMessage(message)
+
+      expect(session.responseLoading).toBe(false)
+    })
+
+    it('should handle api_req_failed message', async () => {
+      const { processMainMessage } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      const session = mockState.currentSession.value!
+
+      const message: ExtensionMessage = {
+        type: 'partialMessage',
+        tabId: 'test-tab-1',
+        partialMessage: {
+          text: 'API request failed',
+          type: 'ask',
+          ask: 'api_req_failed',
+          partial: false,
+          ts: 100
+        }
+      }
+
+      await processMainMessage(message)
+
+      expect(session.showRetryButton).toBe(true)
+      expect(session.responseLoading).toBe(false)
+    })
+
+    it('should handle todoUpdated message', async () => {
+      const { processMainMessage } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      const session = mockState.currentSession.value!
+
+      const todos: Todo[] = [{ id: '1', content: 'Test todo', status: 'pending', priority: 'medium', createdAt: new Date(), updatedAt: new Date() }]
+
+      const message: any = {
+        type: 'todoUpdated',
+        tabId: 'test-tab-1',
+        todos
+      }
+
+      await processMainMessage(message)
+
+      expect(mockMarkLatestMessageWithTodoUpdate).toHaveBeenCalledWith(session.chatHistory, todos)
+    })
+
+    it('should handle taskTitleUpdated message', async () => {
+      const { processMainMessage } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+
+      const message: any = {
+        type: 'taskTitleUpdated',
+        tabId: 'test-tab-1',
+        taskId: 'test-tab-1',
+        title: 'New Chat Title'
+      }
+
+      await processMainMessage(message)
+
+      expect(mockState.chatTabs.value[0].title).toBe('New Chat Title')
+    })
+
+    it('should write knowledge_summary into summary folder without date prefix', async () => {
+      const { processMainMessage } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      // First chunk should create the file under summary/
+      mockKbCreateFile.mockResolvedValueOnce({ relPath: 'summary/My Note.md' })
+
+      const first: ExtensionMessage = {
+        type: 'partialMessage',
+        tabId: 'test-tab-1',
+        partialMessage: {
+          type: 'say',
+          say: 'knowledge_summary',
+          partial: true,
+          ts: 100,
+          text: JSON.stringify({ fileName: 'My Note', summary: 'S1' })
+        } as any
+      }
+
+      await processMainMessage(first)
+
+      expect(mockKbCreateFile).toHaveBeenCalledWith('summary', 'My Note.md', 'S1')
+      expect(vi.mocked(eventBus.emit)).toHaveBeenCalledWith(
+        'openUserTab',
+        expect.objectContaining({
+          content: 'KnowledgeCenterEditor',
+          title: 'My Note.md',
+          props: { relPath: 'summary/My Note.md' }
+        })
+      )
+
+      // Next chunk should write to the same relPath
+      const second: ExtensionMessage = {
+        type: 'partialMessage',
+        tabId: 'test-tab-1',
+        partialMessage: {
+          type: 'say',
+          say: 'knowledge_summary',
+          partial: true,
+          ts: 100,
+          text: JSON.stringify({ fileName: 'My Note', summary: 'S2' })
+        } as any
+      }
+
+      await processMainMessage(second)
+      expect(mockKbWriteFile).toHaveBeenCalledWith('summary/My Note.md', 'S2')
+
+      // Final chunk should still write, and then cleanup internal map
+      const third: ExtensionMessage = {
+        type: 'partialMessage',
+        tabId: 'test-tab-1',
+        partialMessage: {
+          type: 'say',
+          say: 'knowledge_summary',
+          partial: false,
+          ts: 100,
+          text: JSON.stringify({ fileName: 'My Note', summary: 'S3' })
+        } as any
+      }
+
+      await processMainMessage(third)
+      expect(mockKbWriteFile).toHaveBeenCalledWith('summary/My Note.md', 'S3')
+    })
+
+    it('should ignore partial messages when task is cancelled', async () => {
+      const { processMainMessage } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      const session = mockState.currentSession.value!
+      session.isCancelled = true
+
+      const consoleSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
+
+      const message: ExtensionMessage = {
+        type: 'partialMessage',
+        tabId: 'test-tab-1',
+        partialMessage: {
+          text: 'Should be ignored',
+          type: 'say',
+          say: 'text',
+          partial: true,
+          ts: 100
+        }
+      }
+
+      await processMainMessage(message)
+
+      expect(session.chatHistory).toHaveLength(0)
+      expect(consoleSpy).toHaveBeenCalledWith('[ai.chatMessages] Ignoring partial message because task is cancelled', '')
+      consoleSpy.mockRestore()
+    })
+
+    it('should stream knowledge_summary into knowledge base file', async () => {
+      const { processMainMessage } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+      const expectedRelPath = 'summary/test.md'
+      mockKbCreateFile.mockResolvedValue({ relPath: expectedRelPath })
+
+      const partialMessage: ExtensionMessage = {
+        type: 'partialMessage',
+        tabId: 'test-tab-1',
+        partialMessage: {
+          text: JSON.stringify({ fileName: 'test', summary: '# Title' }),
+          type: 'say',
+          say: 'knowledge_summary',
+          partial: true,
+          ts: 100
+        }
+      }
+
+      await processMainMessage(partialMessage)
+
+      expect(mockKbCreateFile).toHaveBeenCalledWith('summary', 'test.md', '# Title')
+      expect(vi.mocked(eventBus.emit)).toHaveBeenCalledWith(
+        'openUserTab',
+        expect.objectContaining({
+          content: 'KnowledgeCenterEditor'
+        })
+      )
+      const mockState = vi.mocked(useSessionState)()
+      expect(mockState.currentSession.value!.chatHistory).toHaveLength(0)
+
+      const updateMessage: ExtensionMessage = {
+        type: 'partialMessage',
+        tabId: 'test-tab-1',
+        partialMessage: {
+          text: JSON.stringify({ fileName: 'test', summary: '# Title\n\nMore' }),
+          type: 'say',
+          say: 'knowledge_summary',
+          partial: true,
+          ts: 100
+        }
+      }
+
+      await processMainMessage(updateMessage)
+
+      expect(mockKbWriteFile).toHaveBeenCalledWith(expectedRelPath, '# Title\n\nMore')
+      expect(vi.mocked(eventBus.emit)).toHaveBeenCalledWith(
+        'kb:content-changed',
+        expect.objectContaining({
+          relPath: expectedRelPath,
+          content: '# Title\n\nMore'
+        })
+      )
+
+      const finalMessage: ExtensionMessage = {
+        type: 'partialMessage',
+        tabId: 'test-tab-1',
+        partialMessage: {
+          text: JSON.stringify({ fileName: 'test', summary: '# Title\n\nMore\n\nDone' }),
+          type: 'say',
+          say: 'knowledge_summary',
+          partial: false,
+          ts: 100
+        }
+      }
+
+      await processMainMessage(finalMessage)
+
+      expect(mockKbWriteFile).toHaveBeenCalledWith(expectedRelPath, '# Title\n\nMore\n\nDone')
+      expect(vi.mocked(eventBus.emit)).toHaveBeenCalledWith(
+        'kb:content-changed',
+        expect.objectContaining({
+          relPath: expectedRelPath,
+          content: '# Title\n\nMore\n\nDone'
+        })
+      )
+    })
+  })
+
+  describe('setMarkdownRendererRef', () => {
+    it('should store markdown renderer reference', () => {
+      const { setMarkdownRendererRef, markdownRendererRefs } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockRef = { setThinkingLoading: vi.fn() }
+      setMarkdownRendererRef(mockRef, 0)
+
+      expect(markdownRendererRefs.value[0]).toEqual(mockRef)
+    })
+
+    it('should not store null references', () => {
+      const { setMarkdownRendererRef, markdownRendererRefs } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      setMarkdownRendererRef(null, 0)
+
+      expect(markdownRendererRefs.value[0]).toBeUndefined()
+    })
+  })
+
+  describe('handleSummarizeToKnowledge', () => {
+    it('should send summary command with message timestamp when message is provided', async () => {
+      const { handleSummarizeToKnowledge } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      const session = mockState.currentSession.value!
+
+      const message: ChatMessage = {
+        id: 'msg-1',
+        role: 'assistant',
+        content: 'Task completed',
+        type: 'ask',
+        ask: 'completion_result',
+        say: 'completion_result',
+        ts: 1706443200000
+      }
+
+      await handleSummarizeToKnowledge(message)
+
+      // Check that sendToMain was called with correct parameters
+      expect(mockSendToMain).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'newTask',
+          askResponse: 'messageResponse',
+          text: '/summary-to-doc',
+          contentParts: expect.arrayContaining([
+            expect.objectContaining({
+              type: 'chip',
+              chipType: 'command',
+              ref: expect.objectContaining({
+                command: '/summary-to-doc',
+                label: '/Summary to Doc',
+                summarizeUpToTs: 1706443200000
+              })
+            })
+          ])
+        })
+      )
+
+      // Check that user message was added
+      expect(session.chatHistory).toHaveLength(1)
+      expect(session.chatHistory[0].role).toBe('user')
+      expect(session.chatHistory[0].content).toBe('/summary-to-doc')
+    })
+
+    it('should send summary command without timestamp when message is not provided', async () => {
+      const { handleSummarizeToKnowledge } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      const session = mockState.currentSession.value!
+
+      await handleSummarizeToKnowledge()
+
+      // Check that sendToMain was called with correct parameters
+      expect(mockSendToMain).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'newTask',
+          askResponse: 'messageResponse',
+          text: '/summary-to-doc',
+          contentParts: expect.arrayContaining([
+            expect.objectContaining({
+              type: 'chip',
+              chipType: 'command',
+              ref: expect.objectContaining({
+                command: '/summary-to-doc',
+                label: '/Summary to Doc',
+                summarizeUpToTs: undefined
+              })
+            })
+          ])
+        })
+      )
+
+      // Check that user message was added
+      expect(session.chatHistory).toHaveLength(1)
+      expect(session.chatHistory[0].role).toBe('user')
+      expect(session.chatHistory[0].content).toBe('/summary-to-doc')
+    })
+
+    it('should work with message that has no timestamp', async () => {
+      const { handleSummarizeToKnowledge } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const message: ChatMessage = {
+        id: 'msg-1',
+        role: 'assistant',
+        content: 'Task completed',
+        type: 'ask',
+        ask: 'completion_result',
+        say: 'completion_result'
+        // No ts field
+      }
+
+      await handleSummarizeToKnowledge(message)
+
+      expect(mockSendToMain).toHaveBeenCalledWith(
+        expect.objectContaining({
+          contentParts: expect.arrayContaining([
+            expect.objectContaining({
+              ref: expect.objectContaining({
+                summarizeUpToTs: undefined
+              })
+            })
+          ])
+        })
+      )
+    })
+  })
+
+  describe('sendMessageToMain', () => {
+    it('sends askResponse even when a command is executing', async () => {
+      const session = createMockSession()
+      session.isExecutingCommand = true
+      session.chatHistory.push({
+        id: 'm1',
+        role: 'assistant',
+        content: 'running',
+        type: 'say',
+        ask: '',
+        say: 'command',
+        ts: Date.now()
+      })
+
+      const mockTab = createMockTab('test-tab-1', session)
+      const chatTabs = ref([mockTab])
+      const currentChatId = ref('test-tab-1')
+      const chatInputParts = ref([])
+      const hosts = ref<Host[]>([{ host: '127.0.0.1', uuid: 'localhost', connection: 'localhost' }])
+      const chatTypeValue = ref('agent')
+
+      vi.mocked(useSessionState).mockReturnValue({
+        chatTabs,
+        currentChatId,
+        currentTab: ref(mockTab),
+        currentSession: ref(mockTab.session),
+        chatInputParts,
+        hosts,
+        chatTypeValue
+      } as any)
+
+      const { sendMessageToMain } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      await sendMessageToMain('hello', 'send')
+
+      expect(mockSendToMain).toHaveBeenCalledTimes(1)
+      const sent = mockSendToMain.mock.calls[0][0]
+      expect(sent.type).toBe('askResponse')
+      expect(sent.askResponse).toBe('messageResponse')
+      expect(sent.text).toBe('hello')
+    })
+
+    it('sends structured toolResult for commandSend without overloading text', async () => {
+      const session = createMockSession()
+      session.chatHistory.push({
+        id: 'm1',
+        role: 'assistant',
+        content: 'Run ls',
+        type: 'ask',
+        ask: 'command',
+        say: '',
+        ts: Date.now()
+      })
+
+      const mockTab = createMockTab('test-tab-1', session)
+      const chatTabs = ref([mockTab])
+      const currentChatId = ref('test-tab-1')
+      const chatInputParts = ref([])
+      const hosts = ref<Host[]>([{ host: '127.0.0.1', uuid: 'localhost', connection: 'localhost' }])
+      const chatTypeValue = ref('cmd')
+
+      vi.mocked(useSessionState).mockReturnValue({
+        chatTabs,
+        currentChatId,
+        currentTab: ref(mockTab),
+        currentSession: ref(mockTab.session),
+        chatInputParts,
+        hosts,
+        chatTypeValue
+      } as any)
+
+      const { sendMessageWithContent } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const toolResult = {
+        output: 'file1\nfile2',
+        toolName: 'execute_command'
+      }
+
+      await sendMessageWithContent('Terminal output:\n```\nfile1\nfile2\n```', 'commandSend', undefined, undefined, undefined, undefined, toolResult)
+
+      expect(mockSendToMain).toHaveBeenCalledTimes(1)
+      const sent = mockSendToMain.mock.calls[0][0]
+      expect(sent.type).toBe('askResponse')
+      expect(sent.askResponse).toBe('yesButtonClicked')
+      expect(sent.text).toBeUndefined()
+      expect(sent.toolResult).toEqual(toolResult)
+    })
+  })
+
+  describe('hosts parameter handling', () => {
+    it('should use default tab hosts when overrideHosts is not provided', async () => {
+      const { sendMessageWithContent } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      const currentTabHosts = mockState.currentTab.value!.hosts
+
+      await sendMessageWithContent('Test message', 'send', undefined, undefined, undefined, undefined)
+
+      expect(mockSendToMain).toHaveBeenCalledWith(
+        expect.objectContaining({
+          hosts: currentTabHosts
+        })
+      )
+    })
+
+    it('should use overrideHosts when provided', async () => {
+      const { sendMessageWithContent } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const customHosts: Host[] = [
+        { host: '172.16.0.1', uuid: 'custom-host-1', connection: 'personal' },
+        { host: '172.16.0.2', uuid: 'custom-host-2', connection: 'organization' }
+      ]
+
+      await sendMessageWithContent('Test message', 'send', undefined, undefined, undefined, customHosts)
+
+      expect(mockSendToMain).toHaveBeenCalledWith(
+        expect.objectContaining({
+          hosts: customHosts
+        })
+      )
+    })
+
+    it('should attach hosts to user message in chat history', async () => {
+      const { sendMessageWithContent } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      const session = mockState.currentSession.value!
+
+      const customHosts: Host[] = [{ host: '192.168.2.10', uuid: 'edited-host', connection: 'personal' }]
+
+      await sendMessageWithContent('Edited message', 'send', undefined, undefined, undefined, customHosts)
+
+      const lastMessage = session.chatHistory[session.chatHistory.length - 1]
+      expect(lastMessage.hosts).toEqual(customHosts)
+    })
+
+    it('should set hosts to empty array when overrideHosts is empty', async () => {
+      const { sendMessageWithContent } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      const session = mockState.currentSession.value!
+
+      await sendMessageWithContent('Message', 'send', undefined, undefined, undefined, [])
+
+      const lastMessage = session.chatHistory[session.chatHistory.length - 1]
+      expect(lastMessage.hosts).toEqual([])
+    })
+
+    it('should handle truncate-and-send with edited hosts', async () => {
+      const { sendMessageWithContent } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      const originalHosts = mockState.currentTab.value!.hosts
+      const editedHosts: Host[] = [{ host: '10.10.10.10', uuid: 'new-host', connection: 'organization' }]
+
+      const truncateTs = Date.now() - 1000
+
+      await sendMessageWithContent('Edited content', 'send', undefined, truncateTs, undefined, editedHosts)
+
+      expect(mockSendToMain).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: expect.any(String),
+          hosts: editedHosts
+        })
+      )
+
+      // Verify original tab hosts are not modified
+      expect(mockState.currentTab.value!.hosts).toEqual(originalHosts)
+    })
+
+    it('should preserve Host object fields that are supported by sendMessageToMain', async () => {
+      const { sendMessageWithContent } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const detailedHosts: Host[] = [
+        {
+          host: '192.168.1.100',
+          uuid: 'detailed-host-uuid',
+          connection: 'organization',
+          organizationUuid: 'org-uuid-456',
+          assetType: 'linux-production'
+        }
+      ]
+
+      await sendMessageWithContent('Test', 'send', undefined, undefined, undefined, detailedHosts)
+
+      const callArgs = mockSendToMain.mock.calls[0][0]
+      expect(callArgs.hosts).toBeDefined()
+      expect(callArgs.hosts).toHaveLength(1)
+
+      // Verify that the currently supported fields are preserved
+      // Note: organizationUuid is not currently preserved by sendMessageToMain (line 119-124 in useChatMessages.ts)
+      expect(callArgs.hosts[0].host).toBe('192.168.1.100')
+      expect(callArgs.hosts[0].uuid).toBe('detailed-host-uuid')
+      expect(callArgs.hosts[0].connection).toBe('organization')
+      expect(callArgs.hosts[0].assetType).toBe('linux-production')
+    })
+
+    it('should support edit-and-resend with different hosts through truncateAtMessageTs', async () => {
+      const { sendMessageWithContent } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const editedHosts: Host[] = [
+        { host: '192.168.1.10', uuid: 'host-1', connection: 'personal' },
+        { host: '192.168.1.20', uuid: 'host-3', connection: 'personal' }
+      ]
+
+      const truncateTs = Date.now() - 2000
+      const contentParts = [{ type: 'text' as const, text: 'Edited message' }]
+
+      await sendMessageWithContent('Edited message', 'send', undefined, truncateTs, contentParts, editedHosts)
+
+      const callArgs = mockSendToMain.mock.calls[0][0]
+      expect(callArgs.hosts).toEqual(editedHosts)
+    })
+
+    it('should allow removing all hosts during edit', async () => {
+      const { sendMessageWithContent } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const originalTs = Date.now() - 3000
+
+      await sendMessageWithContent('Message with no hosts', 'send', undefined, originalTs, undefined, [])
+
+      expect(mockSendToMain).toHaveBeenCalledWith(
+        expect.objectContaining({
+          hosts: []
+        })
+      )
+    })
+  })
+})

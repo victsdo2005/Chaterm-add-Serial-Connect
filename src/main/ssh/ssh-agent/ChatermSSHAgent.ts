@@ -1,0 +1,849 @@
+import { BaseAgent, utils } from 'ssh2'
+import { createServer, Socket, type ListenOptions, type Server } from 'net'
+import { EventEmitter } from 'events'
+import * as crypto from 'crypto'
+import * as fs from 'fs/promises'
+import * as path from 'path'
+import * as os from 'os'
+import { Duplex } from 'stream'
+const logger = createLogger('ssh')
+
+// SSH Agent Protocol
+const SSH_AGENT_FAILURE = 5
+const SSH_AGENTC_REQUEST_IDENTITIES = 11
+const SSH_AGENTC_REQUEST_IDENTITIES_OLD = 1
+const SSH_AGENT_IDENTITIES_ANSWER = 12
+const SSH_AGENTC_SIGN_REQUEST = 13
+const SSH_AGENT_SIGN_RESPONSE = 14
+const SSH_AGENTC_ADD_SMARTCARD_KEY = 27
+
+// SSH key type
+enum SSHKeyType {
+  RSA = 'ssh-rsa',
+  ED25519 = 'ssh-ed25519',
+  ECDSA_P256 = 'ecdsa-sha2-nistp256',
+  ECDSA_P384 = 'ecdsa-sha2-nistp384',
+  ECDSA_P521 = 'ecdsa-sha2-nistp521'
+}
+
+interface SSHAgentKey {
+  id: string
+  privateKey: any
+  publicKey: Buffer
+  comment: string
+  keyType: SSHKeyType
+  fingerprint: string
+  addedAt: Date
+}
+
+interface AgentConnection {
+  on(event: 'data', listener: (data: Buffer) => void): this
+  on(event: 'error', listener: (err: Error) => void): this
+  on(event: 'close', listener: () => void): this
+  write(data: Buffer): boolean
+  destroy(): void
+}
+
+class InMemoryAgentConnection extends EventEmitter implements AgentConnection {
+  private closed = false
+
+  constructor(private readonly stream: Duplex) {
+    super()
+  }
+
+  receive(data: Buffer): void {
+    if (!this.closed) {
+      this.emit('data', data)
+    }
+  }
+
+  write(data: Buffer): boolean {
+    if (this.closed) {
+      return false
+    }
+    return this.stream.push(Buffer.from(data))
+  }
+
+  destroy(): void {
+    if (this.closed) {
+      return
+    }
+    this.closed = true
+    this.stream.push(null)
+    this.emit('close')
+  }
+
+  closeFromClient(error?: Error | null): void {
+    if (this.closed) {
+      return
+    }
+    if (error) {
+      this.emit('error', error)
+    }
+    this.closed = true
+    this.emit('close')
+  }
+}
+
+// Define the SSH Agent class, inheriting the BaseAgent of ssh2
+export class SSHAgent extends BaseAgent {
+  private eventEmitter = new EventEmitter()
+  private server: Server | null = null
+  private readonly socketPath: string | null
+  private keys: Map<string, SSHAgentKey> = new Map()
+  private isRunning: boolean = false
+  private clientConnections: Set<AgentConnection> = new Set()
+
+  constructor(socketPath?: string) {
+    super()
+    this.socketPath = socketPath || (process.platform === 'win32' ? null : this.generateSocketPath())
+  }
+
+  // EventEmitter
+  on(event: string, listener: (...args: any[]) => void): this {
+    this.eventEmitter.on(event, listener)
+    return this
+  }
+
+  emit(event: string, ...args: any[]): boolean {
+    return this.eventEmitter.emit(event, ...args)
+  }
+
+  off(event: string, listener: (...args: any[]) => void): this {
+    this.eventEmitter.off(event, listener)
+    return this
+  }
+
+  removeAllListeners(event?: string): this {
+    this.eventEmitter.removeAllListeners(event)
+    return this
+  }
+
+  private generateSocketPath(): string {
+    const tmpDir = os.tmpdir()
+    const randomSuffix = crypto.randomBytes(8).toString('hex')
+    const timestamp = Date.now()
+
+    return path.join(tmpDir, `ssh-agent-${timestamp}-${randomSuffix}.sock`)
+  }
+
+  async start(): Promise<string | null> {
+    if (this.isRunning) {
+      return this.socketPath
+    }
+
+    if (process.platform === 'win32') {
+      this.isRunning = true
+      logger.info('SSH Agent started without Windows named pipe', { event: 'ssh.agent.started.inmemory' })
+      this.emit('started', null)
+      return null
+    }
+
+    if (!this.socketPath) {
+      throw new Error('SSH Agent socket path is not available')
+    }
+    const socketPath = this.socketPath
+
+    // Clean up old socket files
+    try {
+      await fs.unlink(socketPath)
+    } catch (error) {}
+
+    return new Promise((resolve, reject) => {
+      this.server = createServer((socket) => {
+        this.handleConnection(socket)
+      })
+
+      this.server.on('error', (err) => {
+        logger.error('SSH Agent server error', { event: 'ssh.agent.server.error', error: err.message })
+        reject(err)
+      })
+
+      this.server.listen(this.createListenOptions(), () => {
+        this.isRunning = true
+        logger.info('SSH Agent started', { event: 'ssh.agent.started' })
+
+        // Set SSH_AUTH_SOCK
+        process.env.SSH_AUTH_SOCK = socketPath
+
+        // Set Permissions
+        fs.chmod(socketPath, 0o600).catch((err) => {
+          logger.warn('Could not set socket permissions', { event: 'ssh.agent.chmod.error', error: err.message })
+        })
+
+        this.emit('started', socketPath)
+        resolve(socketPath)
+      })
+    })
+  }
+
+  private createListenOptions(): ListenOptions {
+    if (!this.socketPath) {
+      throw new Error('SSH Agent socket path is not available')
+    }
+
+    return {
+      path: this.socketPath,
+      exclusive: true,
+      readableAll: false,
+      writableAll: false
+    }
+  }
+
+  async stop(): Promise<void> {
+    return new Promise((resolve) => {
+      if (!this.isRunning) {
+        resolve()
+        return
+      }
+
+      // Close all client connections
+      this.clientConnections.forEach((socket) => {
+        socket.destroy()
+      })
+      this.clientConnections.clear()
+
+      const finishStop = async () => {
+        this.isRunning = false
+
+        // Clean up socket files
+        if (this.socketPath) {
+          try {
+            await fs.unlink(this.socketPath)
+          } catch (err) {
+            logger.warn('Could not remove socket file', { event: 'ssh.agent.cleanup.error', error: err })
+          }
+        }
+
+        // Clean up SSH_AUTH_SOCK
+        if (process.env.SSH_AUTH_SOCK === this.socketPath) {
+          delete process.env.SSH_AUTH_SOCK
+        }
+
+        logger.info('SSH Agent stopped', { event: 'ssh.agent.stopped' })
+        this.emit('stopped')
+        resolve()
+      }
+
+      if (!this.server) {
+        finishStop()
+        return
+      }
+
+      this.server.close(finishStop)
+    })
+  }
+
+  private handleConnection(socket: AgentConnection): void {
+    this.clientConnections.add(socket)
+    logger.debug('SSH Agent client connected', { event: 'ssh.agent.client.connect' })
+
+    let buffer: Buffer = Buffer.alloc(0) as Buffer
+
+    socket.on('data', (data) => {
+      const dataBuffer = Buffer.from(data)
+      buffer = Buffer.concat([buffer, dataBuffer])
+      buffer = this.processMessages(socket, buffer)
+    })
+
+    socket.on('error', (err) => {
+      logger.error('SSH Agent socket error', { event: 'ssh.agent.socket.error', error: err.message })
+    })
+
+    socket.on('close', () => {
+      this.clientConnections.delete(socket)
+      logger.debug('SSH Agent client disconnected', { event: 'ssh.agent.client.disconnect' })
+    })
+  }
+
+  private processMessages(socket: AgentConnection, buffer: Buffer): Buffer {
+    let offset = 0
+
+    while (offset + 4 <= buffer.length) {
+      // read the message length
+      const messageLength = buffer.readUInt32BE(offset)
+
+      if (offset + 4 + messageLength > buffer.length) {
+        // wait for more data
+        break
+      }
+
+      // fetch the message data
+      const messageData = buffer.slice(offset + 4, offset + 4 + messageLength)
+
+      try {
+        this.handleAgentMessage(socket, messageData)
+      } catch (error) {
+        logger.error('SSH Agent error handling message', {
+          event: 'ssh.agent.message.error',
+          error: error
+        })
+        this.sendFailureResponse(socket)
+      }
+
+      offset += 4 + messageLength
+    }
+
+    return buffer.slice(offset)
+  }
+
+  private handleAgentMessage(socket: AgentConnection, message: Buffer): void {
+    if (message.length === 0) return
+
+    const messageType = message.readUInt8(0)
+    logger.debug('SSH Agent received message', { event: 'ssh.agent.message', messageType })
+
+    switch (messageType) {
+      case SSH_AGENTC_REQUEST_IDENTITIES:
+      case SSH_AGENTC_REQUEST_IDENTITIES_OLD:
+        this.handleRequestIdentities(socket)
+        break
+      case SSH_AGENTC_SIGN_REQUEST:
+        this.handleSignRequest(socket, message)
+        break
+      case SSH_AGENTC_ADD_SMARTCARD_KEY:
+        logger.debug('Smart card operations not supported', { event: 'ssh.agent.smartcard.unsupported' })
+        this.sendFailureResponse(socket)
+        break
+      default:
+        logger.warn('SSH Agent unknown message type', { event: 'ssh.agent.message.unknown', messageType })
+        this.sendFailureResponse(socket)
+    }
+  }
+
+  private handleRequestIdentities(socket: AgentConnection): void {
+    logger.debug('Handling request identities', { event: 'ssh.agent.identities' })
+
+    const keys = Array.from(this.keys.values())
+
+    // Calculate the total length of the response
+    let totalLength = 1 + 4 // Message Type + Number of Keys
+
+    keys.forEach((key) => {
+      totalLength += 4 + key.publicKey.length // Public key length field + public key data
+      const commentBuffer = Buffer.from(key.comment, 'utf8')
+      totalLength += 4 + commentBuffer.length // Comment length field + comment data
+    })
+
+    const response = Buffer.alloc(totalLength)
+    let offset = 0
+
+    // Message Type
+    response.writeUInt8(SSH_AGENT_IDENTITIES_ANSWER, offset)
+    offset += 1
+
+    // Number of keys
+    response.writeUInt32BE(keys.length, offset)
+    offset += 4
+
+    keys.forEach((key) => {
+      logger.debug('Adding key to identity response', {
+        event: 'ssh.agent.identity.add',
+        comment: key.comment,
+        publicKeyLength: key.publicKey.length
+      })
+
+      // Public key length
+      response.writeUInt32BE(key.publicKey.length, offset)
+      offset += 4
+
+      key.publicKey.copy(response, offset)
+      offset += key.publicKey.length
+
+      const commentBuffer = Buffer.from(key.comment, 'utf8')
+      response.writeUInt32BE(commentBuffer.length, offset)
+      offset += 4
+
+      commentBuffer.copy(response, offset)
+      offset += commentBuffer.length
+
+      logger.debug('Key added to identity response', { event: 'ssh.agent.identity.added', comment: key.comment })
+    })
+
+    logger.debug('Identity response built', { event: 'ssh.agent.identities.done', totalLength, offset })
+
+    this.sendResponse(socket, response)
+  }
+
+  private handleSignRequest(socket: AgentConnection, message: Buffer): void {
+    logger.debug('Handling sign request', { event: 'ssh.agent.sign' })
+
+    let offset = 1 // Skip message
+
+    try {
+      // Read the public key
+      const pubKeyLength = message.readUInt32BE(offset)
+      offset += 4
+      const pubKeyData = message.slice(offset, offset + pubKeyLength)
+      offset += pubKeyLength
+
+      // Read the data to be signed
+      const dataLength = message.readUInt32BE(offset)
+      offset += 4
+      const signData = message.slice(offset, offset + dataLength)
+      offset += dataLength
+
+      // Read flag bit
+      const flags = message.readUInt32BE(offset)
+
+      logger.debug('Sign request details', { event: 'ssh.agent.sign.details', pubKeyLength, dataLength, flags })
+
+      // Find matching keys
+      const key = this.findKeyByPublicKeyData(pubKeyData)
+      if (!key) {
+        logger.debug('Key not found for signing', { event: 'ssh.agent.sign.keynotfound' })
+        this.sendFailureResponse(socket)
+        return
+      }
+
+      logger.debug('Found key for signing', { event: 'ssh.agent.sign.keyfound', comment: key.comment })
+
+      // sign
+      const signature = this.performSigning(key, signData, flags)
+      if (!signature) {
+        logger.warn('Signing failed', { event: 'ssh.agent.sign.failed' })
+        this.sendFailureResponse(socket)
+        return
+      }
+
+      this.sendSignResponse(socket, signature)
+    } catch (error) {
+      logger.error('Error in sign request', { event: 'ssh.agent.sign.error', error: error })
+      this.sendFailureResponse(socket)
+    }
+  }
+
+  private findKeyByPublicKeyData(pubKeyData: Buffer): SSHAgentKey | undefined {
+    for (const key of this.keys.values()) {
+      // Comparing public key
+      if (key.publicKey.equals(pubKeyData)) {
+        return key
+      }
+
+      // try to compare the parsed public key
+      try {
+        const parsedPubKey = utils.parseKey(pubKeyData)
+        if (parsedPubKey && !(parsedPubKey instanceof Error) && key.publicKey.equals(parsedPubKey.getPublicSSH())) {
+          return key
+        }
+      } catch (e) {}
+    }
+    return undefined
+  }
+
+  private performSigning(key: SSHAgentKey, data: Buffer, flags: number): Buffer | null {
+    try {
+      logger.debug('Performing signature', { event: 'ssh.agent.sign.perform', keyType: key.keyType })
+
+      let hashAlg = 'sha1'
+      if (key.keyType === SSHKeyType.RSA && flags & 0x04) {
+        hashAlg = 'sha512'
+      } else if (key.keyType === SSHKeyType.RSA && flags & 0x02) {
+        hashAlg = 'sha256'
+      }
+
+      const signature = key.privateKey.sign(data, hashAlg)
+      if (signature instanceof Error) {
+        logger.error('Signature generation failed', { event: 'ssh.agent.sign.generate.error' })
+        return null
+      }
+
+      // format
+      return this.formatSignature(key.keyType, signature, flags)
+    } catch (error) {
+      logger.error('Signing error', { event: 'ssh.agent.sign.error', error: error })
+      return null
+    }
+  }
+
+  private formatSignature(keyType: SSHKeyType, signature: Buffer, flags: number): Buffer {
+    let sigType = keyType
+
+    // Determine the signature type based on the flag bit
+    if (keyType === SSHKeyType.RSA) {
+      if (flags & 0x04) {
+        sigType = 'rsa-sha2-512' as SSHKeyType
+      } else if (flags & 0x02) {
+        sigType = 'rsa-sha2-256' as SSHKeyType
+      }
+    }
+
+    const sigTypeBuffer = Buffer.from(sigType, 'utf8')
+    const result = Buffer.alloc(4 + sigTypeBuffer.length + 4 + signature.length)
+    let offset = 0
+
+    // Signature type length
+    result.writeUInt32BE(sigTypeBuffer.length, offset)
+    offset += 4
+
+    // Signature type
+    sigTypeBuffer.copy(result, offset)
+    offset += sigTypeBuffer.length
+
+    // Signature data length
+    result.writeUInt32BE(signature.length, offset)
+    offset += 4
+
+    // Signature data
+    signature.copy(result, offset)
+
+    return result
+  }
+
+  private sendResponse(socket: AgentConnection, data: Buffer): void {
+    const response = Buffer.alloc(4 + data.length)
+    response.writeUInt32BE(data.length, 0)
+    data.copy(response, 4)
+
+    logger.debug('Sending agent response', { event: 'ssh.agent.response', responseLength: response.length, dataLength: data.length })
+
+    socket.write(response)
+  }
+
+  private sendSignResponse(socket: AgentConnection, signature: Buffer): void {
+    const response = Buffer.alloc(1 + 4 + signature.length)
+    let offset = 0
+
+    // Message Type
+    response.writeUInt8(SSH_AGENT_SIGN_RESPONSE, offset)
+    offset += 1
+
+    // Signature data length
+    response.writeUInt32BE(signature.length, offset)
+    offset += 4
+
+    // Signature data
+    signature.copy(response, offset)
+
+    this.sendResponse(socket, response)
+  }
+
+  private sendFailureResponse(socket: AgentConnection): void {
+    const response = Buffer.from([SSH_AGENT_FAILURE])
+    this.sendResponse(socket, response)
+  }
+
+  // BaseAgent Methods
+  getIdentities(callback: (err: Error | null, keys?: any[]) => void): void {
+    try {
+      const keys = Array.from(this.keys.values()).map((key) => ({
+        type: key.keyType,
+        data: key.publicKey,
+        comment: key.comment
+      }))
+      callback(null, keys)
+    } catch (error) {
+      callback(error as Error)
+    }
+  }
+
+  sign(pubKey: string | Buffer | any, data: Buffer, options: any, callback?: (err: Error | null, signature?: Buffer) => void): void {
+    if (typeof options === 'function') {
+      callback = options
+      options = {}
+    }
+
+    if (!callback) {
+      throw new Error('Callback is required')
+    }
+    try {
+      const key = this.findKeyByPublicKeyData(pubKey.data || pubKey)
+      if (!key) {
+        return callback(new Error('Key not found'))
+      }
+
+      const signature = this.performSigning(key, data, options?.flags || 0)
+      if (!signature) {
+        return callback(new Error('Signing failed'))
+      }
+
+      callback(null, signature)
+    } catch (error) {
+      callback(error as Error)
+    }
+  }
+
+  // Agent Forwarding support
+  getStream(callback: (err: Error | null, stream?: Duplex) => void): void {
+    if (!this.isRunning) {
+      return callback(new Error('SSH Agent is not running'))
+    }
+
+    try {
+      if (process.platform === 'win32') {
+        callback(null, this.createInMemoryStream())
+        return
+      }
+
+      if (!this.socketPath) {
+        return callback(new Error('SSH Agent socket path is not available'))
+      }
+
+      // Create a stream connected to the local agent
+      const socket = new Socket()
+      socket.connect(this.socketPath, () => {
+        callback(null, socket)
+      })
+
+      socket.on('error', (err) => {
+        callback(err)
+      })
+    } catch (error) {
+      callback(error as Error)
+    }
+  }
+
+  private createInMemoryStream(): Duplex {
+    let connection: InMemoryAgentConnection
+
+    const readNoop = () => undefined
+    const stream = new Duplex({
+      read: readNoop,
+      write: (chunk, _encoding, next) => {
+        connection.receive(Buffer.from(chunk))
+        next()
+      },
+      destroy: (error, next) => {
+        connection.closeFromClient(error)
+        next(error)
+      }
+    })
+
+    connection = new InMemoryAgentConnection(stream)
+    this.handleConnection(connection)
+
+    return stream
+  }
+
+  async addKeyFromData(privateKeyData: string, passphrase?: string, comment?: string): Promise<string> {
+    try {
+      const parsedKey = utils.parseKey(privateKeyData, passphrase)
+
+      if (!parsedKey || parsedKey instanceof Error) {
+        throw new Error('Failed to parse private key')
+      }
+
+      if (!parsedKey.isPrivateKey()) {
+        throw new Error('Provided key is not a private key')
+      }
+
+      const publicKeySSH = parsedKey.getPublicSSH()
+      const fingerprint = crypto.createHash('md5').update(publicKeySSH).digest('hex').match(/.{2}/g)!.join(':')
+
+      // Check if a key with the same fingerprint already exists
+      for (const key of this.keys.values()) {
+        if (key.comment === comment) {
+          logger.debug('Key already exists, skipping', { event: 'ssh.agent.key.exists', comment: key.comment })
+          return key.id
+        }
+      }
+
+      const keyId = crypto.randomBytes(16).toString('hex')
+
+      const agentKey: SSHAgentKey = {
+        id: keyId,
+        privateKey: parsedKey,
+        publicKey: publicKeySSH,
+        comment: comment || 'imported-key',
+        keyType: parsedKey.type as SSHKeyType,
+        fingerprint,
+        addedAt: new Date()
+      }
+
+      this.keys.set(keyId, agentKey)
+      logger.info('Key added to SSH Agent', { event: 'ssh.agent.key.added', comment: agentKey.comment, keyType: agentKey.keyType })
+      this.emit('keyAdded', agentKey)
+
+      return keyId
+    } catch (error) {
+      logger.error('Failed to add key from data', { event: 'ssh.agent.key.add.error', error: error })
+      throw error
+    }
+  }
+
+  removeKey(keyId: string): boolean {
+    const key = this.keys.get(keyId)
+    if (key && this.keys.delete(keyId)) {
+      logger.info('Key removed from SSH Agent', { event: 'ssh.agent.key.removed', comment: key.comment })
+      this.emit('keyRemoved', key)
+      return true
+    }
+    return false
+  }
+
+  removeAllKeys(): number {
+    const count = this.keys.size
+    this.keys.clear()
+    logger.info('All keys removed from SSH Agent', { event: 'ssh.agent.keys.cleared', count })
+    this.emit('allKeysRemoved')
+    return count
+  }
+
+  listKeys(): Array<{
+    id: string
+    comment: string
+    keyType: string
+    fingerprint: string
+  }> {
+    return Array.from(this.keys.values()).map((key) => ({
+      id: key.id,
+      comment: key.comment,
+      keyType: key.keyType,
+      fingerprint: key.fingerprint
+    }))
+  }
+
+  getSocketPath(): string | null {
+    return this.socketPath
+  }
+
+  isAgentRunning(): boolean {
+    return this.isRunning
+  }
+
+  async generateKeyPair(
+    keyType: 'rsa' | 'ed25519' | 'ecdsa' = 'ed25519',
+    options: {
+      bits?: number
+      comment?: string
+      passphrase?: string
+    } = {}
+  ): Promise<{ privateKey: string; publicKey: string; keyId: string }> {
+    return new Promise((resolve, reject) => {
+      const generateOptions: any = {
+        comment: options.comment || `generated-${keyType}-key`,
+        ...options
+      }
+
+      utils.generateKeyPair(keyType, generateOptions, async (err, keys) => {
+        if (err) {
+          return reject(err)
+        }
+
+        try {
+          const keyId = await this.addKeyFromData(keys.private, options.passphrase, options.comment)
+
+          resolve({
+            privateKey: keys.private,
+            publicKey: keys.public,
+            keyId
+          })
+        } catch (error) {
+          reject(error)
+        }
+      })
+    })
+  }
+}
+
+export class SSHAgentManager {
+  private static instance: SSHAgentManager | null = null
+  private agent: SSHAgent | null = null
+
+  private constructor() {
+    // Private constructor for singleton pattern
+  }
+
+  static getInstance(): SSHAgentManager {
+    if (!SSHAgentManager.instance) {
+      SSHAgentManager.instance = new SSHAgentManager()
+    }
+    return SSHAgentManager.instance
+  }
+
+  async enableAgent(enabled: boolean): Promise<{ SSH_AUTH_SOCK: string | null; agent?: SSHAgent }> {
+    if (!enabled) {
+      if (this.agent) {
+        await this.agent.stop()
+        this.agent = null
+      }
+      return { SSH_AUTH_SOCK: null }
+    }
+
+    if (this.agent && this.agent.isAgentRunning()) {
+      return {
+        SSH_AUTH_SOCK: this.agent.getSocketPath(),
+        agent: this.agent
+      }
+    }
+
+    try {
+      this.agent = new SSHAgent()
+
+      this.setupEventListeners()
+
+      const socketPath = await this.agent.start()
+
+      logger.info('Chaterm SSH Agent started', { event: 'ssh.agent.ipc.started' })
+      return {
+        SSH_AUTH_SOCK: socketPath,
+        agent: this.agent
+      }
+    } catch (error) {
+      logger.error('Failed to start Chaterm SSH Agent', {
+        event: 'ssh.agent.ipc.start.error',
+        error: error
+      })
+      throw error
+    }
+  }
+
+  private setupEventListeners(): void {
+    if (!this.agent) return
+
+    this.agent.on('started', (_socketPath) => {
+      logger.debug('SSH Agent started event', { event: 'ssh.agent.event.started' })
+    })
+
+    this.agent.on('stopped', () => {
+      logger.debug('SSH Agent stopped event', { event: 'ssh.agent.event.stopped' })
+    })
+
+    this.agent.on('keyAdded', (key) => {
+      logger.debug('Key added event', { event: 'ssh.agent.event.keyadded', comment: key.comment, keyType: key.keyType })
+    })
+
+    this.agent.on('keyRemoved', (key) => {
+      logger.debug('Key removed event', { event: 'ssh.agent.event.keyremoved', comment: key.comment })
+    })
+  }
+
+  getAgent(): SSHAgent | null {
+    return this.agent
+  }
+
+  async addKey(keyData: string, passphrase?: string, comment?: string): Promise<string> {
+    if (!this.agent?.isAgentRunning()) {
+      throw new Error('SSH Agent is not running')
+    }
+    return this.agent.addKeyFromData(keyData, passphrase, comment)
+  }
+
+  removeKey(keyId: string): boolean {
+    if (!this.agent?.isAgentRunning()) {
+      return false
+    }
+    return this.agent.removeKey(keyId)
+  }
+
+  listKeys() {
+    if (!this.agent?.isAgentRunning()) {
+      return []
+    }
+    return this.agent.listKeys()
+  }
+
+  async generateKeyPair(
+    keyType: 'rsa' | 'ed25519' | 'ecdsa' = 'ed25519',
+    options: {
+      bits?: number
+      comment?: string
+      passphrase?: string
+    } = {}
+  ) {
+    if (!this.agent?.isAgentRunning()) {
+      throw new Error('SSH Agent is not running')
+    }
+    return this.agent.generateKeyPair(keyType, options)
+  }
+}

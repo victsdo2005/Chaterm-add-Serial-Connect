@@ -1,0 +1,43 @@
+//  Copyright (c) 2025-present, chaterm.ai  All rights reserved.
+//  This source code is licensed under the GPL-3.0
+//
+// Copyright (c) 2025 cline Authors, All rights reserved.
+// Licensed under the Apache License, Version 2.0
+
+export interface AutoApprovalSettings {
+  // Version for race condition prevention (incremented on every change)
+  version: number
+  // Whether auto-approval is enabled
+  enabled: boolean
+  // Individual action permissions
+  actions: {
+    readFiles: boolean // Read files and directories in the working directory
+    readFilesExternally?: boolean // Read files and directories outside of the working directory
+    editFiles: boolean // Edit files in the working directory
+    editFilesExternally?: boolean // Edit files outside of the working directory
+    executeSafeCommands?: boolean // Execute safe commands
+    executeAllCommands?: boolean // Execute all commands
+    autoExecuteReadOnlyCommands?: boolean // Auto-execute read-only commands (requires_approval=false) without user confirmation
+  }
+  // Global settings
+  maxRequests: number // Maximum number of auto-approved requests
+  enableNotifications: boolean // Show notifications for approval and task completion
+  favorites: string[] // IDs of actions favorited by the user for quick access
+}
+
+export const DEFAULT_AUTO_APPROVAL_SETTINGS: AutoApprovalSettings = {
+  version: 1,
+  enabled: false,
+  actions: {
+    readFiles: true,
+    readFilesExternally: false,
+    editFiles: false,
+    editFilesExternally: false,
+    executeSafeCommands: true,
+    executeAllCommands: true,
+    autoExecuteReadOnlyCommands: false
+  },
+  maxRequests: 3,
+  enableNotifications: true,
+  favorites: ['enableAutoApprove', 'readFiles']
+}

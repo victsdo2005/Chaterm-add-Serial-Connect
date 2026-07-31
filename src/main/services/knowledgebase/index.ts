@@ -1,0 +1,956 @@
+import { app, ipcMain } from 'electron'
+import path from 'path'
+import * as fs from 'fs/promises'
+import fsSync from 'fs'
+import { pipeline } from 'stream/promises'
+import { randomUUID } from 'crypto'
+import { createHash } from 'crypto'
+import { getDefaultLanguage } from '../../config/edition'
+import { getUserConfig } from '../../agent/core/storage/state'
+import { KB_DEFAULT_SEEDS, KB_DEFAULT_SEEDS_VERSION } from './default-seeds'
+import type { KnowledgeBaseDefaultSeed } from './default-seeds'
+import { getKbCloudUsedBytes, KB_CLOUD_TOTAL_BYTES, getKbSyncLastResults } from './sync'
+import { KbSearchManager } from './search/index'
+import type { EmbeddingConfig } from './search/types'
+import { createLogger } from '../logging'
+
+const kbLogger = createLogger('kb-search')
+const KB_SEARCH_QUERY_MAX_LEN = 2000
+
+export interface KnowledgeBaseEntry {
+  name: string
+  relPath: string
+  type: 'file' | 'dir'
+  size?: number
+  mtimeMs?: number
+}
+
+// Blocklist: these extensions are rejected; all others are allowed (permit new text formats by default).
+const BLOCKED_IMPORT_EXTS = new Set([
+  '.exe',
+  '.dll',
+  '.so',
+  '.dylib',
+  '.bin',
+  '.o',
+  '.obj',
+  '.class',
+  '.pyc',
+  '.elc',
+  '.wasm',
+  '.node',
+  '.com',
+  '.bat',
+  '.cmd',
+  '.msi',
+  '.deb',
+  '.rpm',
+  '.dmg',
+  '.pkg',
+  '.zip',
+  '.tar',
+  '.gz',
+  '.tgz',
+  '.rar',
+  '.7z',
+  '.xz',
+  '.bz2',
+  '.z',
+  '.pdf',
+  '.doc',
+  '.docx',
+  '.xls',
+  '.xlsx',
+  '.ppt',
+  '.pptx',
+  '.odt',
+  '.ods',
+  '.odp',
+  '.mp3',
+  '.mp4',
+  '.webm',
+  '.mov',
+  '.avi',
+  '.wav',
+  '.flac',
+  '.ogg',
+  '.m4a',
+  '.wmv',
+  '.mkv',
+  '.m4v',
+  '.db',
+  '.sqlite',
+  '.sqlite3'
+])
+
+// Image file extensions for binary handling (exported for sync encoding)
+export const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg'])
+const MAX_IMPORT_BYTES = 10 * 1024 * 1024
+
+function getKbRoot(): string {
+  return path.join(app.getPath('userData'), 'knowledgebase')
+}
+
+/** Exported for agent glob_search to resolve @knowledgebase/ paths. */
+export function getKnowledgeBaseRoot(): string {
+  return getKbRoot()
+}
+
+const KB_DEFAULT_SEEDS_META_FILE = '.kb-default-seeds-meta.json'
+
+interface DefaultSeedMetaEntry {
+  relPath: string
+  lastSeedHash: string
+  deletedAt?: string
+}
+
+interface DefaultKbSeedsMeta {
+  version: number
+  seeds: Record<string, DefaultSeedMetaEntry>
+}
+
+function isKbSearchRegion(value: unknown): value is 'cn' | 'global' {
+  return value === 'cn' || value === 'global'
+}
+
+function isValidBaseUrl(value: unknown): value is string {
+  if (typeof value !== 'string') return false
+  if (!value.trim()) return false
+  try {
+    const parsed = new URL(value)
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+function readKbSearchPolicyFromEnv(): boolean | null {
+  const raw = process.env.CHATERM_KB_SEARCH_ENABLED
+  if (typeof raw !== 'string') return null
+  const normalized = raw.trim().toLowerCase()
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false
+  return null
+}
+
+function normalizeKbSearchOptions(opts?: { maxResults?: number; minScore?: number }): { maxResults: number; minScore?: number } {
+  const maxResultsRaw = opts?.maxResults
+  const maxResults = typeof maxResultsRaw === 'number' && Number.isFinite(maxResultsRaw) ? Math.floor(maxResultsRaw) : 5
+  const normalized: { maxResults: number; minScore?: number } = {
+    maxResults: Math.min(Math.max(maxResults, 1), 20)
+  }
+  const minScoreRaw = opts?.minScore
+  if (typeof minScoreRaw === 'number' && Number.isFinite(minScoreRaw)) {
+    normalized.minScore = Math.min(Math.max(minScoreRaw, 0), 1)
+  }
+  return normalized
+}
+
+function normalizeRelPath(relPath: string): string {
+  const p = relPath.replace(/\\/g, '/')
+  return p.startsWith('/') ? p.slice(1) : p
+}
+
+function getSeedDefaultRelPath(seed: KnowledgeBaseDefaultSeed, isChinese: boolean): string {
+  return typeof seed.getDefaultRelPath === 'function' ? seed.getDefaultRelPath(isChinese) : seed.defaultRelPath
+}
+
+function getSeedDefaultRelPathVariants(seed: KnowledgeBaseDefaultSeed): string[] {
+  if (typeof seed.getDefaultRelPath === 'function') {
+    return [seed.getDefaultRelPath(true), seed.getDefaultRelPath(false)]
+  }
+  return [seed.defaultRelPath]
+}
+
+function sha256Hex(content: string | Buffer): string {
+  if (Buffer.isBuffer(content)) {
+    return createHash('sha256').update(content).digest('hex')
+  }
+  return createHash('sha256').update(content, 'utf-8').digest('hex')
+}
+
+async function getIsChinese(): Promise<boolean> {
+  let lang = ''
+  try {
+    const userConfig = await getUserConfig()
+    if (userConfig && typeof userConfig.language === 'string') {
+      lang = userConfig.language
+    }
+  } catch {
+    // ignore and fallback to default language
+  }
+  if (!lang) {
+    lang = getDefaultLanguage() || ''
+  }
+  return lang.toLowerCase().startsWith('zh')
+}
+
+async function readKbDefaultSeedsMeta(rootAbs: string): Promise<{ metaAbsPath: string; meta: DefaultKbSeedsMeta }> {
+  const newAbsPath = path.join(rootAbs, KB_DEFAULT_SEEDS_META_FILE)
+
+  const tryRead = async (absPath: string): Promise<DefaultKbSeedsMeta | null> => {
+    try {
+      const raw = await fs.readFile(absPath, 'utf-8')
+      const parsed = JSON.parse(raw) as any
+      if (!parsed || typeof parsed !== 'object') return null
+      const version = typeof parsed.version === 'number' ? parsed.version : 0
+      const seeds = parsed.seeds && typeof parsed.seeds === 'object' ? (parsed.seeds as DefaultKbSeedsMeta['seeds']) : {}
+      return { version, seeds }
+    } catch {
+      return null
+    }
+  }
+
+  const newMeta = await tryRead(newAbsPath)
+  if (newMeta) return { metaAbsPath: newAbsPath, meta: newMeta }
+
+  return { metaAbsPath: newAbsPath, meta: { version: 0, seeds: {} } }
+}
+
+async function writeKbDefaultSeedsMeta(metaAbsPath: string, meta: DefaultKbSeedsMeta): Promise<void> {
+  const safeMeta: DefaultKbSeedsMeta = {
+    version: meta.version ?? 0,
+    seeds: meta.seeds ?? {}
+  }
+  await fs.writeFile(metaAbsPath, JSON.stringify(safeMeta, null, 2), 'utf-8')
+}
+
+function findMetaIdByRelPath(meta: DefaultKbSeedsMeta, relPath: string): string | null {
+  for (const [id, entry] of Object.entries(meta.seeds)) {
+    if (normalizeRelPath(entry.relPath) === relPath) return id
+  }
+  return null
+}
+
+function findSeedIdByDefaultRelPath(relPath: string): string | null {
+  for (const seed of KB_DEFAULT_SEEDS) {
+    for (const candidate of getSeedDefaultRelPathVariants(seed)) {
+      if (normalizeRelPath(candidate) === relPath) return seed.id
+    }
+  }
+  return null
+}
+
+function resolveDefaultSeedId(meta: DefaultKbSeedsMeta, relPath: string): string | null {
+  return findMetaIdByRelPath(meta, relPath) ?? findSeedIdByDefaultRelPath(relPath)
+}
+
+async function trackSeedFileChange(oldRelPath: string, newRelPath?: string): Promise<void> {
+  const rootAbs = path.resolve(getKbRoot())
+  const { metaAbsPath, meta } = await readKbDefaultSeedsMeta(rootAbs)
+
+  const normalized = normalizeRelPath(oldRelPath)
+  const id = resolveDefaultSeedId(meta, normalized)
+  if (!id) return
+
+  // When newRelPath is provided, treat it as a relPath change (rename/move).
+  if (newRelPath && newRelPath.length > 0) {
+    const normalizedNew = normalizeRelPath(newRelPath)
+
+    const entry = meta.seeds[id] ?? { relPath: normalizedNew, lastSeedHash: '' }
+    meta.seeds[id] = { ...entry, relPath: normalizedNew }
+    await writeKbDefaultSeedsMeta(metaAbsPath, meta)
+    return
+  }
+
+  const entry = meta.seeds[id] ?? { relPath: normalized, lastSeedHash: '' }
+  meta.seeds[id] = { ...entry, deletedAt: new Date().toISOString() }
+  await writeKbDefaultSeedsMeta(metaAbsPath, meta)
+}
+
+/**
+ * Initialize knowledge base default seed files.
+ */
+async function initKbDefaultSeedFiles(): Promise<void> {
+  const root = getKbRoot()
+  const rootAbs = path.resolve(root)
+  const { metaAbsPath, meta } = await readKbDefaultSeedsMeta(rootAbs)
+  if (meta.version >= KB_DEFAULT_SEEDS_VERSION) {
+    return
+  }
+
+  const isChinese = await getIsChinese()
+
+  for (const seed of KB_DEFAULT_SEEDS) {
+    const currentEntry = meta.seeds[seed.id]
+    if (currentEntry?.deletedAt) {
+      continue
+    }
+
+    const isBinarySeed = typeof seed.getBinaryContent === 'function'
+    const seedContent = isBinarySeed ? '' : seed.getContent(isChinese).trim()
+    const seedBinary = isBinarySeed ? seed.getBinaryContent() : null
+    if (isBinarySeed && !seedBinary) {
+      continue
+    }
+    const seedHash = isBinarySeed && seedBinary ? sha256Hex(seedBinary) : sha256Hex(seedContent)
+
+    const targetRelPath = currentEntry?.relPath ? normalizeRelPath(currentEntry.relPath) : normalizeRelPath(getSeedDefaultRelPath(seed, isChinese))
+    const targetAbsPath = path.join(root, targetRelPath)
+
+    const exists = await pathExists(targetAbsPath)
+    if (!exists) {
+      // Only create when there is no existing binding for this seed.
+      if (currentEntry?.relPath) {
+        continue
+      }
+
+      await fs.mkdir(path.dirname(targetAbsPath), { recursive: true })
+      if (isBinarySeed && seedBinary) {
+        await fs.writeFile(targetAbsPath, seedBinary)
+      } else {
+        await fs.writeFile(targetAbsPath, seedContent, 'utf-8')
+      }
+      meta.seeds[seed.id] = {
+        relPath: targetRelPath,
+        lastSeedHash: seedHash
+      }
+      continue
+    }
+
+    // Existing file: only overwrite when file still matches last seed hash (i.e., user hasn't edited).
+    try {
+      const fileContent = isBinarySeed ? await fs.readFile(targetAbsPath) : await fs.readFile(targetAbsPath, 'utf-8')
+      const fileHash = sha256Hex(fileContent)
+      const lastSeedHash = currentEntry?.lastSeedHash ?? ''
+
+      if (lastSeedHash && fileHash !== lastSeedHash) {
+        // User modified; do not overwrite.
+        continue
+      }
+
+      // Safe to overwrite (either unmodified seed, or first-time meta missing hash but content matches).
+      if (isBinarySeed && seedBinary) {
+        await fs.writeFile(targetAbsPath, seedBinary)
+      } else {
+        await fs.writeFile(targetAbsPath, seedContent, 'utf-8')
+      }
+      meta.seeds[seed.id] = {
+        relPath: targetRelPath,
+        lastSeedHash: seedHash
+      }
+    } catch {
+      // Ignore read errors; do not overwrite.
+      continue
+    }
+  }
+
+  meta.version = KB_DEFAULT_SEEDS_VERSION
+  await writeKbDefaultSeedsMeta(metaAbsPath, meta)
+}
+
+function isSafeBasename(name: string): boolean {
+  if (!name) return false
+  if (name === '.' || name === '..') return false
+  // Prevent path traversal on both win/unix
+  if (name.includes('/') || name.includes('\\')) return false
+  return true
+}
+
+function resolveKbPath(relPath: string): { rootAbs: string; absPath: string } {
+  const rootAbs = path.resolve(getKbRoot())
+  if (path.isAbsolute(relPath)) {
+    throw new Error('Absolute path not allowed')
+  }
+  const absPath = path.resolve(rootAbs, relPath)
+  if (absPath !== rootAbs && !absPath.startsWith(rootAbs + path.sep)) {
+    throw new Error('Path escapes knowledgebase root')
+  }
+  return { rootAbs, absPath }
+}
+
+async function pathExists(absPath: string): Promise<boolean> {
+  try {
+    await fs.access(absPath)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function caseSensitiveExists(dirAbs: string, name: string): Promise<boolean> {
+  try {
+    const entries = await fs.readdir(dirAbs, { withFileTypes: true })
+    return entries.some((entry) => entry.name === name)
+  } catch (e: any) {
+    if (e?.code === 'ENOENT') return false
+    throw e
+  }
+}
+
+function splitNameExt(fileName: string): { base: string; ext: string } {
+  const ext = path.extname(fileName)
+  const base = ext ? fileName.slice(0, -ext.length) : fileName
+  return { base, ext }
+}
+
+function isImageFile(filePath: string): boolean {
+  const ext = path.extname(filePath).toLowerCase()
+  return IMAGE_EXTS.has(ext)
+}
+
+async function ensureUniqueName(dirAbs: string, desiredName: string): Promise<string> {
+  const { base, ext } = splitNameExt(desiredName)
+  let candidate = desiredName
+  let n = 1
+  while (true) {
+    const target = path.join(dirAbs, candidate)
+    if (!(await pathExists(target))) return candidate
+    candidate = `${base} (${n})${ext}`
+    n++
+  }
+}
+
+async function listDir(relDir: string): Promise<KnowledgeBaseEntry[]> {
+  const { absPath: dirAbs } = resolveKbPath(relDir)
+
+  // Check if directory exists before attempting to read
+  if (!(await pathExists(dirAbs))) {
+    return []
+  }
+
+  const dirents = await fs.readdir(dirAbs, { withFileTypes: true })
+
+  const entries: KnowledgeBaseEntry[] = []
+  for (const d of dirents) {
+    if (d.name.startsWith('.')) continue
+    const childAbs = path.join(dirAbs, d.name)
+    const childRel = path.posix.join(relDir.replace(/\\/g, '/'), d.name)
+    const stat = await fs.stat(childAbs)
+    entries.push({
+      name: d.name,
+      relPath: childRel,
+      type: d.isDirectory() ? 'dir' : 'file',
+      size: d.isDirectory() ? undefined : stat.size,
+      mtimeMs: stat.mtimeMs
+    })
+  }
+
+  // folders first, stable alpha
+  entries.sort((a, b) => {
+    if (a.type !== b.type) return a.type === 'dir' ? -1 : 1
+    return a.name.localeCompare(b.name)
+  })
+  return entries
+}
+
+async function copyFileWithProgress(srcAbs: string, destAbs: string, onProgress: (transferred: number, total: number) => void): Promise<void> {
+  const stat = await fs.stat(srcAbs)
+  const total = stat.size
+
+  const destDirAbs = path.dirname(destAbs)
+  await fs.mkdir(destDirAbs, { recursive: true })
+
+  let transferred = 0
+  const rs = fsSync.createReadStream(srcAbs)
+  const ws = fsSync.createWriteStream(destAbs)
+
+  let lastEmitAt = 0
+  rs.on('data', (chunk) => {
+    transferred += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk)
+    const now = Date.now()
+    if (now - lastEmitAt > 120) {
+      lastEmitAt = now
+      onProgress(transferred, total)
+    }
+  })
+
+  await pipeline(rs, ws)
+  onProgress(total, total)
+}
+
+// Check if file is allowed for import
+function isFileAllowedForImport(fileName: string, fileSize: number): boolean {
+  const ext = path.extname(fileName).toLowerCase()
+  if (ext && BLOCKED_IMPORT_EXTS.has(ext)) return false
+  if (fileSize > MAX_IMPORT_BYTES) return false
+  return true
+}
+
+interface FileImportTask {
+  srcPath: string
+  destPath: string
+}
+
+// Collect all importable files in one pass (lightweight, only paths and create dirs)
+async function collectImportTasks(srcDir: string, destDir: string): Promise<FileImportTask[]> {
+  const tasks: FileImportTask[] = []
+  const entries = await fs.readdir(srcDir, { withFileTypes: true })
+
+  for (const entry of entries) {
+    if (entry.name.startsWith('.')) continue
+    const srcPath = path.join(srcDir, entry.name)
+    const destPath = path.join(destDir, entry.name)
+
+    if (entry.isDirectory()) {
+      const subTasks = await collectImportTasks(srcPath, destPath)
+      tasks.push(...subTasks)
+    } else if (entry.isFile()) {
+      const stat = await fs.stat(srcPath)
+      if (isFileAllowedForImport(entry.name, stat.size)) {
+        tasks.push({ srcPath, destPath })
+      }
+    }
+  }
+  return tasks
+}
+
+export function registerKnowledgeBaseHandlers(): void {
+  ipcMain.handle('kb:check-path', async (_evt, payload: { absPath: string }) => {
+    const absPath = payload?.absPath ?? ''
+    try {
+      const stat = await fs.stat(absPath)
+      return {
+        exists: true,
+        isDirectory: stat.isDirectory(),
+        isFile: stat.isFile()
+      }
+    } catch {
+      return { exists: false, isDirectory: false, isFile: false }
+    }
+  })
+
+  ipcMain.handle('kb:ensure-root', async () => {
+    const root = getKbRoot()
+    await fs.mkdir(root, { recursive: true })
+    await initKbDefaultSeedFiles()
+    return { success: true }
+  })
+
+  ipcMain.handle('kb:get-root', async () => {
+    const root = getKbRoot()
+    await fs.mkdir(root, { recursive: true })
+    await initKbDefaultSeedFiles()
+    return { root }
+  })
+
+  ipcMain.handle('kb:get-cloud-storage', async () => {
+    const usedBytes = await getKbCloudUsedBytes()
+    return { usedBytes, totalBytes: KB_CLOUD_TOTAL_BYTES }
+  })
+
+  ipcMain.handle('kb:sync-last-results', async () => getKbSyncLastResults())
+
+  ipcMain.handle('kb:list-dir', async (_evt, payload: { relDir: string }) => {
+    const relDir = payload?.relDir ?? ''
+    await fs.mkdir(getKbRoot(), { recursive: true })
+    return await listDir(relDir)
+  })
+
+  // Read file with optional encoding: 'utf-8' (default) for text, 'base64' for binary
+  ipcMain.handle('kb:read-file', async (_evt, payload: { relPath: string; encoding?: 'utf-8' | 'base64' }) => {
+    const relPath = payload?.relPath ?? ''
+    const encoding = payload?.encoding ?? 'utf-8'
+    const { absPath } = resolveKbPath(relPath)
+    const stat = await fs.stat(absPath)
+    if (!stat.isFile()) throw new Error('Not a file')
+
+    if (encoding === 'base64') {
+      const buffer = await fs.readFile(absPath)
+      const content = buffer.toString('base64')
+      const ext = path.extname(relPath).toLowerCase()
+      const mimeTypes: Record<string, string> = {
+        '.png': 'image/png',
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.gif': 'image/gif',
+        '.webp': 'image/webp',
+        '.bmp': 'image/bmp',
+        '.svg': 'image/svg+xml'
+      }
+      const mimeType = mimeTypes[ext] || 'application/octet-stream'
+      return { content, mimeType, mtimeMs: stat.mtimeMs, isImage: isImageFile(relPath) }
+    } else {
+      const content = await fs.readFile(absPath, 'utf-8')
+      return { content, mtimeMs: stat.mtimeMs }
+    }
+  })
+
+  // Write file with optional encoding: 'utf-8' (default) for text, 'base64' for binary
+  ipcMain.handle('kb:write-file', async (_evt, payload: { relPath: string; content: string; encoding?: 'utf-8' | 'base64' }) => {
+    const relPath = payload?.relPath ?? ''
+    const content = payload?.content ?? ''
+    const encoding = payload?.encoding ?? 'utf-8'
+    const { absPath } = resolveKbPath(relPath)
+    await fs.mkdir(path.dirname(absPath), { recursive: true })
+
+    if (encoding === 'base64') {
+      const buffer = Buffer.from(content, 'base64')
+      await fs.writeFile(absPath, buffer)
+    } else {
+      await fs.writeFile(absPath, content, 'utf-8')
+    }
+
+    const stat = await fs.stat(absPath)
+    return { mtimeMs: stat.mtimeMs }
+  })
+
+  // Create a new image file from base64 data
+  ipcMain.handle('kb:create-image', async (_evt, payload: { relDir: string; name: string; base64: string }) => {
+    const relDir = payload?.relDir ?? ''
+    const name = payload?.name ?? ''
+    const base64 = payload?.base64 ?? ''
+    if (!isSafeBasename(name)) throw new Error('Invalid file name')
+    const { absPath: dirAbs } = resolveKbPath(relDir)
+    await fs.mkdir(dirAbs, { recursive: true })
+    const finalName = await ensureUniqueName(dirAbs, name)
+    const absPath = path.join(dirAbs, finalName)
+    const buffer = Buffer.from(base64, 'base64')
+    await fs.writeFile(absPath, buffer)
+    return { relPath: path.posix.join(relDir.replace(/\\/g, '/'), finalName) }
+  })
+
+  ipcMain.handle('kb:mkdir', async (_evt, payload: { relDir: string; name: string }) => {
+    const relDir = payload?.relDir ?? ''
+    const name = payload?.name ?? ''
+    if (!isSafeBasename(name)) throw new Error('Invalid folder name')
+    const { absPath: dirAbs } = resolveKbPath(relDir)
+    const targetAbs = path.join(dirAbs, name)
+    await fs.mkdir(targetAbs, { recursive: false })
+    return { success: true, relPath: path.posix.join(relDir.replace(/\\/g, '/'), name) }
+  })
+
+  ipcMain.handle('kb:create-file', async (_evt, payload: { relDir: string; name: string; content?: string }) => {
+    const relDir = payload?.relDir ?? ''
+    const name = payload?.name ?? ''
+    const content = payload?.content ?? ''
+    if (!isSafeBasename(name)) throw new Error('Invalid file name')
+    const { absPath: dirAbs } = resolveKbPath(relDir)
+    await fs.mkdir(dirAbs, { recursive: true })
+    const finalName = await ensureUniqueName(dirAbs, name)
+    const absPath = path.join(dirAbs, finalName)
+    await fs.writeFile(absPath, content, 'utf-8')
+    return { relPath: path.posix.join(relDir.replace(/\\/g, '/'), finalName) }
+  })
+
+  ipcMain.handle('kb:rename', async (_evt, payload: { relPath: string; newName: string }) => {
+    const relPath = payload?.relPath ?? ''
+    const newName = payload?.newName ?? ''
+    if (!isSafeBasename(newName)) throw new Error('Invalid name')
+
+    const { absPath: srcAbs } = resolveKbPath(relPath)
+    const parentAbs = path.dirname(srcAbs)
+    const destAbs = path.join(parentAbs, newName)
+
+    // If renaming to the same name, return success without doing anything
+    if (srcAbs === destAbs) {
+      const parentRel = path.posix.dirname(relPath.replace(/\\/g, '/'))
+      const nextRel = parentRel === '.' ? newName : path.posix.join(parentRel, newName)
+      return { relPath: nextRel }
+    }
+
+    // Check if target already exists (different from source)
+    if (await caseSensitiveExists(parentAbs, newName)) {
+      throw new Error('Target already exists')
+    }
+    await fs.rename(srcAbs, destAbs)
+    const parentRel = path.posix.dirname(relPath.replace(/\\/g, '/'))
+    const nextRel = parentRel === '.' ? newName : path.posix.join(parentRel, newName)
+
+    // Track rename for default seeds (rename implies user intent; never recreate at default path).
+    try {
+      await trackSeedFileChange(relPath, nextRel)
+    } catch {
+      // Ignore meta tracking errors.
+    }
+
+    return { relPath: nextRel }
+  })
+
+  ipcMain.handle('kb:delete', async (_evt, payload: { relPath: string; recursive?: boolean }) => {
+    const relPath = payload?.relPath ?? ''
+    const recursive = !!payload?.recursive
+    const { absPath } = resolveKbPath(relPath)
+    const stat = await fs.stat(absPath)
+    if (stat.isDirectory()) {
+      await fs.rm(absPath, { recursive, force: true })
+    } else {
+      await fs.unlink(absPath)
+    }
+
+    // Track deletions for default seeds (user deletes => never recreate).
+    try {
+      await trackSeedFileChange(relPath)
+    } catch {
+      // Ignore meta tracking errors.
+    }
+
+    return { success: true }
+  })
+
+  ipcMain.handle('kb:move', async (_evt, payload: { srcRelPath: string; dstRelDir: string }) => {
+    const srcRelPath = payload?.srcRelPath ?? ''
+    const dstRelDir = payload?.dstRelDir ?? ''
+    const { absPath: srcAbs } = resolveKbPath(srcRelPath)
+    const { absPath: dstDirAbs } = resolveKbPath(dstRelDir)
+    const name = path.basename(srcAbs)
+    const finalName = await ensureUniqueName(dstDirAbs, name)
+    const destAbs = path.join(dstDirAbs, finalName)
+    await fs.mkdir(dstDirAbs, { recursive: true })
+
+    try {
+      await fs.rename(srcAbs, destAbs)
+    } catch (e: any) {
+      if (e?.code === 'EXDEV') {
+        // Fallback for cross-device moves
+        await fs.cp(srcAbs, destAbs, { recursive: true })
+        await fs.rm(srcAbs, { recursive: true, force: true })
+      } else {
+        throw e
+      }
+    }
+
+    const nextRel = path.posix.join(dstRelDir.replace(/\\/g, '/'), finalName)
+
+    // Track moves for default seeds to keep upgrade path stable.
+    try {
+      await trackSeedFileChange(srcRelPath, nextRel)
+    } catch {
+      // Ignore meta tracking errors.
+    }
+
+    return { relPath: nextRel }
+  })
+
+  ipcMain.handle('kb:copy', async (_evt, payload: { srcRelPath: string; dstRelDir: string }) => {
+    const srcRelPath = payload?.srcRelPath ?? ''
+    const dstRelDir = payload?.dstRelDir ?? ''
+    const { absPath: srcAbs } = resolveKbPath(srcRelPath)
+    const { absPath: dstDirAbs } = resolveKbPath(dstRelDir)
+    const name = path.basename(srcAbs)
+    const finalName = await ensureUniqueName(dstDirAbs, name)
+    const destAbs = path.join(dstDirAbs, finalName)
+    await fs.mkdir(dstDirAbs, { recursive: true })
+    await fs.cp(srcAbs, destAbs, { recursive: true })
+    const nextRel = path.posix.join(dstRelDir.replace(/\\/g, '/'), finalName)
+    return { relPath: nextRel }
+  })
+
+  ipcMain.handle('kb:import-file', async (evt, payload: { srcAbsPath: string; dstRelDir: string }) => {
+    const srcAbsPath = payload?.srcAbsPath ?? ''
+    const dstRelDir = payload?.dstRelDir ?? ''
+    const { absPath: dstDirAbs } = resolveKbPath(dstRelDir)
+
+    const srcStat = await fs.stat(srcAbsPath)
+    if (!srcStat.isFile()) throw new Error('Source is not a file')
+    if (srcStat.size > MAX_IMPORT_BYTES) throw new Error('File too large')
+
+    const ext = path.extname(srcAbsPath).toLowerCase()
+    if (ext && BLOCKED_IMPORT_EXTS.has(ext)) {
+      throw new Error('File type not allowed')
+    }
+
+    const originalName = path.basename(srcAbsPath)
+    const finalName = await ensureUniqueName(dstDirAbs, originalName)
+    const destAbs = path.join(dstDirAbs, finalName)
+
+    const jobId = randomUUID()
+    const destRelPath = path.posix.join(dstRelDir.replace(/\\/g, '/'), finalName)
+
+    await copyFileWithProgress(srcAbsPath, destAbs, (transferred, total) => {
+      evt.sender.send('kb:transfer-progress', {
+        jobId,
+        transferred,
+        total,
+        destRelPath
+      })
+    })
+
+    return { jobId, relPath: destRelPath }
+  })
+
+  ipcMain.handle('kb:import-folder', async (evt, payload: { srcAbsPath: string; dstRelDir: string }) => {
+    const srcAbsPath = payload?.srcAbsPath ?? ''
+    const dstRelDir = payload?.dstRelDir ?? ''
+    const { absPath: dstDirAbs } = resolveKbPath(dstRelDir)
+
+    const srcStat = await fs.stat(srcAbsPath)
+    if (!srcStat.isDirectory()) throw new Error('Source is not a folder')
+
+    const folderName = path.basename(srcAbsPath)
+    const finalFolderName = await ensureUniqueName(dstDirAbs, folderName)
+    const destFolderAbs = path.join(dstDirAbs, finalFolderName)
+    const destFolderRel = path.posix.join(dstRelDir.replace(/\\/g, '/'), finalFolderName)
+
+    const jobId = randomUUID()
+
+    // Ensure folder exists even if empty
+    await fs.mkdir(destFolderAbs, { recursive: true })
+
+    // Collect all import tasks in one traversal (creates dirs, collects file paths)
+    const tasks = await collectImportTasks(srcAbsPath, destFolderAbs)
+    const totalFiles = tasks.length
+
+    // Send initial progress
+    evt.sender.send('kb:transfer-progress', {
+      jobId,
+      transferred: 0,
+      total: totalFiles,
+      destRelPath: destFolderRel
+    })
+
+    // Import all collected files with progress updates
+    for (let i = 0; i < tasks.length; i++) {
+      const task = tasks[i]
+      await copyFileWithProgress(task.srcPath, task.destPath, () => {
+        // Individual file progress (not sent for folder import)
+      })
+      evt.sender.send('kb:transfer-progress', {
+        jobId,
+        transferred: i + 1,
+        total: totalFiles,
+        destRelPath: destFolderRel
+      })
+    }
+
+    return { jobId, relPath: destFolderRel }
+  })
+
+  // KB search IPC handlers
+  ipcMain.handle('kb:set-search-enabled', async (_evt, enabled: boolean) => {
+    try {
+      if (typeof enabled !== 'boolean') {
+        return { success: false, error: 'Invalid enabled flag' }
+      }
+      const policyEnabled = readKbSearchPolicyFromEnv()
+      const resolvedEnabled = policyEnabled === false ? false : enabled
+      if (!resolvedEnabled) {
+        closeKbSearchManager()
+        return { success: true, enabled: false, managedByPolicy: policyEnabled === false }
+      }
+      if (resolvedEnabled) {
+        const { getCurrentUserId } = await import('../../storage/db/connection')
+        const { getEdition } = await import('../../config/edition')
+        const { getAllExtensionState } = await import('../../agent/core/storage/state')
+        const uid = getCurrentUserId()
+        if (!uid) return { success: false, error: 'User not logged in' }
+        const edition = getEdition()
+        const region = edition === 'cn' ? 'cn' : 'global'
+
+        // Get API credentials from user's model configuration
+        const state = await getAllExtensionState()
+        const apiConfig = state?.apiConfiguration
+        if (!apiConfig) return { success: false, error: 'No API configuration found' }
+
+        const mgr = await initKbSearchManager(uid.toString(), {
+          region,
+          apiKey: apiConfig.defaultApiKey ?? '',
+          baseUrl: apiConfig.defaultBaseUrl ?? ''
+        })
+        return { success: !!mgr, enabled: !!mgr, managedByPolicy: policyEnabled === false }
+      }
+      return { success: false, error: 'Invalid KB search state' }
+    } catch (err) {
+      kbLogger.error('kb:set-search-enabled failed', { error: err })
+      return { success: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  ipcMain.handle('kb:init-search', async (_evt, config: EmbeddingConfig & { userId: string }) => {
+    try {
+      const policyEnabled = readKbSearchPolicyFromEnv()
+      if (policyEnabled === false) {
+        closeKbSearchManager()
+        return { success: false, error: 'KB search disabled by policy' }
+      }
+      const userId = typeof config?.userId === 'string' ? config.userId.trim() : ''
+      if (!userId || userId.length > 128) {
+        return { success: false, error: 'Invalid userId' }
+      }
+      if (!isKbSearchRegion(config?.region)) {
+        return { success: false, error: 'Invalid region' }
+      }
+      const apiKey = typeof config?.apiKey === 'string' ? config.apiKey.trim() : ''
+      if (!apiKey) {
+        return { success: false, error: 'Invalid API key' }
+      }
+      const baseUrl = config?.baseUrl ?? ''
+      if (config.region === 'cn' && !isValidBaseUrl(baseUrl)) {
+        return { success: false, error: 'Invalid baseUrl for cn region' }
+      }
+
+      const mgr = await initKbSearchManager(userId, {
+        region: config.region,
+        apiKey,
+        baseUrl
+      })
+      return { success: !!mgr }
+    } catch (err) {
+      kbLogger.error('kb:init-search failed', { error: err })
+      return { success: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  ipcMain.handle('kb:search', async (_evt, query: string, opts?: { maxResults?: number; minScore?: number }) => {
+    const mgr = getKbSearchManager()
+    if (!mgr) return []
+    if (typeof query !== 'string') return []
+    const normalizedQuery = query.trim()
+    if (!normalizedQuery) return []
+    if (normalizedQuery.length > KB_SEARCH_QUERY_MAX_LEN) return []
+    const normalizedOpts = normalizeKbSearchOptions(opts)
+    return mgr.search(normalizedQuery, normalizedOpts)
+  })
+
+  ipcMain.handle('kb:search-status', async () => {
+    const mgr = getKbSearchManager()
+    if (!mgr) return { totalFiles: 0, totalChunks: 0, model: '', provider: '' }
+    return mgr.status()
+  })
+
+  ipcMain.handle('kb:reindex', async () => {
+    const mgr = getKbSearchManager()
+    if (!mgr) return { files: 0, chunks: 0 }
+    return mgr.fullIndex()
+  })
+}
+
+// --- KbSearchManager singleton ---
+
+let kbSearchManagerInstance: KbSearchManager | null = null
+
+export function getKbSearchManager(): KbSearchManager | null {
+  return kbSearchManagerInstance
+}
+
+export async function initKbSearchManager(userId: string, embeddingConfig: EmbeddingConfig): Promise<KbSearchManager | null> {
+  // Close existing instance if any
+  if (kbSearchManagerInstance) {
+    kbSearchManagerInstance.close()
+    kbSearchManagerInstance = null
+  }
+
+  // Require an API key
+  if (!embeddingConfig.apiKey) {
+    kbLogger.info('KB search disabled: no API key available from user model configuration')
+    return null
+  }
+
+  try {
+    const kbRoot = getKbRoot()
+    const dbDir = path.join(app.getPath('userData'), 'chaterm_db')
+    kbSearchManagerInstance = KbSearchManager.create(userId, dbDir, kbRoot, embeddingConfig)
+
+    // Run full index in background (don't block startup)
+    kbSearchManagerInstance
+      .fullIndex()
+      .then((result) => {
+        kbLogger.info('KB search initial index complete', { files: result.files, chunks: result.chunks })
+      })
+      .catch((err) => {
+        kbLogger.error('KB search initial index failed', { error: err })
+      })
+
+    return kbSearchManagerInstance
+  } catch (err) {
+    kbLogger.error('Failed to initialize KB search manager', { error: err })
+    return null
+  }
+}
+
+export function closeKbSearchManager(): void {
+  if (kbSearchManagerInstance) {
+    kbSearchManagerInstance.close()
+    kbSearchManagerInstance = null
+  }
+}

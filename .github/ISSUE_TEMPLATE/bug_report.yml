@@ -1,0 +1,63 @@
+name: 🐛 Bug Report
+description: Report an issue that should be fixed
+title: '[BUG] '
+labels:
+  - bug
+  - needs triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for submitting a bug report! Please provide the following information to help us fix it.
+
+  - type: input
+    id: chaterm-version
+    attributes:
+      label: Chaterm Version
+      placeholder: e.g. v0.7.2
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the bug, what you expected to happen, and what actually happened.
+      placeholder: |
+        **Expected:** What should happen?
+        **Actual:** What actually happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps-to-reproduce
+    attributes:
+      label: Steps to Reproduce
+      description: How can we reproduce this bug? (Optional but helpful)
+      placeholder: |
+        1. 
+        2. 
+        3.
+
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: e.g. macOS 14.0, Windows 11, Ubuntu 22.04
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots
+      description: If applicable, add screenshots to help explain your problem.
+      placeholder: Drag and drop screenshots here or paste image URLs
+
+  - type: textarea
+    id: additional-info
+    attributes:
+      label: Additional Information
+      description: Logs, error messages, or any other information that might be helpful.
+      placeholder: |
+        ```
+        Paste logs or error messages here
+        ```

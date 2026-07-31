@@ -1,0 +1,47 @@
+extends: electron-builder.yml
+
+appId: ai.chaterm.global.app
+productName: Chaterm
+
+directories:
+  output: dist/global
+
+extraResources:
+  - from: 'build/edition-config/'
+    to: 'edition-config/'
+    filter: '**/*.json'
+
+publish:
+  provider: generic
+  url: https://static-download.chaterm.net/
+  channel: latest
+
+win:
+  artifactName: ${name}-${version}-setup-${arch}.${ext}
+  protocols:
+    - name: Chaterm
+      schemes:
+        - chaterm
+
+nsis:
+  artifactName: ${name}-${version}-setup-${arch}.${ext}
+  guid: ai.chaterm.global.app
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+
+dmg:
+  artifactName: ${name}-${version}-macos-${arch}.${ext}
+
+mac:
+  artifactName: ${name}-${version}-macos-${arch}.${ext}
+  protocols:
+    - name: Chaterm
+      schemes:
+        - chaterm
+
+linux:
+  artifactName: ${name}-${version}-linux-${arch}.${ext}
+  protocols:
+    - name: Chaterm
+      schemes:
+        - chaterm

@@ -1,0 +1,213 @@
+import eventBus from '@/utils/eventBus'
+import type { ShortcutAction } from '@/services/shortcutService'
+
+/**
+ * Shortcut hint i18n keys mapping
+ * Use these keys with i18n t() function to get translated text
+ * Example: t(`shortcuts.hints.${shortcutHintKeys.sendOrToggleAi}`)
+ */
+export const shortcutHintKeys = {
+  sendOrToggleAi: 'sendOrToggleAi',
+  toggleLeftSidebar: 'toggleLeftSidebar',
+  openSettings: 'openSettings',
+  openCommandDialog: 'openCommandDialog',
+  openFileManager: 'openFileManager',
+  clearTerminal: 'clearTerminal',
+  toggleLayout: 'toggleLayout'
+} as const
+
+/**
+ * Centralized definition of all keyboard shortcuts in the application.
+ * Each action contains a unique `id`, a `nameKey` for internationalization,
+ * default keyboard shortcuts `defaultKey` (different for Mac and non-Mac platforms),
+ * and a `handler` function to execute the specific operation.
+ */
+export const shortcutActions: Omit<ShortcutAction, 'name'>[] = [
+  {
+    id: 'openSettings',
+    nameKey: 'shortcuts.actions.openSettings',
+    defaultKey: {
+      mac: 'Command+,',
+      other: 'Ctrl+,'
+    },
+    handler: () => {
+      eventBus.emit('openUserTab', 'userConfig')
+    }
+  },
+  {
+    id: 'toggleLeftSidebar',
+    nameKey: 'shortcuts.actions.toggleLeftSidebar',
+    defaultKey: {
+      mac: 'Command+B',
+      other: 'Ctrl+B'
+    },
+    handler: () => {
+      eventBus.emit('toggleSideBar', 'left')
+    }
+  },
+  {
+    id: 'sendOrToggleAi',
+    nameKey: 'shortcuts.actions.sendOrToggleAi',
+    defaultKey: {
+      mac: 'Command+L',
+      other: 'Ctrl+L'
+    },
+    handler: () => {
+      eventBus.emit('sendOrToggleAiFromTerminal')
+    }
+  },
+  {
+    id: 'switchToNextTab',
+    nameKey: 'shortcuts.actions.switchToNextTab',
+    defaultKey: {
+      mac: 'Control+Tab',
+      other: 'Ctrl+Tab'
+    },
+    handler: () => {
+      eventBus.emit('switchToNextTab')
+    }
+  },
+  {
+    id: 'switchToPrevTab',
+    nameKey: 'shortcuts.actions.switchToPrevTab',
+    defaultKey: {
+      mac: 'Control+Shift+Tab',
+      other: 'Ctrl+Shift+Tab'
+    },
+    handler: () => {
+      eventBus.emit('switchToPrevTab')
+    }
+  },
+  {
+    id: 'switchToSpecificTab',
+    nameKey: 'shortcuts.actions.switchToSpecificTab',
+    defaultKey: {
+      mac: 'Command',
+      other: 'Ctrl'
+    },
+    handler: () => {
+      eventBus.emit('switchToSpecificTab')
+    }
+  },
+  {
+    id: 'openCommandDialog',
+    nameKey: 'shortcuts.actions.openCommandDialog',
+    defaultKey: {
+      mac: 'Command+K',
+      other: 'Ctrl+K'
+    },
+    handler: () => {
+      eventBus.emit('openCommandDialog')
+    }
+  },
+  {
+    id: 'searchHost',
+    nameKey: 'shortcuts.actions.searchHost',
+    defaultKey: {
+      mac: 'Command+Shift+P',
+      other: 'Ctrl+Shift+P'
+    },
+    handler: () => {
+      eventBus.emit('searchHost')
+    }
+  },
+  {
+    id: 'newTab',
+    nameKey: 'shortcuts.actions.newTab',
+    defaultKey: {
+      mac: 'Command+N',
+      other: 'Ctrl+N'
+    },
+    handler: () => {
+      eventBus.emit('createNewTerminal')
+    }
+  },
+  {
+    id: 'openFileManager',
+    nameKey: 'shortcuts.actions.openFileManager',
+    defaultKey: {
+      mac: 'Command+M',
+      other: 'Ctrl+M'
+    },
+    handler: () => {
+      eventBus.emit('openUserTab', 'files')
+    }
+  },
+  {
+    id: 'clearTerminal',
+    nameKey: 'shortcuts.actions.clearTerminal',
+    defaultKey: {
+      mac: 'Command+P',
+      other: 'Ctrl+P'
+    },
+    handler: () => {
+      eventBus.emit('clearCurrentTerminal')
+    }
+  },
+  {
+    id: 'fontSizeIncrease',
+    nameKey: 'shortcuts.actions.fontSizeIncrease',
+    defaultKey: {
+      mac: 'Command+=',
+      other: 'Ctrl+='
+    },
+    handler: () => {
+      eventBus.emit('fontSizeIncrease')
+    }
+  },
+  {
+    id: 'fontSizeDecrease',
+    nameKey: 'shortcuts.actions.fontSizeDecrease',
+    defaultKey: {
+      mac: 'Command+-',
+      other: 'Ctrl+-'
+    },
+    handler: () => {
+      eventBus.emit('fontSizeDecrease')
+    }
+  },
+  {
+    id: 'toggleLayout',
+    nameKey: 'shortcuts.actions.toggleLayout',
+    defaultKey: {
+      mac: 'Command+E',
+      other: 'Ctrl+E'
+    },
+    handler: () => {
+      eventBus.emit('toggle-layout')
+    }
+  },
+  {
+    id: 'toggleAgentsLeftSidebar',
+    nameKey: 'shortcuts.actions.toggleAgentsLeftSidebar',
+    defaultKey: {
+      mac: 'Command+Shift+S',
+      other: 'Ctrl+Shift+S'
+    },
+    handler: () => {
+      eventBus.emit('toggleSideBar', 'agentsLeft')
+    }
+  },
+  {
+    id: 'switchAiMode',
+    nameKey: 'shortcuts.actions.switchAiMode',
+    defaultKey: {
+      mac: 'Shift+Tab',
+      other: 'Shift+Tab'
+    },
+    handler: () => {
+      eventBus.emit('switchAiMode')
+    }
+  },
+  {
+    id: 'aiSuggestCommand',
+    nameKey: 'shortcuts.actions.aiSuggestCommand',
+    defaultKey: {
+      mac: 'Command+I',
+      other: 'Ctrl+I'
+    },
+    handler: () => {
+      eventBus.emit('triggerAiSuggest')
+    }
+  }
+]

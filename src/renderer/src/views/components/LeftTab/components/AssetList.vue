@@ -1,0 +1,238 @@
+<template>
+  <div class="asset-list-container">
+    <template
+      v-for="group in filteredAssetGroups"
+      :key="group.key"
+    >
+      <div class="group-title">{{ group.title }}</div>
+      <div
+        class="host-cards"
+        :class="{ 'wide-layout': wideLayout }"
+      >
+        <assetCard
+          v-for="host in group.children"
+          :key="host.key"
+          :asset="host"
+          @click="handleAssetClick"
+          @double-click="handleAssetDoubleClick"
+          @edit="handleAssetEdit"
+          @delete="handleAssetDelete"
+          @context-menu="handleAssetContextMenu"
+        />
+      </div>
+    </template>
+
+    <div
+      v-if="filteredAssetGroups.length === 0"
+      class="empty-state"
+    >
+      <div class="empty-icon">
+        <LaptopOutlined class="empty-icon-svg" />
+      </div>
+      <div class="empty-title">
+        {{ searchValue ? t('common.noSearchResults') : t('personal.noAssets') }}
+      </div>
+      <div
+        v-if="!searchValue"
+        class="empty-description"
+      >
+        {{ t('personal.emptyAssetsDescription') }}
+      </div>
+      <div
+        v-if="!searchValue"
+        class="empty-actions"
+      >
+        <a-button
+          type="primary"
+          size="small"
+          @click="emit('empty-new-asset')"
+        >
+          <template #icon>
+            <PlusOutlined />
+          </template>
+          {{ t('personal.newHost') }}
+        </a-button>
+        <a-button
+          size="small"
+          @click="emit('empty-import-assets')"
+        >
+          <template #icon>
+            <ImportOutlined />
+          </template>
+          {{ t('personal.import') }}
+        </a-button>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { computed } from 'vue'
+import { ImportOutlined, LaptopOutlined, PlusOutlined } from '@ant-design/icons-vue'
+import assetCard from './AssetCard.vue'
+import { deepClone } from '@/utils/util'
+import i18n from '@/locales'
+import type { AssetNode } from '../utils/types'
+
+const { t } = i18n.global
+const logger = createRendererLogger('config.assetList')
+
+interface Props {
+  assetGroups: AssetNode[]
+  searchValue?: string
+  wideLayout?: boolean
+}
+
+const props = withDefaults(defineProps<Props>(), {
+  searchValue: '',
+  wideLayout: false
+})
+
+const emit = defineEmits<{
+  'asset-click': [asset: AssetNode]
+  'asset-double-click': [asset: AssetNode]
+  'asset-edit': [asset: AssetNode]
+  'asset-delete': [asset: AssetNode]
+  'asset-context-menu': [event: MouseEvent, asset: AssetNode]
+  'empty-new-asset': []
+  'empty-import-assets': []
+}>()
+
+const filteredAssetGroups = computed(() => {
+  try {
+    if (!props.searchValue.trim()) return props.assetGroups || []
+
+    const lowerCaseInput = props.searchValue.toLowerCase()
+
+    const filterNodes = (nodes: AssetNode[]): AssetNode[] => {
+      if (!Array.isArray(nodes)) return []
+
+      return nodes
+        .map((node) => {
+          if (!node || typeof node.title !== 'string') return null
+
+          if (node.title.toLowerCase().includes(lowerCaseInput)) {
+            return { ...node }
+          }
+
+          if (node.children && Array.isArray(node.children)) {
+            const filteredChildren = filterNodes(node.children)
+            if (filteredChildren.length > 0) {
+              return {
+                ...node,
+                children: filteredChildren
+              }
+            }
+          }
+
+          return null
+        })
+        .filter(Boolean) as AssetNode[]
+    }
+
+    return filterNodes(deepClone(props.assetGroups || []) as AssetNode[])
+  } catch (error) {
+    logger.error('Error filtering asset groups', { error: error })
+    return []
+  }
+})
+
+const handleAssetClick = (asset: AssetNode) => {
+  emit('asset-click', asset)
+}
+
+const handleAssetDoubleClick = (asset: AssetNode) => {
+  emit('asset-double-click', asset)
+}
+
+const handleAssetEdit = (asset: AssetNode) => {
+  emit('asset-edit', asset)
+}
+
+const handleAssetDelete = (asset: AssetNode) => {
+  emit('asset-delete', asset)
+}
+
+const handleAssetContextMenu = (event: MouseEvent, asset: AssetNode) => {
+  emit('asset-context-menu', event, asset)
+}
+</script>
+
+<style lang="less" scoped>
+.asset-list-container {
+  width: 100%;
+}
+
+.group-title {
+  font-size: 14px;
+  font-weight: bold;
+  color: var(--text-color);
+  margin-bottom: 8px;
+  margin-top: 16px;
+}
+
+.host-cards {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.host-cards.wide-layout {
+  :deep(.card-wrapper) {
+    width: calc(33.33% - 8px);
+  }
+}
+
+.host-cards:not(.wide-layout) {
+  :deep(.card-wrapper) {
+    width: calc(50% - 6px);
+  }
+}
+
+@media (max-width: 768px) {
+  .host-cards {
+    :deep(.card-wrapper) {
+      width: 100% !important;
+    }
+  }
+}
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 60px 20px;
+  text-align: center;
+}
+
+.empty-icon {
+  margin-bottom: 16px;
+
+  .empty-icon-svg {
+    font-size: 48px;
+    color: var(--text-color-tertiary);
+    opacity: 0.6;
+  }
+}
+
+.empty-title {
+  font-size: 14px;
+  color: var(--text-color-secondary);
+}
+
+.empty-description {
+  max-width: 320px;
+  margin-top: 8px;
+  color: var(--text-color-tertiary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.empty-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 16px;
+}
+</style>

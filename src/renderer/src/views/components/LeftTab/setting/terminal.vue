@@ -1,0 +1,1526 @@
+<template>
+  <div
+    class="userInfo"
+    data-onboarding-id="settings-terminal-options"
+  >
+    <a-card
+      :bordered="false"
+      class="userInfo-container"
+    >
+      <a-form
+        :colon="false"
+        label-align="left"
+        wrapper-align="right"
+        :label-col="{ span: 7, offset: 0 }"
+        :wrapper-col="{ span: 17, class: 'right-aligned-wrapper' }"
+        class="custom-form"
+      >
+        <a-form-item>
+          <template #label>
+            <span class="label-text">{{ $t('user.terminalSetting') }}</span>
+          </template>
+        </a-form-item>
+        <a-form-item
+          :label="$t('user.terminalType')"
+          class="user_my-ant-form-item"
+        >
+          <a-select
+            v-model:value="userConfig.terminalType"
+            class="terminal-type-select"
+          >
+            <a-select-option value="xterm">xterm</a-select-option>
+            <a-select-option value="xterm-256color">xterm-256color</a-select-option>
+            <a-select-option value="vt100">vt100</a-select-option>
+            <a-select-option value="vt102">vt102</a-select-option>
+            <a-select-option value="vt220">vt220</a-select-option>
+            <a-select-option value="vt320">vt320</a-select-option>
+            <a-select-option value="linux">linux</a-select-option>
+            <a-select-option value="scoansi">scoansi</a-select-option>
+            <a-select-option value="ansi">ansi</a-select-option>
+          </a-select>
+        </a-form-item>
+        <a-form-item
+          :label="$t('user.fontFamily')"
+          class="user_my-ant-form-item"
+        >
+          <a-select
+            v-model:value="userConfig.fontFamily"
+            class="font-family-select"
+            :options="fontFamilyOptions"
+          />
+        </a-form-item>
+        <a-form-item
+          :label="$t('user.fontSize')"
+          class="user_my-ant-form-item"
+        >
+          <a-input-number
+            v-model:value="userConfig.fontSize"
+            :bordered="false"
+            style="width: 20%"
+            :min="8"
+            :max="64"
+            class="user_my-ant-form-item-content"
+          />
+        </a-form-item>
+        <a-form-item
+          :label="$t('user.scrollBack')"
+          class="user_my-ant-form-item"
+        >
+          <a-input-number
+            v-model:value="userConfig.scrollBack"
+            :bordered="false"
+            style="width: 20%"
+            :min="1"
+            class="user_my-ant-form-item-content"
+          />
+        </a-form-item>
+        <a-form-item
+          :label="$t('user.cursorStyle')"
+          class="user_my-ant-form-item"
+        >
+          <div
+            class="cursor-style-group"
+            role="radiogroup"
+            :aria-label="$t('user.cursorStyle')"
+          >
+            <button
+              v-for="option in cursorStyleOptions"
+              :key="option.value"
+              type="button"
+              role="radio"
+              :aria-checked="userConfig.cursorStyle === option.value"
+              :title="option.label"
+              class="cursor-style-item"
+              :class="{ active: userConfig.cursorStyle === option.value }"
+              @click="userConfig.cursorStyle = option.value"
+            >
+              <span
+                class="cursor-style-icon"
+                :class="`cursor-style-icon--${option.value}`"
+                aria-hidden="true"
+              ></span>
+            </button>
+          </div>
+        </a-form-item>
+        <a-form-item
+          :label="$t('user.cursorBlink')"
+          class="user_my-ant-form-item"
+        >
+          <a-switch
+            :checked="userConfig.cursorBlink"
+            class="user_my-ant-form-item-content"
+            @change="handleCursorBlinkChange"
+          />
+        </a-form-item>
+        <a-form-item
+          :label="$t('user.lineHeight')"
+          class="user_my-ant-form-item"
+        >
+          <a-input-number
+            v-model:value="userConfig.lineHeight"
+            :bordered="false"
+            style="width: 20%"
+            :min="1"
+            :max="3"
+            :step="0.1"
+            :precision="1"
+            class="user_my-ant-form-item-content"
+          />
+        </a-form-item>
+        <a-form-item
+          :label="$t('user.localEcho')"
+          class="user_my-ant-form-item"
+        >
+          <a-switch
+            :checked="userConfig.localEchoEnabled"
+            class="user_my-ant-form-item-content"
+            @change="handleLocalEchoEnabledChange"
+          />
+        </a-form-item>
+        <a-form-item
+          :label="$t('user.pinchZoomStatus')"
+          class="user_my-ant-form-item"
+        >
+          <a-switch
+            :checked="userConfig.pinchZoomStatus === 1"
+            class="user_my-ant-form-item-content"
+            @change="handlePinchZoomStatusChange"
+          />
+        </a-form-item>
+        <a-form-item
+          :label="$t('user.showCloseButton')"
+          class="user_my-ant-form-item"
+        >
+          <a-switch
+            :checked="userConfig.showCloseButton === 1"
+            class="user_my-ant-form-item-content"
+            @change="handleShowCloseButtonChange"
+          />
+        </a-form-item>
+        <a-form-item
+          label="SSH Agents"
+          class="user_my-ant-form-item"
+        >
+          <a-switch
+            :checked="userConfig.sshAgentsStatus === 1"
+            class="user_my-ant-form-item-content"
+            @change="handleSshAgentsStatusChange"
+          />
+        </a-form-item>
+        <a-form-item
+          v-show="userConfig.sshAgentsStatus === 1"
+          :label="$t('user.sshAgentSettings')"
+          class="user_my-ant-form-item"
+        >
+          <a-button
+            class="setting-button"
+            @click="openAgentConfig"
+            >{{ $t('common.setting') }}</a-button
+          >
+        </a-form-item>
+        <a-form-item
+          :label="$t('user.proxySettings')"
+          class="user_my-ant-form-item"
+        >
+          <a-button
+            class="setting-button"
+            @click="openProxyConfig"
+            >{{ $t('common.setting') }}</a-button
+          >
+        </a-form-item>
+        <a-form-item
+          :label="$t('user.mouseEvent')"
+          class="user_my-ant-form-item"
+        >
+          <div class="mouse-event-container">
+            <div class="mouse-event-row">
+              <span class="mouse-event-label">{{ $t('user.middleMouseEvent') }}:</span>
+              <a-select
+                v-model:value="userConfig.middleMouseEvent"
+                class="mouse-event-select"
+              >
+                <a-select-option value="none">{{ $t('user.none') }}</a-select-option>
+                <a-select-option value="paste">{{ $t('user.pasteClipboard') }}</a-select-option>
+                <a-select-option value="contextMenu">{{ $t('user.showContextMenu') }}</a-select-option>
+                <a-select-option value="closeTab">{{ $t('user.closeCurrentTab') }}</a-select-option>
+              </a-select>
+            </div>
+            <div class="mouse-event-row">
+              <span class="mouse-event-label">{{ $t('user.rightMouseEvent') }}:</span>
+              <a-select
+                v-model:value="userConfig.rightMouseEvent"
+                class="mouse-event-select"
+              >
+                <a-select-option value="none">{{ $t('user.none') }}</a-select-option>
+                <a-select-option value="paste">{{ $t('user.pasteClipboard') }}</a-select-option>
+                <a-select-option value="contextMenu">{{ $t('user.showContextMenu') }}</a-select-option>
+              </a-select>
+            </div>
+          </div>
+        </a-form-item>
+      </a-form>
+    </a-card>
+
+    <a-modal
+      v-model:visible="agentConfigModalVisible"
+      :title="$t('user.sshAgentSettings')"
+      width="700px"
+      class="agent-config-modal"
+    >
+      <a-table
+        :row-key="(record) => record.fingerprint"
+        :columns="columns"
+        :data-source="agentKeys"
+        size="small"
+        :pagination="false"
+        :locale="{ emptyText: $t('user.noKeyAdd') }"
+        class="agent-table"
+      >
+        <template #bodyCell="{ column, record }">
+          <template v-if="column.key === 'action'">
+            <a-button
+              type="link"
+              @click="removeKey(record)"
+              >{{ $t('user.remove') }}
+            </a-button>
+          </template>
+        </template>
+      </a-table>
+
+      <a-form
+        layout="inline"
+        style="width: 100%; margin-top: 20px; margin-bottom: 10px"
+      >
+        <a-form-item
+          :label="t('personal.key')"
+          style="flex: 1"
+          class="key-form-item"
+        >
+          <a-select
+            v-model:value="keyChainData"
+            :options="keyChainOptions"
+            :field-names="{ value: 'key', label: 'label' }"
+            style="width: 200px"
+            class="key-selection-select"
+          />
+        </a-form-item>
+        <a-form-item>
+          <a-button
+            type="primary"
+            @click="addKey"
+            >{{ $t('common.add') }}</a-button
+          >
+        </a-form-item>
+      </a-form>
+
+      <template #footer>
+        <a-button @click="handleAgentConfigClose">{{ $t('common.close') }}</a-button>
+      </template>
+    </a-modal>
+
+    <a-modal
+      v-model:visible="sshProxyConfigShowModalVisible"
+      :title="$t('user.proxySettings')"
+      width="700px"
+      class="proxy-config-modal"
+    >
+      <a-table
+        :row-key="(record) => record.name"
+        :columns="proxyConfigColumns"
+        :data-source="userConfig.sshProxyConfigs"
+        size="small"
+        :pagination="false"
+        :locale="{ emptyText: $t('user.noProxyAdd') }"
+        class="agent-table"
+      >
+        <template #bodyCell="{ column, record }">
+          <template v-if="column.key === 'action'">
+            <a-button
+              type="link"
+              @click="removeProxyConfig(record.name)"
+              >{{ $t('user.remove') }}
+            </a-button>
+          </template>
+        </template>
+      </a-table>
+
+      <template #footer>
+        <a-button
+          type="primary"
+          @click="handleProxyConfigAdd"
+          >{{ $t('common.add') }}</a-button
+        >
+        <a-button @click="handleProxyConfigClose">{{ $t('common.close') }}</a-button>
+      </template>
+    </a-modal>
+
+    <a-modal
+      v-model:open="sshProxyConfigAddModalVisible"
+      :title="$t('user.addProxy')"
+      :ok-text="$t('common.confirm')"
+      :cancel-text="$t('common.cancel')"
+      class="proxy-config-add-modal"
+      @ok="handleAddSshProxyConfigConfirm"
+      @cancel="handleAddSshProxyConfigClose"
+    >
+      <a-form
+        ref="proxyForm"
+        class="proxy-form"
+        :model="proxyConfig"
+        :rules="proxyConfigRules"
+        :label-col="{ span: 5 }"
+        :wrapper-col="{ span: 16 }"
+      >
+        <a-form-item
+          name="name"
+          :label="$t('user.proxyName')"
+          style="margin-bottom: 12px"
+        >
+          <a-input
+            v-model:value="proxyConfig.name"
+            :placeholder="$t('user.proxyHost')"
+          />
+        </a-form-item>
+        <a-form-item
+          name="proxyType"
+          :label="$t('user.proxyType')"
+          style="margin-bottom: 12px"
+        >
+          <a-select
+            v-model:value="proxyConfig.type"
+            class="proxy-form-select"
+            :placeholder="$t('user.proxyType')"
+          >
+            <a-select-option value="HTTP">HTTP</a-select-option>
+            <a-select-option value="HTTPS">HTTPS</a-select-option>
+            <a-select-option value="SOCKS4">SOCKS4</a-select-option>
+            <a-select-option value="SOCKS5">SOCKS5</a-select-option>
+          </a-select>
+        </a-form-item>
+        <a-form-item
+          name="host"
+          :label="$t('user.proxyHost')"
+          style="margin-bottom: 12px"
+        >
+          <a-input
+            v-model:value="proxyConfig.host"
+            :placeholder="$t('user.proxyHost')"
+          />
+        </a-form-item>
+        <a-form-item
+          name="port"
+          :label="$t('user.proxyPort')"
+          style="margin-bottom: 12px"
+        >
+          <a-input-number
+            v-model:value="proxyConfig.port"
+            :min="1"
+            :max="65535"
+            :placeholder="$t('user.proxyPort')"
+            style="width: 100%"
+          />
+        </a-form-item>
+        <a-form-item
+          name="enableProxyIdentity"
+          :label="$t('user.enableProxyIdentity')"
+          style="margin-bottom: 12px"
+        >
+          <a-switch
+            :checked="proxyConfig.enableProxyIdentity"
+            class="user_my-ant-form-item-content"
+            @click="handleSshProxyIdentityChange"
+          />
+        </a-form-item>
+        <a-form-item
+          v-if="proxyConfig.enableProxyIdentity"
+          name="proxyUsername"
+          :label="$t('user.proxyUsername')"
+          style="margin-bottom: 12px"
+        >
+          <a-input
+            v-model:value="proxyConfig.username"
+            :placeholder="$t('user.proxyUsername')"
+          />
+        </a-form-item>
+        <a-form-item
+          v-if="proxyConfig.enableProxyIdentity"
+          name="proxyPassword"
+          :label="$t('user.proxyPassword')"
+          style="margin-bottom: 12px"
+        >
+          <a-input-password
+            v-model:value="proxyConfig.password"
+            :placeholder="$t('user.proxyPassword')"
+          />
+        </a-form-item>
+      </a-form>
+    </a-modal>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
+import { notification } from 'ant-design-vue'
+import { userConfigStore, remoteApplyGuard } from '@/services/userConfigStoreService'
+import { useI18n } from 'vue-i18n'
+import eventBus from '@/utils/eventBus'
+
+const logger = createRendererLogger('settings.terminal')
+const { t } = useI18n()
+const api = (window as any).api
+
+const defaultProxyConfig = {
+  name: '',
+  type: 'SOCKS5',
+  host: '127.0.0.1',
+  port: 22,
+  enableProxyIdentity: false,
+  username: '',
+  password: ''
+}
+
+// const proxyConfigs: Array<DefaultProxyConfig> = []
+
+const proxyConfig = ref(defaultProxyConfig)
+
+interface ProxyConfig {
+  name: string
+  type?: 'HTTP' | 'HTTPS' | 'SOCKS4' | 'SOCKS5'
+  host?: string
+  port?: number
+  enableProxyIdentity?: boolean
+  username?: string
+  password?: string
+}
+
+const userConfig = ref<{
+  fontSize: number
+  fontFamily: string
+  scrollBack: number
+  cursorStyle: 'block' | 'bar' | 'underline'
+  cursorBlink: boolean
+  lineHeight: number
+  localEchoEnabled: boolean
+  middleMouseEvent: string
+  rightMouseEvent: string
+  terminalType: string
+  pinchZoomStatus: number
+  showCloseButton: number
+  sshAgentsStatus: number
+  sshAgentsMap: string
+  sshProxyStatus: boolean
+  sshProxyConfigs: ProxyConfig[]
+}>({
+  fontSize: 12,
+  fontFamily: 'Menlo, Monaco, "Courier New", Consolas, Courier, monospace',
+  scrollBack: 1000,
+  cursorStyle: 'block',
+  cursorBlink: true,
+  lineHeight: 1,
+  localEchoEnabled: true,
+  middleMouseEvent: 'paste',
+  rightMouseEvent: 'contextMenu',
+  terminalType: 'xterm-256color',
+  pinchZoomStatus: 1,
+  showCloseButton: 1,
+  sshAgentsStatus: 2,
+  sshAgentsMap: '[]',
+  sshProxyStatus: false,
+  sshProxyConfigs: []
+})
+
+const fontFamilyOptions = [
+  { value: 'Menlo, Monaco, "Courier New", Consolas, Courier, monospace', label: 'Menlo' },
+  { value: 'Monaco, "Courier New", Consolas, Courier, monospace', label: 'Monaco' },
+  { value: '"MesloLGS NF", "MesloLGS NF", "Courier New", Courier, monospace', label: 'Meslo Nerd Font' },
+  { value: '"Courier New", Courier, monospace', label: 'Courier New' },
+  { value: 'Consolas, "Courier New", Courier, monospace', label: 'Consolas' },
+  { value: 'Courier, monospace', label: 'Courier' },
+  { value: '"DejaVu Sans Mono", "Bitstream Vera Sans Mono", Monaco, "Courier New", Courier, monospace', label: 'DejaVu Sans Mono' },
+  { value: '"Fira Code", "Courier New", Courier, monospace', label: 'Fira Code' },
+  { value: '"JetBrains Mono", "Courier New", Courier, monospace', label: 'JetBrains Mono' },
+  { value: '"Source Code Pro", "Courier New", Courier, monospace', label: 'Source Code Pro' },
+  { value: '"Ubuntu Mono", "Courier New", Courier, monospace', label: 'Ubuntu Mono' },
+  { value: '"Liberation Mono", "Courier New", Courier, monospace', label: 'Liberation Mono' },
+  { value: '"SF Mono", Monaco, "Courier New", Courier, monospace', label: 'SF Mono' },
+  { value: '"Hack", "Courier New", Courier, monospace', label: 'Hack' },
+  { value: '"Inconsolata", "Courier New", Courier, monospace', label: 'Inconsolata' },
+  { value: '"Roboto Mono", "Courier New", Courier, monospace', label: 'Roboto Mono' },
+  { value: '"Maple Mono", "Courier New", Courier, monospace', label: 'Maple Mono' }
+]
+
+const cursorStyleOptions: Array<{ value: 'block' | 'bar' | 'underline'; label: string }> = [
+  { value: 'block', label: t('user.cursorStyleBlock') },
+  { value: 'bar', label: t('user.cursorStyleBar') },
+  { value: 'underline', label: t('user.cursorStyleUnderline') }
+]
+
+const columns = [
+  {
+    title: t('user.fingerprint'),
+    dataIndex: 'fingerprint',
+    key: 'fingerprint'
+  },
+  {
+    title: t('user.comment'),
+    dataIndex: 'comment',
+    key: 'comment'
+  },
+  {
+    title: t('user.type'),
+    dataIndex: 'keyType',
+    key: 'keyType'
+  },
+  {
+    title: t('extensions.action'),
+    dataIndex: 'action',
+    key: 'action'
+  }
+]
+
+const proxyConfigColumns = [
+  {
+    title: t('user.proxyName'),
+    dataIndex: 'name',
+    key: 'name'
+  },
+  {
+    title: t('user.proxyType'),
+    dataIndex: 'type',
+    key: 'type'
+  },
+  {
+    title: t('user.proxyHost'),
+    dataIndex: 'host',
+    key: 'host'
+  },
+  {
+    title: t('user.proxyPort'),
+    dataIndex: 'port',
+    key: 'port'
+  },
+  {
+    title: t('user.proxyUsername'),
+    dataIndex: 'username',
+    key: 'username'
+  },
+  {
+    title: t('extensions.action'),
+    dataIndex: 'action',
+    key: 'action'
+  }
+]
+
+const getDefaultFontFamily = async (): Promise<string> => {
+  try {
+    const platform = await api.getPlatform()
+    if (platform === 'darwin') {
+      return '"SF Mono", Monaco, "Courier New", Courier, monospace'
+    }
+  } catch (error) {
+    logger.warn('Failed to get platform, using default font', { error: error })
+  }
+  return 'Menlo, Monaco, "Courier New", Consolas, Courier, monospace'
+}
+
+// Load saved configuration
+const loadSavedConfig = async () => {
+  try {
+    const savedConfig = await userConfigStore.getConfig()
+    if (savedConfig) {
+      userConfig.value = {
+        ...userConfig.value,
+        ...savedConfig,
+        cursorStyle: (savedConfig.cursorStyle || 'block') as 'block' | 'bar' | 'underline',
+        cursorBlink: savedConfig.cursorBlink !== false,
+        lineHeight: typeof savedConfig.lineHeight === 'number' ? savedConfig.lineHeight : 1,
+        localEchoEnabled: savedConfig.localEchoEnabled === true,
+        sshProxyConfigs: (savedConfig.sshProxyConfigs || []) as ProxyConfig[]
+      }
+    } else {
+      userConfig.value.fontFamily = await getDefaultFontFamily()
+    }
+  } catch (error) {
+    logger.error('Failed to load config', { error: error })
+    notification.error({
+      message: t('user.loadConfigFailed'),
+      description: t('user.loadConfigFailedDescription')
+    })
+  }
+}
+
+const handleSshAgentsStatusChange = async (checked) => {
+  userConfig.value.sshAgentsStatus = checked ? 1 : 2
+  window.api.agentEnableAndConfigure({ enabled: checked }).then((res) => {
+    if (checked && res.success) {
+      const sshAgentMaps = JSON.parse(userConfig.value.sshAgentsMap)
+      for (const keyId in sshAgentMaps) {
+        loadKey(sshAgentMaps[keyId])
+      }
+    }
+  })
+}
+
+const handlePinchZoomStatusChange = async (checked) => {
+  userConfig.value.pinchZoomStatus = checked ? 1 : 2
+  eventBus.emit('pinchZoomStatusChanged', checked)
+}
+
+const handleCursorBlinkChange = (checked: boolean) => {
+  userConfig.value.cursorBlink = checked
+}
+
+const handleLocalEchoEnabledChange = (checked: boolean) => {
+  userConfig.value.localEchoEnabled = checked
+  eventBus.emit('localEchoSettingChanged', checked)
+}
+
+const handleShowCloseButtonChange = async (checked) => {
+  userConfig.value.showCloseButton = checked ? 1 : 2
+  eventBus.emit('showCloseButtonChanged', checked)
+}
+
+// SSH proxy
+const sshProxyConfigAddModalVisible = ref(false)
+const sshProxyConfigShowModalVisible = ref(false)
+const openProxyConfig = async () => {
+  sshProxyConfigShowModalVisible.value = true
+}
+
+const handleProxyConfigClose = async () => {
+  sshProxyConfigShowModalVisible.value = false
+}
+//
+const proxyConfigRules = {
+  name: [
+    { required: true, message: t('user.pleaseInputProxyName'), trigger: 'blur' },
+    {
+      validator: (_rule: any, value: string) => {
+        if (!value) return Promise.resolve()
+
+        const nameExists = userConfig.value.sshProxyConfigs.some((config) => config.name === value)
+
+        if (nameExists) {
+          return Promise.reject(new Error(t('user.pleaseInputOtherProxyName')))
+        }
+        return Promise.resolve()
+      },
+      trigger: 'blur'
+    }
+  ],
+  host: [{ required: true, message: t('user.pleaseInputProxyHost'), trigger: 'blur' }],
+  port: [{ type: 'number', min: 1, max: 65535, message: t('user.errorProxyPort'), trigger: 'blur' }]
+}
+
+const handleProxyConfigAdd = async () => {
+  proxyConfig.value = { ...defaultProxyConfig }
+  proxyForm.value?.resetFields()
+  sshProxyConfigAddModalVisible.value = true
+}
+
+const handleSshProxyIdentityChange = async (checked) => {
+  proxyConfig.value.enableProxyIdentity = checked
+}
+
+const proxyForm = ref()
+const handleAddSshProxyConfigConfirm = async () => {
+  await proxyForm.value.validateFields()
+  userConfig.value.sshProxyConfigs.push({ ...proxyConfig.value } as ProxyConfig)
+  sshProxyConfigAddModalVisible.value = false
+  proxyConfig.value = { ...defaultProxyConfig }
+  proxyForm.value?.resetFields()
+  await nextTick()
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  eventBus.emit('sshProxyConfigsUpdated')
+}
+
+const removeProxyConfig = async (proxyName) => {
+  const index = userConfig.value.sshProxyConfigs.findIndex((config) => config.name === proxyName)
+
+  if (index !== -1) {
+    userConfig.value.sshProxyConfigs.splice(index, 1)
+    await nextTick()
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    eventBus.emit('sshProxyConfigsUpdated')
+    return true
+  } else {
+    return false
+  }
+}
+
+const handleAddSshProxyConfigClose = async () => {
+  sshProxyConfigAddModalVisible.value = false
+  proxyConfig.value = { ...defaultProxyConfig }
+  proxyForm.value?.resetFields()
+}
+
+const agentConfigModalVisible = ref(false)
+
+interface KeyChainOption {
+  label: string
+  key: string
+  value?: string
+}
+
+const keyChainOptions = ref<KeyChainOption[]>([])
+interface AgentKey {
+  id: string
+  comment?: string
+  label?: string
+  key?: string
+}
+
+const agentKeys = ref<AgentKey[]>([])
+const keyChainData = ref<string | null>(null)
+
+const openAgentConfig = async () => {
+  agentConfigModalVisible.value = true
+  getKeyChainData()
+  await getAgentKeys()
+}
+
+const handleAgentConfigClose = async () => {
+  agentConfigModalVisible.value = false
+}
+
+const removeKey = async (record: AgentKey) => {
+  await api.removeKey({ keyId: record.id })
+  const target = keyChainOptions.value.find((item) => item.label === record.comment)
+
+  if (target) {
+    const sshAgentsMap = JSON.parse(userConfig.value.sshAgentsMap)
+    const index = sshAgentsMap.indexOf(target.key)
+    if (index !== -1) {
+      sshAgentsMap.splice(index, 1)
+    }
+    userConfig.value.sshAgentsMap = JSON.stringify(sshAgentsMap)
+  }
+  await getAgentKeys()
+}
+
+const loadKey = async (keyId) => {
+  await window.api.getKeyChainInfo({ id: keyId }).then((res) => {
+    window.api.addKey({
+      keyData: res.private_key,
+      comment: res.chain_name,
+      passphrase: res.passphrase
+    })
+  })
+}
+const addKey = async () => {
+  if (keyChainData.value) {
+    await api.getKeyChainInfo({ id: keyChainData.value }).then((res) => {
+      api
+        .addKey({
+          keyData: res.private_key,
+          comment: res.chain_name,
+          passphrase: res.passphrase
+        })
+        .then(() => {
+          notification.success({
+            message: t('user.addSuccess')
+          })
+          let sshAgentKey = JSON.parse(userConfig.value.sshAgentsMap)
+          sshAgentKey.push(keyChainData.value)
+          sshAgentKey = Array.from(new Set(sshAgentKey))
+          userConfig.value.sshAgentsMap = JSON.stringify(sshAgentKey)
+          keyChainData.value = null
+          getAgentKeys()
+        })
+        .catch(() => {
+          notification.error({
+            message: t('user.addFailed')
+          })
+          keyChainData.value = null
+        })
+    })
+  }
+}
+const getAgentKeys = async () => {
+  const res = await api.listKeys()
+  agentKeys.value = res.keys
+}
+
+const getKeyChainData = () => {
+  api.getKeyChainSelect().then((res) => {
+    keyChainOptions.value = res.data.keyChain
+  })
+}
+
+const saveConfig = async () => {
+  try {
+    const configToStore = {
+      fontSize: userConfig.value.fontSize,
+      fontFamily: userConfig.value.fontFamily,
+      scrollBack: userConfig.value.scrollBack,
+      cursorStyle: userConfig.value.cursorStyle,
+      cursorBlink: userConfig.value.cursorBlink,
+      lineHeight: userConfig.value.lineHeight,
+      localEchoEnabled: userConfig.value.localEchoEnabled,
+      middleMouseEvent: userConfig.value.middleMouseEvent,
+      rightMouseEvent: userConfig.value.rightMouseEvent,
+      terminalType: userConfig.value.terminalType,
+      pinchZoomStatus: userConfig.value.pinchZoomStatus,
+      showCloseButton: userConfig.value.showCloseButton,
+      sshAgentsStatus: userConfig.value.sshAgentsStatus,
+      sshAgentsMap: userConfig.value.sshAgentsMap,
+      sshProxyConfigs: userConfig.value.sshProxyConfigs
+    }
+
+    await userConfigStore.saveConfig(configToStore as any)
+  } catch (error) {
+    logger.error('Failed to save config', { error: error })
+    notification.error({
+      message: t('user.error'),
+      description: t('user.saveConfigFailedDescription')
+    })
+  }
+}
+
+watch(
+  () => userConfig.value,
+  async () => {
+    if (remoteApplyGuard.isApplying) return
+    await saveConfig()
+  },
+  { deep: true }
+)
+
+const reloadConfigOnSync = async () => {
+  await loadSavedConfig()
+}
+
+const handleOpenAddProxyConfigModal = () => {
+  handleProxyConfigAdd()
+}
+
+onMounted(async () => {
+  await loadSavedConfig()
+  eventBus.on('userConfigSyncApplied', reloadConfigOnSync)
+  eventBus.on('openAddProxyConfigModal', handleOpenAddProxyConfigModal)
+})
+
+onBeforeUnmount(() => {
+  eventBus.off('userConfigSyncApplied', reloadConfigOnSync)
+  eventBus.off('openAddProxyConfigModal', handleOpenAddProxyConfigModal)
+})
+</script>
+
+<style scoped>
+.userInfo {
+  width: 100%;
+}
+
+.userInfo-container {
+  width: 100%;
+  background-color: var(--bg-color) !important;
+  border-radius: 6px;
+  padding: 4px;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.15);
+  color: var(--text-color);
+}
+
+:deep(.ant-card) {
+  background-color: var(--bg-color) !important;
+}
+
+:deep(.ant-card-body) {
+  padding: 16px;
+  background-color: var(--bg-color);
+}
+
+.proxy-form :deep(.ant-form-item-label > label) {
+  color: var(--text-color) !important;
+}
+
+.custom-form {
+  color: var(--text-color);
+  align-content: center;
+}
+
+.custom-form :deep(.ant-form-item-label) {
+  padding-right: 20px;
+}
+
+.custom-form :deep(.ant-form-item-label > label) {
+  color: var(--text-color);
+}
+
+.custom-form :deep(.ant-input),
+.custom-form :deep(.ant-input-number),
+.custom-form :deep(.ant-radio-wrapper) {
+  color: var(--text-color);
+}
+
+.custom-form :deep(.ant-switch) {
+  background-color: var(--bg-color-switch);
+}
+
+.custom-form :deep(.ant-switch.ant-switch-checked) {
+  background: #1890ff !important;
+}
+
+.custom-form :deep(.ant-input-number) {
+  background-color: var(--input-number-bg);
+  border: 1px solid var(--border-color) !important;
+  border-radius: 6px;
+  transition: all 0.3s;
+  width: 100px !important;
+}
+
+.custom-form :deep(.ant-input-number:hover),
+.custom-form :deep(.ant-input-number:focus),
+.custom-form :deep(.ant-input-number-focused) {
+  background-color: var(--input-number-hover-bg);
+  border-color: #1890ff !important;
+  box-shadow: 0 0 0 2px rgba(24, 144, 255, 0.2);
+}
+
+.custom-form :deep(.ant-input-number-input) {
+  height: 32px;
+  padding: 4px 8px;
+  background-color: transparent;
+  color: var(--text-color);
+}
+
+.label-text {
+  font-size: 20px;
+  font-weight: bold;
+  line-height: 1.3;
+}
+
+.user_my-ant-form-item {
+  -webkit-box-sizing: border-box;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  color: rgba(0, 0, 0, 0.65);
+  font-size: 30px;
+  font-variant: tabular-nums;
+  line-height: 1.5;
+  list-style: none;
+  -webkit-font-feature-settings: 'tnum';
+  font-feature-settings: 'tnum';
+  margin-bottom: 12px;
+  vertical-align: top;
+  color: #ffffff;
+}
+
+.terminal-type-select {
+  width: 180px !important;
+  text-align: left;
+}
+
+.terminal-type-select :deep(.ant-select-selector) {
+  background-color: var(--select-bg);
+  border: 1px solid var(--select-border);
+  border-radius: 6px;
+  color: var(--text-color);
+  transition: all 0.3s;
+  height: 32px;
+}
+
+.terminal-type-select :deep(.ant-select-selector:hover) {
+  border-color: #1890ff;
+  background-color: var(--select-hover-bg);
+}
+
+.terminal-type-select :deep(.ant-select-focused .ant-select-selector),
+.terminal-type-select :deep(.ant-select-selector:focus) {
+  border-color: #1890ff;
+  box-shadow: 0 0 0 2px rgba(24, 144, 255, 0.2);
+  background-color: var(--select-hover-bg);
+}
+
+.terminal-type-select :deep(.ant-select-selection-item) {
+  color: var(--text-color);
+  font-size: 14px;
+  line-height: 32px;
+}
+
+.terminal-type-select :deep(.ant-select-arrow) {
+  color: var(--text-color);
+  opacity: 0.7;
+}
+
+.font-family-select {
+  width: 180px !important;
+  text-align: left;
+}
+
+.font-family-select :deep(.ant-select-selector) {
+  background-color: var(--select-bg);
+  border: 1px solid var(--select-border);
+  border-radius: 6px;
+  color: var(--text-color);
+  transition: all 0.3s;
+  height: 32px;
+}
+
+.font-family-select :deep(.ant-select-selector:hover) {
+  border-color: #1890ff;
+  background-color: var(--select-hover-bg);
+}
+
+.font-family-select :deep(.ant-select-focused .ant-select-selector),
+.font-family-select :deep(.ant-select-selector:focus) {
+  border-color: #1890ff;
+  box-shadow: 0 0 0 2px rgba(24, 144, 255, 0.2);
+  background-color: var(--select-hover-bg);
+}
+
+.font-family-select :deep(.ant-select-selection-item) {
+  color: var(--text-color);
+  font-size: 14px;
+  line-height: 32px;
+}
+
+.font-family-select :deep(.ant-select-arrow) {
+  color: var(--text-color);
+  opacity: 0.7;
+}
+
+.divider-container {
+  width: calc(65%);
+  margin: -10px calc(16%);
+}
+
+:deep(.right-aligned-wrapper) {
+  text-align: right;
+  color: #ffffff;
+}
+
+.checkbox-md :deep(.ant-checkbox-inner) {
+  width: 20px;
+  height: 20px;
+}
+
+.telemetry-description-item {
+  margin-top: -15px;
+  margin-bottom: 14px;
+}
+
+.telemetry-description-item :deep(.ant-form-item-control) {
+  margin-left: 0 !important;
+  max-width: 100% !important;
+}
+
+.telemetry-description {
+  font-size: 12px;
+  color: var(--text-color-secondary);
+  line-height: 1.4;
+  opacity: 0.8;
+  text-align: left;
+  margin: 0;
+  margin-left: 20px;
+  padding: 0;
+  word-wrap: break-word;
+}
+
+.telemetry-description a {
+  color: #1890ff;
+  text-decoration: none;
+  transition: color 0.3s;
+}
+
+.telemetry-description a:hover {
+  color: #40a9ff;
+  text-decoration: underline;
+}
+
+.mouse-event-row {
+  margin-bottom: 10px;
+  min-height: 32px;
+}
+
+.mouse-event-label {
+  font-size: 14px;
+  color: var(--text-color);
+  min-width: 110px;
+  text-align: left;
+  opacity: 0.9;
+  margin-right: 10px;
+}
+
+.cursor-style-group {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px;
+  background-color: var(--bg-color-octonary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  gap: 2px;
+}
+
+.cursor-style-item {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 26px;
+  padding: 0;
+  background-color: transparent;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  color: var(--text-color);
+  transition:
+    background-color 0.2s,
+    box-shadow 0.2s;
+}
+
+.cursor-style-item:hover {
+  background-color: var(--hover-bg-color);
+}
+
+.cursor-style-item.active {
+  background-color: var(--bg-color);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+}
+
+.cursor-style-icon {
+  display: inline-block;
+  background-color: currentColor;
+}
+
+.cursor-style-icon--block {
+  width: 8px;
+  height: 14px;
+  border-radius: 1px;
+}
+
+.cursor-style-icon--bar {
+  width: 2px;
+  height: 14px;
+  border-radius: 1px;
+}
+
+.cursor-style-icon--underline {
+  width: 12px;
+  height: 2px;
+  border-radius: 1px;
+}
+
+.mouse-event-select {
+  width: 140px;
+}
+
+.mouse-event-select :deep(.ant-select-selector) {
+  background-color: var(--select-bg);
+  border: 1px solid var(--select-border);
+  border-radius: 6px;
+  color: var(--text-color);
+  transition: all 0.3s;
+  height: 32px;
+}
+
+.mouse-event-select :deep(.ant-select-selector:hover),
+.mouse-event-select :deep(.ant-select-focused .ant-select-selector) {
+  background-color: var(--select-hover-bg);
+  border-color: #1890ff;
+}
+
+.mouse-event-select :deep(.ant-select-selection-item) {
+  color: var(--text-color);
+  font-size: 14px;
+  line-height: 32px;
+}
+
+.mouse-event-select :deep(.ant-select-arrow) {
+  color: var(--text-color);
+  opacity: 0.7;
+}
+
+:deep(.ant-select) {
+  .ant-select-selector {
+    background-color: var(--bg-color-secondary) !important;
+    border: 1px solid var(--border-color);
+    color: var(--text-color);
+  }
+
+  &.ant-select-focused {
+    .ant-select-selector {
+      background-color: var(--bg-color-secondary) !important;
+      border-color: #1890ff !important;
+    }
+  }
+}
+
+.agent-table .ant-table-tbody > tr {
+  height: 28px !important;
+}
+
+.proxy-form :deep(:where(.ant-form-item)) {
+  margin-bottom: 12px !important;
+}
+
+/* Setting button styles - consistent with model check button */
+.setting-button {
+  width: 90px;
+  background-color: var(--bg-color-octonary) !important;
+  color: var(--text-color) !important;
+  border: none !important;
+  box-shadow: none !important;
+  transition: background 0.2s;
+}
+
+.setting-button:hover,
+.setting-button:focus {
+  background-color: var(--bg-color-novenary) !important;
+  color: var(--text-color) !important;
+}
+
+.theme-light .setting-button {
+  background-color: #e2e8f0 !important;
+  border-color: #e2e8f0 !important;
+  color: #0f172a !important;
+}
+
+.theme-light .setting-button:hover,
+.theme-light .setting-button:focus {
+  background-color: #cbd5e1 !important;
+  border-color: #cbd5e1 !important;
+  color: #0f172a !important;
+}
+
+/* Ensure setting button form items inherit right alignment */
+.user_my-ant-form-item:has(.setting-button) {
+  text-align: right;
+}
+
+.user_my-ant-form-item:has(.setting-button) :deep(.ant-form-item-control) {
+  text-align: right;
+}
+
+/* Proxy form select styles - white background for dark theme */
+.proxy-form-select {
+  width: 100% !important;
+}
+
+.proxy-form-select :deep(.ant-select-selector) {
+  background-color: var(--bg-color-octonary) !important;
+  border: 1px solid var(--border-color) !important;
+  border-radius: 6px;
+  color: var(--text-color) !important;
+  transition: all 0.3s;
+  height: 32px;
+}
+
+.proxy-form-select :deep(.ant-select-selector:hover) {
+  border-color: #1890ff !important;
+  background-color: var(--select-hover-bg) !important;
+}
+
+.proxy-form-select :deep(.ant-select-focused .ant-select-selector),
+.proxy-form-select :deep(.ant-select-selector:focus) {
+  border-color: #1890ff !important;
+  box-shadow: 0 0 0 2px rgba(24, 144, 255, 0.2) !important;
+  background-color: var(--select-hover-bg) !important;
+}
+
+.proxy-form-select :deep(.ant-select-selection-item) {
+  color: var(--text-color) !important;
+  font-size: 14px;
+  line-height: 32px;
+}
+
+.proxy-form-select :deep(.ant-select-selection-placeholder) {
+  color: var(--text-color-tertiary) !important;
+  font-size: 14px;
+  line-height: 32px;
+}
+
+.proxy-form-select :deep(.ant-select-arrow) {
+  color: var(--text-color) !important;
+  opacity: 0.7;
+}
+
+/* Proxy form select dropdown styles */
+.proxy-form-select :deep(.ant-select-dropdown) {
+  background-color: var(--bg-color-secondary) !important;
+  border: 1px solid var(--border-color) !important;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15) !important;
+}
+
+.proxy-form-select :deep(.ant-select-item) {
+  color: var(--text-color) !important;
+  background-color: var(--bg-color-secondary) !important;
+  font-size: 14px;
+}
+
+.proxy-form-select :deep(.ant-select-item-option-active),
+.proxy-form-select :deep(.ant-select-item-option-selected) {
+  color: var(--text-color) !important;
+  background-color: var(--hover-bg-color) !important;
+}
+
+.proxy-form-select :deep(.ant-select-item-option:hover) {
+  color: var(--text-color) !important;
+  background-color: var(--hover-bg-color) !important;
+}
+
+/* SSH Agent modal key selection styles - dark theme overrides */
+.agent-config-modal :deep(.ant-form-item-label > label) {
+  color: var(--text-color) !important;
+}
+
+/* Key selection select styles - white background for dark theme */
+.key-selection-select :deep(.ant-select-selector) {
+  background-color: var(--bg-color-octonary) !important;
+  border: 1px solid var(--border-color) !important;
+  border-radius: 6px;
+  color: var(--text-color) !important;
+  transition: all 0.3s;
+  height: 32px;
+}
+
+.key-selection-select :deep(.ant-select-selector:hover) {
+  border-color: #1890ff !important;
+  background-color: var(--select-hover-bg) !important;
+}
+
+.key-selection-select :deep(.ant-select-focused .ant-select-selector),
+.key-selection-select :deep(.ant-select-selector:focus) {
+  border-color: #1890ff !important;
+  box-shadow: 0 0 0 2px rgba(24, 144, 255, 0.2) !important;
+  background-color: var(--select-hover-bg) !important;
+}
+
+.key-selection-select :deep(.ant-select-selection-item) {
+  color: var(--text-color) !important;
+  font-size: 14px;
+  line-height: 32px;
+}
+
+.key-selection-select :deep(.ant-select-arrow) {
+  color: var(--text-color) !important;
+  opacity: 0.7;
+}
+
+/* Key selection select dropdown styles */
+.key-selection-select :deep(.ant-select-dropdown) {
+  background-color: var(--bg-color-secondary) !important;
+  border: 1px solid var(--border-color) !important;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15) !important;
+}
+
+.key-selection-select :deep(.ant-select-item) {
+  color: var(--text-color) !important;
+  background-color: var(--bg-color-secondary) !important;
+  font-size: 14px;
+}
+
+.key-selection-select :deep(.ant-select-item-option-active),
+.key-selection-select :deep(.ant-select-item-option-selected) {
+  color: var(--text-color) !important;
+  background-color: var(--hover-bg-color) !important;
+}
+
+.key-selection-select :deep(.ant-select-item-option:hover) {
+  color: var(--text-color) !important;
+  background-color: var(--hover-bg-color) !important;
+}
+
+/* More specific styles for key form item */
+.key-form-item :deep(.ant-form-item-label > label) {
+  color: var(--text-color) !important;
+}
+
+.key-form-item .key-selection-select :deep(.ant-select-selector) {
+  background-color: var(--bg-color-octonary) !important;
+  border: 1px solid var(--border-color) !important;
+  color: var(--text-color) !important;
+}
+
+.key-form-item .key-selection-select :deep(.ant-select-selection-item) {
+  color: var(--text-color) !important;
+}
+
+.key-form-item .key-selection-select :deep(.ant-select-arrow) {
+  color: var(--text-color) !important;
+}
+</style>
+
+<style>
+/* Global styles for modal theming - adapt to light/dark theme */
+.agent-config-modal .ant-modal-content,
+.proxy-config-modal .ant-modal-content,
+.proxy-config-add-modal .ant-modal-content {
+  background-color: var(--bg-color-secondary) !important;
+  color: var(--text-color) !important;
+  border: 1px solid var(--border-color-light) !important;
+}
+
+.agent-config-modal .ant-modal-header,
+.proxy-config-modal .ant-modal-header,
+.proxy-config-add-modal .ant-modal-header {
+  background-color: var(--bg-color-secondary) !important;
+  border-bottom: none !important;
+}
+
+.agent-config-modal .ant-modal-title,
+.proxy-config-modal .ant-modal-title,
+.proxy-config-add-modal .ant-modal-title {
+  color: var(--text-color) !important;
+}
+
+.agent-config-modal .ant-modal-close,
+.agent-config-modal .ant-modal-close-x,
+.agent-config-modal .ant-modal-close .ant-modal-close-icon,
+.proxy-config-modal .ant-modal-close,
+.proxy-config-modal .ant-modal-close-x,
+.proxy-config-modal .ant-modal-close .ant-modal-close-icon,
+.proxy-config-add-modal .ant-modal-close,
+.proxy-config-add-modal .ant-modal-close-x,
+.proxy-config-add-modal .ant-modal-close .ant-modal-close-icon {
+  color: var(--text-color-secondary-light) !important;
+}
+
+.agent-config-modal .ant-modal-body,
+.proxy-config-modal .ant-modal-body,
+.proxy-config-add-modal .ant-modal-body {
+  background-color: var(--bg-color-secondary) !important;
+}
+
+.agent-config-modal .ant-modal-footer,
+.proxy-config-modal .ant-modal-footer,
+.proxy-config-add-modal .ant-modal-footer {
+  background-color: var(--bg-color-secondary) !important;
+  border-top: none !important;
+  padding-top: 4px !important;
+}
+
+/* Table styles in modals */
+.agent-config-modal .agent-table .ant-table,
+.proxy-config-modal .agent-table .ant-table {
+  background-color: transparent !important;
+}
+
+.agent-config-modal .agent-table .ant-table-thead > tr > th,
+.proxy-config-modal .agent-table .ant-table-thead > tr > th {
+  background-color: var(--bg-color-tertiary) !important;
+  color: var(--text-color) !important;
+  border-bottom: 1px solid var(--border-color-light) !important;
+}
+
+.agent-config-modal .agent-table .ant-table-thead > tr > th::before,
+.proxy-config-modal .agent-table .ant-table-thead > tr > th::before {
+  background-color: rgba(255, 255, 255, 0.06) !important;
+}
+
+.agent-config-modal .agent-table .ant-table-tbody > tr > td,
+.proxy-config-modal .agent-table .ant-table-tbody > tr > td {
+  background-color: var(--bg-color-secondary) !important;
+  color: var(--text-color) !important;
+  border-bottom: 1px solid var(--border-color-light) !important;
+}
+
+.agent-config-modal .agent-table .ant-table-tbody > tr:hover > td,
+.proxy-config-modal .agent-table .ant-table-tbody > tr:hover > td {
+  background-color: var(--hover-bg-color) !important;
+}
+
+/* Form styles in modals */
+.agent-config-modal .ant-form-item-label > label,
+.proxy-config-add-modal .ant-form-item-label > label {
+  color: var(--text-color) !important;
+}
+
+.agent-config-modal .ant-input,
+.proxy-config-add-modal .ant-input,
+.agent-config-modal .ant-input-password,
+.proxy-config-add-modal .ant-input-password {
+  background-color: var(--bg-color-octonary) !important;
+  color: var(--text-color) !important;
+  border-color: var(--border-color) !important;
+
+  &::placeholder {
+    color: var(--text-color-tertiary) !important;
+  }
+}
+
+.agent-config-modal .ant-input-number,
+.proxy-config-add-modal .ant-input-number {
+  background-color: var(--bg-color-octonary) !important;
+  border: 1px solid var(--border-color) !important;
+  border-radius: 6px;
+}
+
+.agent-config-modal .ant-input-number:hover,
+.agent-config-modal .ant-input-number:focus,
+.proxy-config-add-modal .ant-input-number:hover,
+.proxy-config-add-modal .ant-input-number:focus {
+  border-color: #1890ff !important;
+  box-shadow: 0 0 0 2px rgba(24, 144, 255, 0.2) !important;
+}
+
+.agent-config-modal .ant-input-number-input,
+.proxy-config-add-modal .ant-input-number-input {
+  background-color: var(--bg-color-octonary) !important;
+  color: var(--text-color) !important;
+
+  &::placeholder {
+    color: var(--text-color-tertiary) !important;
+  }
+}
+</style>

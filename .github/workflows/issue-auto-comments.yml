@@ -1,0 +1,64 @@
+name: Issue Auto Comment
+
+on:
+  issues:
+    types:
+      - opened
+      - closed
+      - assigned
+  pull_request_target:
+    types:
+      - opened
+      - closed
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    permissions:
+      issues: write
+      pull-requests: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Auto Comment on Issues Closed
+        if: github.event_name == 'issues' && github.event.issue.state == 'closed'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BODY=$(cat <<'EOF'
+          @${{ github.event.issue.user.login }}
+
+          This issue has been closed. If you have any questions or concerns, please feel free to comment and we'll be happy to help!
+          EOF
+          )
+
+          gh api "repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments" \
+            --method POST \
+            --field "body=${BODY}"
+
+      - name: Auto Comment on Pull Request Merged
+        if: github.event_name == 'pull_request_target' && github.event.pull_request.merged == true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BODY=$(cat <<'EOF'
+          Great PR @${{ github.event.pull_request.user.login }}
+
+          Thank you for your contribution to Chaterm! The growth of this project is inseparable from community feedback and contributions like yours.
+
+          We appreciate your time and effort in making Chaterm better!
+          EOF
+          )
+
+          gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+            --method POST \
+            --field "body=${BODY}"
+
+      - name: Remove inactive label
+        if: github.event_name == 'issues' && github.event.issue.state == 'open' && github.actor == github.event.issue.user.login
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/labels/Inactive" \
+            --method DELETE

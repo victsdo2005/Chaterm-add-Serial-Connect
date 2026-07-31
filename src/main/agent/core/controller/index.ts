@@ -1,0 +1,1214 @@
+//  Copyright (c) 2025-present, chaterm.ai  All rights reserved.
+//  This source code is licensed under the GPL-3.0
+//
+// Copyright (c) 2025 cline Authors, All rights reserved.
+// Licensed under the Apache License, Version 2.0
+
+import { Anthropic } from '@anthropic-ai/sdk'
+
+import pWaitFor from 'p-wait-for'
+import { buildApiHandler, ApiHandler } from '@api/index'
+import { McpHub } from '@services/mcp/McpHub'
+import { SkillsManager } from '@services/skills'
+import { version as extensionVersion } from '../../../../../package.json'
+import { TelemetrySetting } from '@shared/TelemetrySetting'
+import { telemetryService } from '@services/telemetry/TelemetryService'
+import { ExtensionMessage, Platform } from '@shared/ExtensionMessage'
+import { WebviewMessage } from '@shared/WebviewMessage'
+import type { ContentPart, Host } from '@shared/WebviewMessage'
+import { validateWebviewMessageContract } from '@shared/WebviewMessage'
+import {
+  ensureTaskExists,
+  getSavedApiConversationHistory,
+  deleteChatermHistoryByTaskId,
+  getTaskMetadata,
+  saveTaskMetadata,
+  saveTaskTitle,
+  ensureTaskMetadataExists,
+  ensureMcpServersDirectoryExists,
+  setTaskWorkspace
+} from '../storage/disk'
+import { isValidCommand } from '../../../storage/db/commandValidation'
+import { getAllExtensionState, updateGlobalState, getUserConfig, getModelOptions } from '../storage/state'
+import { Task } from '../task'
+import type { TaskWorkspace } from '../task/tool-registry'
+import { hasValidDbContext, normaliseWorkspace, type DbTaskContext } from '../task/workspace'
+import { ApiConfiguration, ApiProvider, PROVIDER_MODEL_KEY_MAP } from '@shared/api'
+import { TITLE_GENERATION_PROMPT, TITLE_GENERATION_PROMPT_CN } from '../prompts/system'
+import { DEFAULT_LANGUAGE_SETTINGS } from '@shared/Languages'
+import type { CommandGenerationContext } from '@shared/WebviewMessage'
+import { isChineseEdition } from '../../../config/edition'
+import { mark } from '@perf'
+const logger = createLogger('agent')
+// TODO: Replace hardcoded model names with chaterm-model configuration
+const AI_SUGGEST_MODEL_CN = 'Qwen-Plus'
+const AI_SUGGEST_MODEL_GLOBAL = 'gemini-3-pro'
+
+export class Controller {
+  private postMessage: (message: ExtensionMessage) => Promise<boolean> | undefined
+
+  private tasks: Map<string, Task> = new Map()
+  mcpHub: McpHub
+  skillsManager: SkillsManager
+
+  constructor(postMessage: (message: ExtensionMessage) => Promise<boolean> | undefined, getMcpSettingsFilePath: () => Promise<string>) {
+    logger.debug('Controller instantiated', { event: 'agent.controller.init' })
+    this.postMessage = postMessage
+
+    this.mcpHub = new McpHub(
+      () => ensureMcpServersDirectoryExists(),
+      getMcpSettingsFilePath,
+      extensionVersion,
+      (msg) => this.postMessageToWebview(msg)
+    )
+
+    // Initialize Skills Manager
+    this.skillsManager = new SkillsManager((msg) => this.postMessageToWebview(msg))
+    this.skillsManager.initialize().catch((error) => {
+      logger.error('[Controller] Failed to initialize SkillsManager', { error: error })
+    })
+  }
+
+  private getTaskFromId(tabId?: string): Task | undefined {
+    if (!tabId) {
+      return undefined
+    }
+    const task = this.tasks.get(tabId)
+    return task
+  }
+
+  getAllTasks(): Task[] {
+    return Array.from(this.tasks.values())
+  }
+
+  /**
+   * Reload security config for all active tasks
+   * Used for hot reloading security configuration
+   */
+  async reloadSecurityConfigForAllTasks(): Promise<void> {
+    const tasks = this.getAllTasks()
+    const promises = tasks.map(async (task) => {
+      try {
+        await task.reloadSecurityConfig()
+      } catch (error) {
+        logger.warn(`[SecurityConfig] Failed to hot reload configuration in Task ${task.taskId}`, {
+          error: error
+        })
+      }
+    })
+    await Promise.allSettled(promises)
+  }
+
+  async dispose() {
+    // Release terminal resources for all tasks
+    for (const task of this.tasks.values()) {
+      const terminalManager = task.getTerminalManager()
+      if (terminalManager) {
+        terminalManager.disposeAll()
+      }
+    }
+
+    await this.clearTask()
+    this.mcpHub.dispose()
+    await this.skillsManager.dispose()
+  }
+
+  async setUserInfo(info?: { displayName: string | null; email: string | null; photoURL: string | null }) {
+    await updateGlobalState('userInfo', info)
+  }
+
+  /**
+   * Build ApiConfiguration for a given model name (from model options). Includes thinking models.
+   * Returns base config unchanged if modelName is empty or not found.
+   */
+  private async buildApiConfigurationForModel(base: ApiConfiguration, modelName: string): Promise<ApiConfiguration> {
+    if (!modelName?.trim()) return base
+    const modelOptions = await getModelOptions(false)
+    const selectedModel = modelOptions.find((m) => m.name === modelName)
+    if (!selectedModel?.apiProvider) return base
+    const modelKey = PROVIDER_MODEL_KEY_MAP[selectedModel.apiProvider] || 'defaultModelId'
+    return {
+      ...base,
+      apiProvider: selectedModel.apiProvider as ApiProvider,
+      [modelKey]: selectedModel.name
+    }
+  }
+
+  /**
+   * Build ApiConfiguration from task metadata model_usage entry (model_id + model_provider_id).
+   */
+  private buildApiConfigurationFromMetadata(base: ApiConfiguration, modelId: string, modelProviderId: string): ApiConfiguration {
+    if (!modelId?.trim() || !modelProviderId?.trim()) return base
+    const modelKey = PROVIDER_MODEL_KEY_MAP[modelProviderId] || 'defaultModelId'
+    return {
+      ...base,
+      apiProvider: modelProviderId as ApiProvider,
+      [modelKey]: modelId
+    }
+  }
+
+  async initTask(
+    hosts: Host[],
+    task?: string,
+    taskId?: string,
+    contentParts?: ContentPart[],
+    modelName?: string,
+    workspace?: TaskWorkspace,
+    dbContext?: DbTaskContext
+  ) {
+    const resolvedTaskId = taskId
+    mark('chaterm/agent/willCreateTask')
+    logger.info('Initializing task', {
+      event: 'agent.task.init',
+      taskId: resolvedTaskId || 'new',
+      hasInitialPrompt: !!task,
+      workspace: workspace ?? 'server'
+    })
+    if (resolvedTaskId) {
+      await this.clearTask(resolvedTaskId)
+    }
+    const { apiConfiguration, userRules, autoApprovalSettings } = await getAllExtensionState()
+    const customInstructions = this.formatUserRulesToInstructions(userRules)
+
+    let resolvedApiConfiguration: ApiConfiguration
+    if (modelName?.trim()) {
+      resolvedApiConfiguration = await this.buildApiConfigurationForModel(apiConfiguration, modelName)
+    } else if (resolvedTaskId) {
+      const metadata = await getTaskMetadata(resolvedTaskId)
+      const lastUsage = metadata?.model_usage?.length ? metadata.model_usage[metadata.model_usage.length - 1] : null
+      if (lastUsage?.model_id && lastUsage?.model_provider_id) {
+        resolvedApiConfiguration = this.buildApiConfigurationFromMetadata(apiConfiguration, lastUsage.model_id, lastUsage.model_provider_id)
+      } else {
+        resolvedApiConfiguration = apiConfiguration
+      }
+    } else {
+      resolvedApiConfiguration = apiConfiguration
+    }
+
+    // Resolve workspace + dbContext:
+    //   - New-task path: use caller-provided workspace (defaulting to 'server');
+    //     when caller asks for 'database', require a valid DbTaskContext.
+    //   - Resume path: read from persisted metadata; caller-provided overrides
+    //     are honoured (e.g. when a UI explicitly pins the workspace), but
+    //     fall back to storage on absence.
+    let resolvedWorkspace: TaskWorkspace
+    let resolvedDbContext: DbTaskContext | undefined
+    if (task && taskId) {
+      // New task: caller intent wins.
+      resolvedWorkspace = normaliseWorkspace(workspace)
+      resolvedDbContext = resolvedWorkspace === 'database' && hasValidDbContext(dbContext) ? dbContext : undefined
+    } else if (resolvedTaskId) {
+      // Resume: prefer caller override, else storage.
+      const metadata = await getTaskMetadata(resolvedTaskId)
+      const storedWorkspace = normaliseWorkspace(metadata?.workspace)
+      resolvedWorkspace = workspace ? normaliseWorkspace(workspace) : storedWorkspace
+      const callerDbContext = hasValidDbContext(dbContext) ? dbContext : undefined
+      const storedDbContext = hasValidDbContext(metadata?.db_context) ? (metadata?.db_context as DbTaskContext) : undefined
+      resolvedDbContext = resolvedWorkspace === 'database' ? (callerDbContext ?? storedDbContext) : undefined
+    } else {
+      resolvedWorkspace = normaliseWorkspace(workspace)
+      resolvedDbContext = resolvedWorkspace === 'database' && hasValidDbContext(dbContext) ? dbContext : undefined
+    }
+
+    // Guard: a database-workspace new task must carry a valid dbContext.
+    // The renderer already validates this before sending; this check is a
+    // server-side safety net to prevent half-created DB sessions.
+    if (task && taskId && resolvedWorkspace === 'database' && !resolvedDbContext) {
+      logger.warn('Rejected database-workspace task creation: missing or invalid dbContext', {
+        event: 'agent.task.db_context_missing',
+        taskId
+      })
+      await this.postMessageToWebview(
+        {
+          type: 'notification',
+          notification: {
+            type: 'error',
+            description: 'Database workspace requires a valid database connection context.'
+          }
+        },
+        taskId
+      )
+      return
+    }
+
+    // Ensure metadata row exists before Task constructor runs,
+    // so touchTaskUpdatedAt cannot insert a title-less row first.
+    if (task && taskId) {
+      const initialTitle = task.substring(0, 50).trim() || undefined
+      await ensureTaskMetadataExists(taskId, initialTitle)
+      // Persist workspace assignment immediately so later patches
+      // (title generation, favorite toggles, todos updates) observe the
+      // correct workspace. For server tasks this is a no-op vs the column
+      // default; for database tasks it seals the workspace+dbContext pair.
+      if (resolvedWorkspace === 'database') {
+        await setTaskWorkspace(taskId, resolvedWorkspace, resolvedDbContext)
+      }
+    }
+
+    let newTask: Task
+    const postState = () => this.postStateToWebview(newTask?.taskId ?? resolvedTaskId)
+    const postMessage = (message: ExtensionMessage) => this.postMessageToWebview(message, newTask?.taskId ?? resolvedTaskId)
+
+    newTask = new Task(
+      postState,
+      postMessage,
+      (taskId) => this.reinitExistingTaskFromId(taskId),
+      resolvedApiConfiguration,
+      autoApprovalSettings,
+      hosts,
+      this.mcpHub,
+      this.skillsManager,
+      customInstructions,
+      task,
+      undefined, // chatTitle - Don't pass generated title initially
+      taskId,
+      contentParts,
+      resolvedWorkspace,
+      resolvedDbContext
+    )
+
+    this.tasks.set(newTask.taskId, newTask)
+    mark('chaterm/agent/didCreateTask')
+
+    // Generate chat title asynchronously for new tasks (non-blocking)
+    if (task && taskId) {
+      // Start title generation in background without awaiting
+      this.generateChatTitle(task, taskId).catch((error) => {
+        logger.error('Failed to generate chat title', { error: error })
+        // Title generation failure doesn't affect task execution
+      })
+    }
+  }
+
+  async reinitExistingTaskFromId(taskId: string) {
+    const { taskId: existingTaskId } = await this.getTaskWithId(taskId)
+    if (existingTaskId) {
+      const existingTask = this.getTaskFromId(taskId)
+      const hosts = existingTask?.hosts || []
+      await this.initTask(hosts, undefined, existingTaskId)
+    }
+  }
+
+  // Send any JSON serializable data to the react app
+  async postMessageToWebview(message: ExtensionMessage, taskId?: string) {
+    // Send a message to the webview here
+    const payload = taskId
+      ? {
+          ...message,
+          tabId: (message as ExtensionMessage & { tabId?: string }).tabId ?? taskId,
+          taskId: (message as ExtensionMessage & { taskId?: string }).taskId ?? taskId
+        }
+      : message
+    const safeMessage = removeSensitiveKeys(payload)
+    await this.postMessage(safeMessage)
+  }
+
+  /**
+   * Sets up an event listener to listen for messages passed from the webview context and
+   * executes code based on the message that is received.
+   *
+   * @param webview A reference to the extension webview
+   */
+  async handleWebviewMessage(message: WebviewMessage) {
+    if (process.env.NODE_ENV === 'test' || process.env.CHATERM_E2E === '1') {
+      const check = validateWebviewMessageContract(message)
+      if (!check.ok) {
+        logger.warn('[IPC Contract] Invalid WebviewMessage', { value: check.error })
+      }
+    }
+
+    const targetTaskId = message.tabId ?? message.taskId
+    const targetTask = targetTaskId ? this.getTaskFromId(targetTaskId) : undefined
+
+    switch (message.type) {
+      case 'newTask':
+        // Stage 2 of #18: forward workspace + dbContext to Controller.initTask
+        // so DB ChatBot Tasks from the Database workspace start with the
+        // right prompt/tool/approval branch. `initTask` already normalises
+        // and validates both fields; absent → defaults to 'server'.
+        await this.initTask(
+          message.hosts!,
+          message.text,
+          message.taskId,
+          message.contentParts,
+          message.modelName,
+          message.workspace,
+          message.dbContext
+        )
+        if (message.taskId && message.hosts) {
+          await updateTaskHosts(message.taskId, message.hosts)
+        }
+        break
+      case 'condense':
+        targetTask?.handleWebviewAskResponse('yesButtonClicked')
+        break
+
+      case 'askResponse':
+        if (!targetTask && targetTaskId) {
+          // Lazy initialization: Task was not created when the user opened the
+          // history tab (to avoid DB rewrite race). Initialize it now that the
+          // user is actually continuing the conversation.
+          await this.showTaskWithId(targetTaskId, message.hosts || [])
+        }
+        {
+          const task = targetTask || (targetTaskId ? this.getTaskFromId(targetTaskId) : undefined)
+          if (task) {
+            logger.debug('Received askResponse message', {
+              event: 'agent.controller.ask.response',
+              taskId: task.taskId,
+              askResponse: message.askResponse
+            })
+            if (message.modelName?.trim() && message.modelName.trim() !== task.api.getModel().id) {
+              const { apiConfiguration } = await getAllExtensionState()
+              if (apiConfiguration) {
+                const perTabConfig = await this.buildApiConfigurationForModel(apiConfiguration, message.modelName)
+                task.api = buildApiHandler(perTabConfig)
+                task.setApiProvider(perTabConfig.apiProvider)
+              }
+            }
+            if (message.hosts) {
+              task.hosts = message.hosts
+              if (targetTaskId) {
+                await updateTaskHosts(targetTaskId, message.hosts)
+              }
+            }
+            if (task.workspace === 'database' && hasValidDbContext(message.dbContext)) {
+              task.updateDbContext(message.dbContext as DbTaskContext)
+            }
+            if (message.askResponse === 'messageResponse') {
+              // Clean up all command contexts for this task and broadcast close events
+              logger.debug('Cleaning command contexts before handling messageResponse', {
+                event: 'agent.controller.message_response.cleanup.start',
+                taskId: task.taskId
+              })
+              Task.clearCommandContextsForTask(task.taskId)
+              await task.clearTodos('new_user_input')
+              logger.debug('Command contexts and todos cleared for messageResponse', {
+                event: 'agent.controller.message_response.cleanup.complete',
+                taskId: task.taskId
+              })
+            }
+            await task.handleWebviewAskResponse(
+              message.askResponse!,
+              message.text,
+              message.truncateAtMessageTs,
+              message.contentParts,
+              message.toolResult
+            )
+          }
+        }
+        break
+      case 'showTaskWithId':
+        this.showTaskWithId(message.text!, message.hosts || [])
+        break
+      case 'deleteTaskWithId':
+        this.deleteTaskWithId(message.text!)
+        break
+      case 'taskFeedback':
+        if (message.feedbackType && targetTaskId) {
+          telemetryService.captureTaskFeedback(targetTaskId, message.feedbackType)
+        }
+        break
+      case 'commandGeneration':
+        if (message.instruction) {
+          await this.handleCommandGeneration(message.instruction, message.context, message.tabId, message.modelName)
+        }
+        break
+      case 'explainCommand':
+        if (message.command != null) {
+          await this.handleExplainCommand(message.command, message.tabId, message.commandMessageId)
+        }
+        break
+      case 'telemetrySetting': {
+        if (message.telemetrySetting) {
+          await this.updateTelemetrySetting(message.telemetrySetting)
+        }
+        await this.postStateToWebview(targetTaskId)
+        break
+      }
+    }
+  }
+
+  async updateTelemetrySetting(telemetrySetting: TelemetrySetting) {
+    const rawPolicy = process.env.CHATERM_TELEMETRY_ENABLED
+    if (typeof rawPolicy === 'string') {
+      const normalized = rawPolicy.trim().toLowerCase()
+      if (['0', 'false', 'no', 'off'].includes(normalized)) {
+        telemetrySetting = 'disabled'
+      }
+    }
+    try {
+      await updateGlobalState('telemetrySetting', telemetrySetting)
+    } catch (error) {}
+    const isOptedIn = telemetrySetting === 'enabled'
+    telemetryService.updateTelemetryState(isOptedIn)
+  }
+
+  async cancelTask(tabId?: string) {
+    const currentTask = this.getTaskFromId(tabId)
+    if (!currentTask) {
+      return
+    }
+    try {
+      await currentTask.abortTask()
+    } catch (error) {
+      logger.error('Failed to abort task', { error: error })
+    }
+    await pWaitFor(() => currentTask.isStreaming === false || currentTask.didFinishAbortingStream || currentTask.isWaitingForFirstChunk, {
+      timeout: 3_000
+    }).catch(() => {
+      logger.error('Failed to abort task')
+    })
+
+    try {
+      await currentTask.clearTodos('user_cancelled')
+    } catch (error) {
+      logger.error('Failed to clear todos during cancelTask', { error: error })
+    }
+
+    currentTask.abandoned = true
+    await this.initTask(currentTask.hosts, undefined, currentTask.taskId)
+  }
+
+  async gracefulCancelTask(tabId?: string) {
+    const currentTask = this.getTaskFromId(tabId)
+    if (!currentTask) {
+      return
+    }
+
+    try {
+      await currentTask.gracefulAbortTask()
+    } catch (error) {
+      logger.error('Failed to gracefully abort task', { error: error })
+    }
+    try {
+      await currentTask.clearTodos('user_cancelled')
+    } catch (error) {
+      logger.error('Failed to clear todos during gracefulCancelTask', { error: error })
+    }
+  }
+
+  async getTaskWithId(id: string): Promise<{
+    taskId: string
+    apiConversationHistory: Anthropic.MessageParam[]
+  }> {
+    const taskId = await ensureTaskExists(id)
+    if (taskId) {
+      const apiConversationHistory = await getSavedApiConversationHistory(taskId)
+      return { taskId, apiConversationHistory }
+    }
+    throw new Error('Task not found')
+  }
+
+  async showTaskWithId(id: string, hosts: Host[]) {
+    const existingTask = this.tasks.get(id)
+    if (existingTask) {
+      // Task already exists, no need to reinitialize
+      return
+    }
+
+    await this.getTaskWithId(id) // existence check only
+    await this.initTask(hosts, undefined, id)
+    // Wait for Task's DB initialization (resumeTaskFromHistory) to complete
+    // before returning, so that callers can safely query paginated messages.
+    const newTask = this.tasks.get(id)
+    if (newTask) {
+      await newTask.dbReady
+    }
+  }
+
+  async deleteTaskWithId(id: string) {
+    logger.info('deleteTaskWithId', { taskId: id })
+    await deleteChatermHistoryByTaskId(id)
+    await this.clearTask(id)
+    // Notify renderer so all UI components (sidebar, chatHistory) can remove the item.
+    await this.postMessageToWebview({ type: 'taskDeleted', taskId: id })
+  }
+
+  async postStateToWebview(taskId?: string) {
+    const { apiConfiguration, customInstructions, autoApprovalSettings, chatSettings, userInfo, mcpMarketplaceEnabled } = await getAllExtensionState()
+
+    const activeTask = this.getTaskFromId(taskId)
+
+    const state = {
+      version: extensionVersion,
+      apiConfiguration,
+      customInstructions,
+      checkpointTrackerErrorMessage: activeTask?.checkpointTrackerErrorMessage,
+      chatermMessages: activeTask?.chatermMessages || [],
+      shouldShowAnnouncement: false,
+      platform: process.platform as Platform,
+      autoApprovalSettings,
+      chatSettings,
+      userInfo,
+      mcpMarketplaceEnabled,
+      shellIntegrationTimeout: 30,
+      isNewUser: true
+    }
+
+    this.postMessageToWebview({ type: 'state', state }, taskId)
+  }
+
+  async clearTask(tabId?: string) {
+    const disposeTask = async (task: Task) => {
+      try {
+        await task.abortTask()
+      } catch (error) {
+        logger.error('Failed to abort task during clearTask', { error: error })
+      }
+
+      const terminalManager = task.getTerminalManager()
+      if (terminalManager) {
+        terminalManager.disposeAll()
+      }
+    }
+
+    if (tabId) {
+      const task = this.tasks.get(tabId)
+      if (task) {
+        await disposeTask(task)
+        this.tasks.delete(tabId)
+      }
+      return
+    }
+
+    for (const task of this.tasks.values()) {
+      await disposeTask(task)
+    }
+    this.tasks.clear()
+  }
+  // updateTaskHistory removed - task metadata now persisted via agent_task_metadata_v1
+
+  async validateApiKey(configuration: ApiConfiguration): Promise<{ isValid: boolean; error?: string }> {
+    // For LiteLLM, use createSync for synchronous initialization
+    let api: ApiHandler
+    if (configuration.apiProvider === 'litellm' || configuration.apiProvider === 'default') {
+      const { LiteLlmHandler } = await import('@api/providers/litellm')
+      const options =
+        configuration.apiProvider === 'default'
+          ? {
+              ...configuration,
+              liteLlmModelId: configuration.defaultModelId,
+              liteLlmBaseUrl: configuration.defaultBaseUrl,
+              liteLlmApiKey: configuration.defaultApiKey
+            }
+          : configuration
+      api = LiteLlmHandler.createSync(options)
+    } else {
+      api = buildApiHandler(configuration)
+    }
+    return await api.validateApiKey()
+  }
+  /**
+   * Handle command generation request from webview
+   * Converts natural language instruction to executable terminal command
+   */
+  async handleCommandGeneration(instruction: string, context?: CommandGenerationContext, tabId?: string, modelName?: string) {
+    try {
+      // Get API configuration
+      const { apiConfiguration } = await getAllExtensionState()
+      if (!apiConfiguration) {
+        throw new Error('API configuration not found')
+      }
+
+      // Build API configuration based on selected model
+      let commandApiConfiguration: ApiConfiguration
+
+      if (modelName) {
+        // Get model options to find the selected model's provider (exclude thinking models)
+        const modelOptions = await getModelOptions(true)
+        const selectedModel = modelOptions.find((m) => m.name === modelName)
+
+        if (selectedModel && selectedModel.apiProvider) {
+          const modelKey = PROVIDER_MODEL_KEY_MAP[selectedModel.apiProvider] || 'defaultModelId'
+
+          commandApiConfiguration = {
+            ...apiConfiguration,
+            apiProvider: selectedModel.apiProvider as ApiProvider,
+            [modelKey]: selectedModel.name
+          }
+        } else {
+          commandApiConfiguration = apiConfiguration
+        }
+      } else {
+        commandApiConfiguration = apiConfiguration
+      }
+
+      const api = buildApiHandler(commandApiConfiguration)
+
+      // Build system prompt for command generation
+      const systemPrompt = this.buildCommandGenerationPrompt(context)
+
+      // Create conversation with user instruction
+      const conversation: Anthropic.MessageParam[] = [
+        {
+          role: 'user' as const,
+          content: instruction
+        }
+      ]
+
+      // Call AI API to generate command
+      const stream = api.createMessage(systemPrompt, conversation)
+      let generatedCommand = ''
+
+      try {
+        for await (const chunk of stream) {
+          if (chunk.type === 'text') {
+            generatedCommand += chunk.text
+          }
+        }
+
+        // Clean up the generated command (remove markdown formatting if present)
+        const cleanedCommand = this.extractCommandFromResponse(generatedCommand)
+
+        // Send response back to webview with tabId for proper routing
+        await this.postMessageToWebview({
+          type: 'commandGenerationResponse',
+          command: cleanedCommand,
+          tabId: tabId
+        })
+      } catch (streamError) {
+        logger.error('Error processing AI stream', { error: streamError })
+        throw streamError
+      }
+    } catch (error) {
+      logger.error('Command generation failed', { error: error })
+
+      // Send error response back to webview with tabId for proper routing
+      await this.postMessageToWebview({
+        type: 'commandGenerationResponse',
+        error: error instanceof Error ? error.message : 'Command generation failed',
+        tabId: tabId
+      })
+    }
+  }
+
+  /**
+   * Handle explain command request from webview
+   * One-off AI call to explain a command, does not touch task history
+   */
+  async handleExplainCommand(command: string, tabId?: string, commandMessageId?: string) {
+    try {
+      const trimmed = command?.trim() ?? ''
+      if (!trimmed) {
+        await this.postMessageToWebview({
+          type: 'explainCommandResponse',
+          error: 'Empty command',
+          tabId,
+          commandMessageId
+        })
+        return
+      }
+
+      const { apiConfiguration } = await getAllExtensionState()
+      if (!apiConfiguration) {
+        await this.postMessageToWebview({
+          type: 'explainCommandResponse',
+          error: 'API configuration not found',
+          tabId,
+          commandMessageId
+        })
+        return
+      }
+
+      const api = buildApiHandler(apiConfiguration)
+      // Use user language setting so the explanation matches UI language.
+      let userLanguage = DEFAULT_LANGUAGE_SETTINGS
+      try {
+        const userConfig = await getUserConfig()
+        if (userConfig?.language) {
+          userLanguage = userConfig.language
+        }
+      } catch {
+        // Ignore errors and fallback to default language.
+      }
+
+      const systemPrompt = this.buildExplainCommandPrompt(userLanguage)
+      const conversation: Anthropic.MessageParam[] = [{ role: 'user' as const, content: trimmed }]
+      const stream = api.createMessage(systemPrompt, conversation)
+      let explanation = ''
+
+      try {
+        for await (const chunk of stream) {
+          if (chunk.type === 'text') {
+            explanation += chunk.text
+          }
+        }
+        await this.postMessageToWebview({
+          type: 'explainCommandResponse',
+          explanation: explanation.trim(),
+          tabId,
+          commandMessageId
+        })
+      } catch (streamError) {
+        logger.error('Explain command stream error', { error: streamError })
+        await this.postMessageToWebview({
+          type: 'explainCommandResponse',
+          error: streamError instanceof Error ? streamError.message : 'Explain failed',
+          tabId,
+          commandMessageId
+        })
+      }
+    } catch (error) {
+      logger.error('Explain command failed', { error: error })
+      await this.postMessageToWebview({
+        type: 'explainCommandResponse',
+        error: error instanceof Error ? error.message : 'Explain failed',
+        tabId,
+        commandMessageId
+      })
+    }
+  }
+
+  /**
+   * Build system prompt for command explanation
+   * Supports all languages by instructing AI to respond in the user's language
+   */
+  private buildExplainCommandPrompt(language?: string): string {
+    const lang = language || 'en-US'
+
+    // Map language codes to language names for the prompt
+    const languageMap: Record<string, string> = {
+      en: 'English',
+      'en-US': 'English',
+      ar: 'Arabic',
+      'pt-BR': 'Portuguese (Brazil)',
+      cs: 'Czech',
+      fr: 'French',
+      de: 'German',
+      hi: 'Hindi',
+      hu: 'Hungarian',
+      it: 'Italian',
+      ja: 'Japanese',
+      ko: 'Korean',
+      pl: 'Polish',
+      'pt-PT': 'Portuguese (Portugal)',
+      ru: 'Russian',
+      'zh-CN': 'Simplified Chinese',
+      es: 'Spanish',
+      'zh-TW': 'Traditional Chinese',
+      tr: 'Turkish'
+    }
+
+    const languageName = languageMap[lang] || 'English'
+
+    // For Chinese, use native prompt for better accuracy
+    if (lang === 'zh-CN') {
+      return `你是一名命令行技术文档专家。请用简体中文、以技术文档的风格，用 1–2 句话准确、简洁地说明下面这条命令：主要参数或选项的含义、命令的作用以及典型使用场景。不要重复命令本身，用语需专业、准确。`
+    }
+    if (lang === 'zh-TW') {
+      return `你是一名命令行技術文檔專家。請用繁體中文、以技術文檔的風格，用 1–2 句話準確、簡潔地說明下面這條命令：主要參數或選項的含義、命令的作用以及典型使用場景。不要重複命令本身，用語需專業、準確。`
+    }
+
+    // For all other languages, use English prompt with language instruction
+    return `You are a CLI technical documentation expert. Explain the following command in 1-2 sentences in a technical, accurate, and concise style: the meaning of key parameters/options, what the command does, and typical use cases. Do not repeat the command. Answer in ${languageName}.`
+  }
+
+  /**
+   * Generate chat title using LLM
+   * Creates a concise, descriptive title for the chat session based on the user's task
+   * @returns The generated title or empty string if generation fails
+   */
+  async generateChatTitle(userTask: string, taskId: string): Promise<string> {
+    try {
+      // Add timeout to prevent hanging (10 seconds)
+      const timeoutPromise = new Promise<string>((_, reject) => {
+        setTimeout(() => reject(new Error('Title generation timeout')), 10000)
+      })
+
+      const titleGenerationPromise = this._performTitleGeneration(userTask, taskId)
+
+      return await Promise.race([titleGenerationPromise, timeoutPromise])
+    } catch (error) {
+      logger.error('Chat title generation failed', { error: error })
+      // Always return empty string to avoid disrupting task execution
+      return ''
+    }
+  }
+
+  /**
+   * Internal method to perform the actual title generation
+   */
+  private async _performTitleGeneration(userTask: string, taskId: string): Promise<string> {
+    const { apiConfiguration } = await getAllExtensionState()
+    if (!apiConfiguration) {
+      logger.warn('API configuration not found, skipping title generation')
+      return ''
+    }
+
+    const api = buildApiHandler(apiConfiguration)
+
+    let userLanguage = DEFAULT_LANGUAGE_SETTINGS
+    try {
+      const userConfig = await getUserConfig()
+      if (userConfig && userConfig.language) {
+        userLanguage = userConfig.language
+      }
+    } catch (error) {
+      // If we can't get user config, use default language
+    }
+
+    // Select system prompt based on language
+    const systemPrompt = userLanguage === 'zh-CN' ? TITLE_GENERATION_PROMPT_CN : TITLE_GENERATION_PROMPT
+
+    // Create conversation with user task
+    const conversation: Anthropic.MessageParam[] = [
+      {
+        role: 'user' as const,
+        content: `Generate a title for this task: ${userTask}`
+      }
+    ]
+
+    // Call AI API to generate title
+    const stream = api.createMessage(systemPrompt, conversation)
+    let generatedTitle = ''
+
+    try {
+      for await (const chunk of stream) {
+        if (chunk.type === 'text') {
+          generatedTitle += chunk.text
+        }
+      }
+
+      // Clean up the generated title (remove any extra whitespace, quotes, or newlines)
+      const cleanedTitle = generatedTitle
+        .replace(/<think>/g, '') // Remove GLM think tags
+        .replace(/<\/think>/g, '')
+        .trim()
+        .replace(/^["']|["']$/g, '') // Remove leading/trailing quotes
+        .replace(/\n/g, ' ') // Replace newlines with spaces
+        .replace(/\s+/g, ' ') // Normalize multiple spaces
+        .substring(0, 100) // Limit to 100 characters
+
+      if (cleanedTitle) {
+        logger.debug('Generated chat title', {
+          event: 'agent.chat.title.generated',
+          taskId,
+          titleLength: cleanedTitle.length
+        })
+
+        // Update Task instance's chatTitle property
+        const task = this.getTaskFromId(taskId)
+        if (task) {
+          task.chatTitle = cleanedTitle
+        }
+
+        // Write title to agent_task_metadata_v1 (sole persistence target)
+        await saveTaskTitle(taskId, cleanedTitle)
+
+        // Send the updated title to webview for immediate UI update
+        await this.postMessageToWebview({
+          type: 'taskTitleUpdated',
+          title: cleanedTitle,
+          taskId: taskId
+        })
+
+        return cleanedTitle
+      }
+
+      return ''
+    } catch (streamError) {
+      logger.error('Error processing title generation stream', { error: streamError })
+      return ''
+    }
+  }
+
+  /**
+   * Handle AI command suggestion for terminal autocomplete.
+   * Returns a single predicted command based on partial user input,
+   * or null if prediction is not possible.
+   */
+  async handleAiSuggestCommand(partialCommand: string, osInfo?: string): Promise<{ command: string; explanation: string } | null> {
+    const trace = (message: string, meta?: Record<string, unknown>) => {
+      logger.debug(message, {
+        event: 'agent.aiSuggest.trace',
+        ...meta
+      })
+    }
+
+    const trimmed = partialCommand?.trim() ?? ''
+
+    if (trimmed.length < 3) {
+      return null
+    }
+
+    try {
+      const { apiConfiguration } = await getAllExtensionState()
+      if (!apiConfiguration) {
+        return null
+      }
+
+      const timeoutMs = 2000
+      const fixedModelId = this.getFixedAiSuggestModelId()
+      // Clone configuration with a short timeout for autocomplete responsiveness
+      const suggestConfig: ApiConfiguration = {
+        ...apiConfiguration,
+        apiProvider: 'default',
+        defaultModelId: fixedModelId,
+        requestTimeoutMs: timeoutMs
+      }
+      trace('AI suggest provider selected', {
+        fixedModelId,
+        timeoutMs
+      })
+
+      if (!suggestConfig.defaultBaseUrl || !suggestConfig.defaultApiKey) {
+        return null
+      }
+
+      const api = buildApiHandler(suggestConfig)
+      const readStreamText = async (systemPrompt: string, userInput: string): Promise<string> => {
+        const conversation: Anthropic.MessageParam[] = [{ role: 'user' as const, content: userInput }]
+        const stream = api.createMessage(systemPrompt, conversation)
+        let output = ''
+
+        for await (const chunk of stream) {
+          if (chunk.type === 'text') {
+            output += chunk.text
+          }
+        }
+
+        return output
+      }
+
+      let userLanguage = DEFAULT_LANGUAGE_SETTINGS
+      try {
+        const userConfig = await getUserConfig()
+        if (userConfig?.language) {
+          userLanguage = userConfig.language
+        }
+      } catch {
+        // Ignore errors and fallback to default language.
+      }
+      const explanationLanguage = this.resolveAiSuggestExplanationLanguage(userLanguage)
+
+      const result = await readStreamText(this.buildAiSuggestPrompt(osInfo, explanationLanguage), trimmed)
+      const parsed = this.parseAiSuggestResponse(result, explanationLanguage)
+      if (!parsed) {
+        return null
+      }
+
+      if (!isValidCommand(parsed.command)) {
+        trace('AI suggest rejected by validator')
+        return null
+      }
+
+      trace('AI suggest accepted', { outputLength: parsed.command.length, explanationLength: parsed.explanation.length })
+      return parsed
+    } catch (error) {
+      trace('AI suggest failed', { error: error instanceof Error ? error.message : String(error) })
+      // Silently return null on any error to avoid disrupting autocomplete flow
+      return null
+    }
+  }
+
+  /**
+   * Build system prompt for AI command suggestion.
+   * Single-call prompt that returns both the predicted command and a brief explanation.
+   */
+  private buildAiSuggestPrompt(osInfo?: string, language?: 'zh' | 'en'): string {
+    const langInstruction = language === 'zh' ? 'EXP in Chinese, max 16 chars.' : 'EXP in English, max 8 words.'
+    const exampleExp = language === 'zh' ? '查看最近10条提交' : 'Show recent 10 commits'
+    return `You are a terminal autocomplete engine.
+The user message is a PARTIAL command typed in a terminal${osInfo ? ` (OS: ${osInfo})` : ''}. Complete it.
+
+Rules:
+- The completed command MUST start with exactly what the user typed
+- Prefer common commands and flags over obscure ones
+- Never suggest destructive commands (rm -rf /, mkfs, dd to disk)
+- If unsure, return: NONE
+- Format (two lines only, no other text):
+  CMD: <complete command>
+  EXP: <brief purpose>
+- ${langInstruction}
+
+Example:
+Input: git lo
+CMD: git log --oneline -10
+EXP: ${exampleExp}`
+  }
+
+  /**
+   * Parse the combined AI suggest response into command and explanation.
+   * Expected format:
+   *   CMD: <command>
+   *   EXP: <explanation>
+   */
+  private parseAiSuggestResponse(response: string, language: 'zh' | 'en'): { command: string; explanation: string } | null {
+    const text = response.trim()
+    if (!text || text.toUpperCase() === 'NONE') {
+      return null
+    }
+
+    const cmdMatch = text.match(/^CMD:\s*(.+)/im)
+    const expMatch = text.match(/^EXP:\s*(.+)/im)
+
+    if (!cmdMatch) {
+      // Fallback: treat entire response as command (backward compat with simple models)
+      // Strip any leftover label prefixes that slipped through
+      const cleaned = this.extractCommandFromResponse(text.replace(/^(?:cmd|exp):\s*/gim, '').trim())
+      if (!cleaned || cleaned.toUpperCase() === 'NONE') {
+        return null
+      }
+      return {
+        command: cleaned,
+        explanation: this.limitAiSuggestExplanation(this.getAiSuggestExplanationFallback(cleaned, language), language)
+      }
+    }
+
+    const command = this.extractCommandFromResponse(cmdMatch[1])
+    if (!command || command.toUpperCase() === 'NONE') {
+      return null
+    }
+
+    let explanation = expMatch ? expMatch[1].trim().replace(/^["']|["']$/g, '') : ''
+    if (!explanation) {
+      explanation = this.getAiSuggestExplanationFallback(command, language)
+    }
+
+    return {
+      command,
+      explanation: this.limitAiSuggestExplanation(explanation, language)
+    }
+  }
+
+  private resolveAiSuggestExplanationLanguage(language?: string): 'zh' | 'en' {
+    return language?.toLowerCase().startsWith('zh') ? 'zh' : 'en'
+  }
+
+  private getAiSuggestExplanationFallback(_command: string, language: 'zh' | 'en'): string {
+    if (language === 'zh') {
+      return 'AI 建议'
+    }
+    return 'AI suggested'
+  }
+
+  private limitAiSuggestExplanation(explanation: string, language: 'zh' | 'en'): string {
+    const normalized = explanation.replace(/\s+/g, ' ').trim()
+    const maxChars = language === 'zh' ? 20 : 60
+    if (normalized.length <= maxChars) {
+      return normalized
+    }
+    return `${normalized.slice(0, maxChars).trimEnd()}...`
+  }
+
+  private getFixedAiSuggestModelId(): string {
+    return isChineseEdition() ? AI_SUGGEST_MODEL_CN : AI_SUGGEST_MODEL_GLOBAL
+  }
+
+  /**
+   * Build system prompt for command generation
+   */
+  private buildCommandGenerationPrompt(context?): string {
+    // Convert context object to string
+    let contextString = 'No context provided'
+    if (context && typeof context === 'object') {
+      contextString = Object.entries(context)
+        .map(([key, value]) => `${key}: ${value}`)
+        .join('\n')
+    } else if (context) {
+      contextString = String(context)
+    }
+
+    return `You are a command-line expert assistant. Your job is to convert natural language instructions into precise, executable terminal commands.
+
+Context:
+${contextString}
+
+Guidelines:
+1. Generate ONLY the terminal command, without any explanation or markdown formatting
+2. The command should be safe and commonly used
+3. Use appropriate flags and options for the given OS and shell
+4. If the instruction is unclear, provide the most reasonable interpretation
+5. For complex operations, prefer single commands or simple pipelines
+6. Use absolute paths when necessary for clarity
+
+Examples:
+Input: "list all javascript files"
+Output: find . -name "*.js" -type f
+
+Input: "show disk usage"
+Output: df -h
+
+Input: "find large files over 100MB"
+Output: find . -type f -size +100M -exec ls -lh {} \\;
+
+Now, convert the following instruction to a command:`
+  }
+
+  /**
+   * Extract clean command from AI response
+   * Removes markdown formatting and extra text
+   */
+  private extractCommandFromResponse(response: string): string {
+    let command = response.trim()
+
+    // Remove markdown code blocks
+    command = command.replace(/^```(?:bash|sh|shell)?\s*\n?/gm, '')
+    command = command.replace(/```\s*$/gm, '')
+
+    // Remove common prefixes
+    command = command.replace(/^(?:Command:|Output:|Result:)\s*/i, '')
+
+    // Take only the first line if multiple lines
+    const lines = command.split('\n').filter((line) => line.trim())
+    if (lines.length > 0) {
+      command = lines[0].trim()
+    }
+
+    // Remove leading/trailing quotes
+    command = command.replace(/^["']|["']$/g, '')
+
+    return command
+  }
+
+  private formatUserRulesToInstructions(
+    userRules?: Array<{
+      id: string
+      content: string
+      enabled: boolean
+    }>
+  ): string | undefined {
+    if (!userRules || userRules.length === 0) {
+      return undefined
+    }
+
+    // Filter enabled rules and format them as numbered list
+    const enabledRules = userRules.filter((rule) => rule.enabled && rule.content.trim())
+    if (enabledRules.length === 0) {
+      return undefined
+    }
+
+    return enabledRules.map((rule, index) => `${index + 1}. ${rule.content.trim()}`).join('\n\n')
+  }
+}
+
+function removeSensitiveKeys(obj: any): any {
+  if (Array.isArray(obj)) {
+    return obj.map(removeSensitiveKeys)
+  } else if (obj && typeof obj === 'object') {
+    const newObj: any = {}
+    for (const key of Object.keys(obj)) {
+      if (
+        key.toLowerCase().includes('accesskey') ||
+        key.toLowerCase().includes('secretkey') ||
+        key.toLowerCase().includes('apikey') ||
+        key.toLowerCase().includes('endpoint') ||
+        key.toLowerCase().includes('awsprofile')
+      ) {
+        newObj[key] = undefined // or '***'
+      } else {
+        newObj[key] = removeSensitiveKeys(obj[key])
+      }
+    }
+    return newObj
+  }
+  return obj
+}
+
+async function updateTaskHosts(taskId: string, hosts: Host[]) {
+  const metadata = await getTaskMetadata(taskId)
+  metadata.hosts = hosts || []
+
+  await saveTaskMetadata(taskId, metadata)
+}

@@ -1,0 +1,36 @@
+# CodeRabbit AI Configuration for Chaterm
+# This file configures CodeRabbit AI to align with project standards
+
+language: en
+
+reviews:
+  high_level_summary: true
+  review_status: true
+
+  walkthrough:
+    sequence_diagrams: false
+
+  path_filters:
+    - '!**/node_modules/**'
+    - '!**/dist/**'
+    - '!**/out/**'
+    - '!**/coverage/**'
+    - '!**/*.d.ts'
+    - '!**/package-lock.json'
+    - '!**/.git/**'
+    - '!**/build/**'
+    - '!**/playwright-report/**'
+    - '!**/test-results/**'
+
+  disable:
+    - 'dependencies'
+    - 'docker'
+
+  collapse_when_outdated: true
+  collapse_when_resolved: true
+  max_comments_per_review: 50
+  max_files_per_review: 100
+
+chat:
+  enabled: true
+  auto_reply: false

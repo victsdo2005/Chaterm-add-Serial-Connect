@@ -1,0 +1,392 @@
+/* eslint-disable no-console */
+const Database = require('better-sqlite3')
+const fs = require('fs')
+const path = require('path')
+
+// 初始化数据库文件名，固定在当前文件目录
+const dbPath = path.join(__dirname, 'init_chaterm.db')
+
+// 如果数据库已存在则删除，保证初始化版本干净
+if (fs.existsSync(dbPath)) {
+  fs.unlinkSync(dbPath)
+  console.log(`已删除旧的 ${dbPath}`)
+}
+
+// 创建物理文件并连接
+const db = new Database(dbPath)
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS t_assets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,             -- 模型ID
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,    -- 创建时间
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,    -- 更新时间
+  label TEXT,                                       -- 名称
+  asset_ip TEXT,                                    -- 服务器IP
+  group_name TEXT,                                  -- 分组名称
+  uuid TEXT UNIQUE,                                 -- 唯一ID
+  auth_type TEXT,                                   -- 认证方式
+  port INTEGER,                                     -- 端口
+  username TEXT,                                    -- 用户名
+  password TEXT,                                    -- 密码
+  key_chain_id INTEGER,                             -- 密钥链ID
+  favorite  INTEGER DEFAULT 2,                     -- 是否收藏，默认值2表示未收藏
+  asset_type TEXT,                                  -- 类型
+  need_proxy INTEGER DEFAULT 0,                     -- 是否需要代理，默认值0表示不需要
+  proxy_name TEXT,                                  -- 代理名称
+  version INTEGER NOT NULL DEFAULT 1                -- 版本号
+);
+
+CREATE TABLE IF NOT EXISTS t_asset_chains (
+  key_chain_id INTEGER PRIMARY KEY AUTOINCREMENT,   -- 秘钥ID
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,    -- 创建时间
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,    -- 更新时间
+  chain_name TEXT,                                  -- 秘钥链名称
+  chain_type TEXT,                                  -- 秘钥链类型
+  chain_private_key TEXT,                           -- 私钥
+  chain_public_key TEXT,                            -- 公钥
+  passphrase TEXT,                                  -- 密码
+  uuid TEXT UNIQUE,                                 -- 唯一ID
+  version INTEGER NOT NULL DEFAULT 1                -- 版本号
+);
+
+CREATE TABLE IF NOT EXISTS agent_api_conversation_history_v1 (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,                -- 新增自增主键
+  created_at INTEGER DEFAULT (strftime('%s', 'now')),  -- 写入时间戳
+  task_id TEXT NOT NULL,                               -- 会话任务ID
+  ts INTEGER NOT NULL,                                 -- 消息时间戳
+  role TEXT NOT NULL,                                  -- 角色
+  content_type TEXT,                                   -- 内容类型
+  content_data TEXT,                                   -- 内容数据
+  tool_use_id TEXT,                                    -- 工具使用ID
+  sequence_order INTEGER                               -- 消息顺序
+);
+CREATE INDEX IF NOT EXISTS idx_task_time ON agent_api_conversation_history_v1(task_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_time_desc ON agent_api_conversation_history_v1(ts DESC);
+
+CREATE TABLE IF NOT EXISTS agent_ui_messages_v1 (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,                -- 新增自增主键
+  task_id TEXT NOT NULL,                               -- 会话任务ID
+  created_at INTEGER DEFAULT (strftime('%s', 'now')),  -- 写入时间戳
+  ts INTEGER NOT NULL,                                 -- 消息时间戳
+  type TEXT NOT NULL,                                  -- 消息类型
+  ask_type TEXT,
+  say_type TEXT,
+  text TEXT,
+  reasoning TEXT,
+  images TEXT,
+  partial INTEGER DEFAULT 0,
+  last_checkpoint_hash TEXT,
+  is_checkpoint_checked_out INTEGER DEFAULT 0,
+  is_operation_outside_workspace INTEGER DEFAULT 0,
+  conversation_history_index INTEGER,
+  conversation_history_deleted_range TEXT,
+  mcp_tool_call_data TEXT                              -- MCP工具调用信息(JSON格式)
+);
+CREATE INDEX IF NOT EXISTS idx_task_ts ON agent_ui_messages_v1(task_id, ts ASC);
+CREATE INDEX IF NOT EXISTS idx_ts_desc ON agent_ui_messages_v1(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_created_at ON agent_ui_messages_v1(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS agent_task_metadata_v1 (
+  task_id TEXT PRIMARY KEY,                          -- 任务ID (主键)
+  created_at INTEGER DEFAULT (strftime('%s', 'now')), -- 写入时间戳
+  updated_at INTEGER DEFAULT (strftime('%s', 'now')), -- 更新时间戳
+  files_in_context TEXT,                             -- 文件上下文元数据 (JSON格式)
+  model_usage TEXT,                                  -- 模型使用记录 (JSON格式)
+  hosts TEXT,                                        -- 主机信息 (JSON格式)
+  todos TEXT,                                        -- 待办事项 (JSON格式)
+  title TEXT,                                        -- 任务标题
+  favorite INTEGER DEFAULT 0                         -- 收藏状态
+);
+CREATE INDEX IF NOT EXISTS idx_created_at_meta ON agent_task_metadata_v1(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_updated_at_meta ON agent_task_metadata_v1(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS agent_context_history_v1 (
+  task_id TEXT PRIMARY KEY,                         -- 任务ID (主键)
+  created_at INTEGER DEFAULT (strftime('%s', 'now')), -- 创建时间戳
+  updated_at INTEGER DEFAULT (strftime('%s', 'now')), -- 更新时间戳
+  context_history_data TEXT NOT NULL               -- 完整上下文历史 (JSON格式)
+);
+CREATE INDEX IF NOT EXISTS idx_context_created_at ON agent_context_history_v1(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_context_updated_at ON agent_context_history_v1(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS user_snippet_v1 (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,                -- 新增自增主键
+  uuid TEXT UNIQUE,                                     -- 唯一ID
+  created_at INTEGER DEFAULT (strftime('%s', 'now')),  -- 写入时间戳
+  updated_at INTEGER DEFAULT (strftime('%s', 'now')),  -- 更新时间戳
+  snippet_name TEXT NOT NULL,                           -- 快捷命令名称
+  snippet_content TEXT NOT NULL,                        -- 快捷命令内容
+  group_uuid TEXT,                                      -- 分组UUID
+  sort_order INTEGER DEFAULT 0                          -- 排序字段
+);
+
+CREATE TABLE IF NOT EXISTS user_snippet_groups_v1 (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  uuid TEXT UNIQUE NOT NULL,                            -- 分组UUID
+  group_name TEXT NOT NULL,
+  created_at INTEGER DEFAULT (strftime('%s', 'now')),
+  updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+);
+CREATE TABLE IF NOT EXISTS t_organization_assets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,             -- 资源ID
+  organization_uuid TEXT,                           -- 组织UUID
+  uuid TEXT,                                        -- 资源UUID
+  hostname TEXT,                                    -- 主机名
+  host TEXT,                                        -- 主机IP
+  jump_server_type TEXT,                            -- 跳板机类型
+  favorite INTEGER DEFAULT 2,                       -- 是否收藏
+  comment TEXT,                                     -- 自定义备注
+  bastion_comment TEXT,                             -- 堡垒机备注
+  data_source TEXT DEFAULT 'refresh',               -- 数据来源: manual/refresh
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,    -- 创建时间
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP     -- 更新时间
+);
+
+-- 自定义文件夹表
+CREATE TABLE IF NOT EXISTS t_custom_folders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,             -- 文件夹ID
+  uuid TEXT UNIQUE,                                 -- 文件夹UUID
+  name TEXT NOT NULL,                               -- 文件夹名称
+  description TEXT,                                 -- 文件夹描述
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,    -- 创建时间
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP     -- 更新时间
+);
+
+-- 资产文件夹关联表
+CREATE TABLE IF NOT EXISTS t_asset_folder_mapping (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,             -- 关联ID
+  folder_uuid TEXT NOT NULL,                        -- 文件夹UUID
+  organization_uuid TEXT NOT NULL,                  -- 组织UUID
+  asset_host TEXT NOT NULL,                         -- 资产主机IP
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,    -- 创建时间
+  UNIQUE(folder_uuid, organization_uuid, asset_host) -- 唯一约束
+);
+
+CREATE TABLE IF NOT EXISTS change_log (
+        id TEXT PRIMARY KEY,
+        table_name TEXT NOT NULL,
+        record_uuid TEXT NOT NULL,
+        operation_type TEXT NOT NULL,
+        change_data TEXT,
+        before_data TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        sync_status TEXT DEFAULT 'pending',
+        retry_count INTEGER DEFAULT 0,
+        error_message TEXT
+      );
+CREATE TABLE IF NOT EXISTS sync_status (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        table_name TEXT NOT NULL,
+        last_sync_time TEXT,
+        updated_at TEXT DEFAULT (datetime('now'))
+      );
+
+CREATE TABLE IF NOT EXISTS sync_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT
+      );
+
+CREATE TABLE IF NOT EXISTS sync_metadata (
+          table_name TEXT PRIMARY KEY,
+          last_sync_time TEXT,
+          last_sync_version INTEGER,
+          server_last_modified TEXT,
+          local_last_modified TEXT,
+          sync_status TEXT,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+CREATE TABLE IF NOT EXISTS sync_conflicts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_name TEXT,
+                record_uuid TEXT,
+                conflict_reason TEXT,
+                local_data TEXT,
+                server_data TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+
+-- 创建同步相关表的性能优化索引
+CREATE INDEX IF NOT EXISTS idx_change_log_sync_status ON change_log(sync_status);
+CREATE INDEX IF NOT EXISTS idx_change_log_table_name ON change_log(table_name);
+CREATE INDEX IF NOT EXISTS idx_change_log_created_at ON change_log(created_at);
+CREATE INDEX IF NOT EXISTS idx_sync_status_table_name ON sync_status(table_name);
+
+-- IndexedDB 迁移相关表
+-- 说明:
+--   - indexdb_migration_status: 迁移完成后可删除
+--   - t_aliases: 如果持续使用命令别名功能,保留此表
+--   - key_value_store: 如果持续使用键值对存储,保留此表
+-- 表1: t_aliases (命令别名表)
+CREATE TABLE IF NOT EXISTS t_aliases (
+  id TEXT PRIMARY KEY,
+  alias TEXT UNIQUE NOT NULL,
+  command TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_t_aliases_created_at ON t_aliases(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_t_aliases_alias ON t_aliases(alias);
+
+-- 表2: key_value_store (通用键值对存储表)
+CREATE TABLE IF NOT EXISTS key_value_store (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  created_at INTEGER DEFAULT (strftime('%s', 'now')),
+  updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_kv_updated_at ON key_value_store(updated_at DESC);
+
+-- 表3: indexdb_migration_status (迁移状态表)
+CREATE TABLE IF NOT EXISTS indexdb_migration_status (
+  data_source TEXT PRIMARY KEY,
+  migrated INTEGER DEFAULT 0,
+  migrated_at INTEGER,
+  record_count INTEGER,
+  error_message TEXT
+);
+
+-- Chat Sync V2: per-task sync state tracking
+CREATE TABLE IF NOT EXISTS agent_chat_sync_task_state (
+  task_id TEXT PRIMARY KEY,
+  local_change_seq INTEGER DEFAULT 0,
+  acked_local_change_seq INTEGER DEFAULT 0,
+  last_uploaded_hash TEXT,
+  last_uploaded_hash_version INTEGER DEFAULT 0,
+  last_applied_hash TEXT,
+  last_applied_hash_version INTEGER DEFAULT 0,
+  last_server_revision INTEGER DEFAULT 0,
+  pending_upload INTEGER DEFAULT 0,
+  is_deleted INTEGER DEFAULT 0,
+  remote_deleted INTEGER DEFAULT 0,
+  sync_blocked_reason TEXT,
+  last_sync_status TEXT,
+  last_error TEXT,
+  updated_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_task_state_pending ON agent_chat_sync_task_state(pending_upload, remote_deleted, is_deleted);
+
+-- 数据库资产表 (Database assets: MySQL / PostgreSQL connections and metadata)
+CREATE TABLE IF NOT EXISTS db_assets (
+  id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  group_id TEXT,
+  group_name TEXT,
+  db_type TEXT NOT NULL,
+  environment TEXT,
+  host TEXT NOT NULL,
+  port INTEGER NOT NULL,
+  database_name TEXT,
+  schema_name TEXT,
+  auth_type TEXT NOT NULL DEFAULT 'password',
+  username TEXT,
+  password_ciphertext TEXT,
+  ssl_mode TEXT,
+  jdbc_url TEXT,
+  driver_name TEXT,
+  driver_class_name TEXT,
+  ssh_tunnel_enabled INTEGER DEFAULT 0,
+  ssh_tunnel_asset_uuid TEXT,
+  options_json TEXT,
+  tags_json TEXT,
+  status TEXT DEFAULT 'idle',
+  last_connected_at TEXT,
+  last_tested_at TEXT,
+  last_error_code TEXT,
+  last_error_message TEXT,
+  sort_order INTEGER DEFAULT 0,
+  deleted_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_db_assets_user_id ON db_assets(user_id);
+CREATE INDEX IF NOT EXISTS idx_db_assets_type ON db_assets(db_type);
+CREATE INDEX IF NOT EXISTS idx_db_assets_group_name ON db_assets(group_name);
+CREATE INDEX IF NOT EXISTS idx_db_assets_group_id ON db_assets(group_id);
+CREATE INDEX IF NOT EXISTS idx_db_assets_status ON db_assets(status);
+CREATE INDEX IF NOT EXISTS idx_db_assets_user_deleted ON db_assets(user_id, deleted_at);
+
+-- 数据库资产分组表 (Database asset groups: tree-structured grouping)
+CREATE TABLE IF NOT EXISTS db_asset_groups (
+  id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  parent_id TEXT,
+  sort_order INTEGER DEFAULT 0,
+  deleted_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_db_asset_groups_user_id ON db_asset_groups(user_id);
+CREATE INDEX IF NOT EXISTS idx_db_asset_groups_parent_id ON db_asset_groups(parent_id);
+CREATE INDEX IF NOT EXISTS idx_db_asset_groups_user_deleted ON db_asset_groups(user_id, deleted_at);
+
+-- K8s 集群表
+CREATE TABLE IF NOT EXISTS k8s_clusters (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  kubeconfig_path TEXT,
+  kubeconfig_content TEXT,
+  context_name TEXT NOT NULL,
+  server_url TEXT NOT NULL,
+  auth_type TEXT DEFAULT 'kubeconfig',
+  is_active INTEGER DEFAULT 0,
+  connection_status TEXT DEFAULT 'disconnected',
+  auto_connect INTEGER DEFAULT 0,
+  default_namespace TEXT DEFAULT 'default',
+  source_type TEXT DEFAULT 'local',              -- 来源类型: local/jumpserver
+  bastion_uuid TEXT,                             -- 堡垒机UUID
+  bastion_asset_address TEXT,                    -- 堡垒机资产地址
+  bastion_asset_name TEXT,                       -- 堡垒机资产名称
+  bastion_asset_id_last INTEGER,                 -- 堡垒机资产最后ID
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_k8s_clusters_context_name ON k8s_clusters(context_name);
+CREATE INDEX IF NOT EXISTS idx_k8s_clusters_is_active ON k8s_clusters(is_active);
+CREATE INDEX IF NOT EXISTS idx_k8s_clusters_source_type ON k8s_clusters(source_type);
+CREATE INDEX IF NOT EXISTS idx_k8s_clusters_bastion_identity ON k8s_clusters(bastion_uuid, bastion_asset_address, bastion_asset_name);
+
+-- K8s 终端会话表
+CREATE TABLE IF NOT EXISTS k8s_terminal_sessions (
+  id TEXT PRIMARY KEY,
+  cluster_id TEXT NOT NULL,
+  name TEXT,
+  namespace TEXT DEFAULT 'default',
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY (cluster_id) REFERENCES k8s_clusters(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_k8s_terminal_sessions_cluster_id ON k8s_terminal_sessions(cluster_id);
+
+`)
+
+console.log('数据库创建成功，表已创建')
+
+// 查询数据以验证
+const count = db.prepare('SELECT COUNT(*) as count FROM t_assets').get()
+console.log(`数据库中共有 ${count.count} 条命令记录`)
+
+// 验证新创建的对话历史表
+const conversationCount = db.prepare('SELECT COUNT(*) as count FROM agent_api_conversation_history_v1').get()
+console.log(`对话历史表中共有 ${conversationCount.count} 条记录`)
+
+// 验证新创建的UI消息表
+const uiMessageCount = db.prepare('SELECT COUNT(*) as count FROM agent_ui_messages_v1').get()
+console.log(`UI消息表中共有 ${uiMessageCount.count} 条记录`)
+
+// 验证新创建的任务元数据表
+const metadataCount = db.prepare('SELECT COUNT(*) as count FROM agent_task_metadata_v1').get()
+console.log(`任务元数据表中共有 ${metadataCount.count} 条记录`)
+
+// 验证新创建的上下文历史表
+const contextHistoryCount = db.prepare('SELECT COUNT(*) as count FROM agent_context_history_v1').get()
+console.log(`上下文历史表中共有 ${contextHistoryCount.count} 条记录`)
+
+// 验证新创建的快捷命令表
+const snippetCount = db.prepare('SELECT COUNT(*) as count FROM user_snippet_v1').get()
+console.log(`快捷命令表中共有 ${snippetCount.count} 条记录`)
+
+// 关闭数据库连接
+db.close()

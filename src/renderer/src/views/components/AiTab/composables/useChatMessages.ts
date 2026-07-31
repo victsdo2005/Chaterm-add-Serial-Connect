@@ -1,0 +1,925 @@
+import { ref, onMounted, watch, isProxy, toRaw } from 'vue'
+import { v4 as uuidv4 } from 'uuid'
+import { notification } from 'ant-design-vue'
+import eventBus from '@/utils/eventBus'
+
+import type { ChatMessage, Host } from '../types'
+import type { Todo } from '@/types/todo'
+import type { ChatTab } from './useSessionState'
+import type { ExtensionMessage } from '@shared/ExtensionMessage'
+import type { ContentPart, ToolResultPayload, WebviewMessage } from '@shared/WebviewMessage'
+import { createNewMessage, parseMessageContent, pickHostInfo, isSwitchAssetType } from '../utils'
+import { Notice } from '@/views/components/Notice'
+import { useSessionState } from './useSessionState'
+import { getGlobalState, updateGlobalState } from '@renderer/agent/storage/state'
+import i18n from '@/locales'
+import { AI_TAB_DEFAULT_WORKSPACE, type AiTabWorkspace } from '../workspace'
+const logger = createRendererLogger('ai.chatMessages')
+const { t } = i18n.global
+let globalIpcListenerInitialized = false
+const STREAM_RENDER_THROTTLE_MS = 32
+const pendingPartialMessages = new Map<string, ExtensionMessage>()
+const pendingPartialFlushTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+const clearPendingPartialFlushTimer = (tabId: string) => {
+  const timer = pendingPartialFlushTimers.get(tabId)
+  if (timer) {
+    clearTimeout(timer)
+    pendingPartialFlushTimers.delete(tabId)
+  }
+}
+
+const takePendingPartialMessage = (tabId: string): ExtensionMessage | undefined => {
+  const pending = pendingPartialMessages.get(tabId)
+  pendingPartialMessages.delete(tabId)
+  return pending
+}
+
+/**
+ * Per-AiTab context that must be threaded into outgoing Task messages when
+ * the AiTab is mounted in the Database workspace (task #18 Stage 1).
+ *
+ * Shape mirrors docs/database_ai.md §9.2 `dbContext`; the canonical type
+ * lives in `@common/db-ai-types` but is intentionally duplicated here as
+ * a plain object literal so useChatMessages does not grow a hard dep on
+ * the main-side `@shared` alias (kept testable in isolation).
+ */
+export interface AiTabDbContext {
+  assetId: string
+  dbType: 'mysql' | 'postgresql' | 'sqlite' | 'oracle'
+  databaseName?: string
+  schemaName?: string
+  assetName?: string
+}
+
+/**
+ * Composable for chat message core logic
+ * Handles message sending, receiving, display and other core functionalities
+ */
+export function useChatMessages(
+  scrollToBottom: (force?: boolean) => void,
+  clearTodoState: (messages: ChatMessage[]) => void,
+  markLatestMessageWithTodoUpdate: (messages: ChatMessage[], todos: Todo[]) => void,
+  currentTodos: any,
+  checkModelConfig: () => Promise<{ success: boolean; message?: string; description?: string }>,
+  workspaceContext: {
+    /**
+     * Workspace identifier. Defaults to `'terminal'`; when `'database'`
+     * the renderer stamps `workspace` + `dbContext` onto every outgoing
+     * Task message so the main-process Task constructor can route it to
+     * the DB ChatBot track (see #11 for the main-side handling).
+     * Stage 1 only adds the fields to the payload; `#11` consumes them.
+     */
+    workspace?: AiTabWorkspace
+    dbContext?: () => AiTabDbContext | null
+  } = {}
+) {
+  const { chatTabs, currentChatId, currentTab, currentSession, hosts, chatTypeValue, chatInputParts, messageFeedbacks } = useSessionState()
+  const workspace: AiTabWorkspace = workspaceContext.workspace ?? AI_TAB_DEFAULT_WORKSPACE
+  const resolveDbContext = workspaceContext.dbContext
+
+  const markdownRendererRefs = ref<Array<{ setThinkingLoading: (loading: boolean) => void }>>([])
+
+  const isCurrentChatMessage = ref(true)
+
+  // Clear refs when tab switches to avoid index conflicts
+  watch(currentChatId, () => {
+    markdownRendererRefs.value = []
+  })
+
+  const setMarkdownRendererRef = (el: any, index: number) => {
+    if (el) {
+      markdownRendererRefs.value[index] = el
+    }
+  }
+
+  const formatParamValue = (value: unknown): string => {
+    if (value === null) return 'null'
+    if (value === undefined) return 'undefined'
+    if (typeof value === 'string') return value
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+    if (typeof value === 'object') {
+      try {
+        return JSON.stringify(value, null, 2)
+      } catch {
+        return String(value)
+      }
+    }
+    return String(value)
+  }
+
+  /**
+   * Clean up partial command messages
+   * Removes messages with partial=true and ask='command'
+   */
+  const cleanupPartialCommandMessages = (chatHistory: ChatMessage[]) => {
+    for (let i = chatHistory.length - 1; i >= 0; i--) {
+      const message = chatHistory[i]
+      if (
+        message.role === 'assistant' &&
+        message.partial === true &&
+        message.type === 'ask' &&
+        (message.ask === 'command' || message.ask === 'db_sql_approval')
+      ) {
+        logger.info('Removing partial command message', { data: { id: message.id, ts: message.ts } })
+        chatHistory.splice(i, 1)
+        break
+      }
+    }
+  }
+
+  const isLocalHost = (ip: string): boolean => {
+    return ip === '127.0.0.1' || ip === 'localhost' || ip === '::1'
+  }
+
+  const buildPlainTextFromParts = (parts: ContentPart[]): string => {
+    return parts
+      .map((part) => {
+        if (part.type === 'text') return part.text
+        if (part.type === 'image') return '[image]'
+        if (part.chipType === 'doc') {
+          return `@${part.ref.absPath || ''}`
+        }
+        if (part.chipType === 'command') {
+          return part.ref.command
+        }
+        if (part.chipType === 'skill') {
+          return `@skill:${part.ref.skillName}`
+        }
+
+        const taskName = part.ref.title || ''
+        return taskName ? `@${part.ref.taskId}_${taskName}` : `@${part.ref.taskId}`
+      })
+      .join('')
+  }
+
+  /**
+   * Validate the DB context for a new database-workspace task.
+   * Returns null when valid, or an i18n key + optional params when invalid.
+   * Only applies when workspace === 'database'; always returns null otherwise.
+   */
+  const validateDbContextForNewTask = (): { key: string; params?: Record<string, string> } | null => {
+    if (workspace !== 'database') return null
+    const ctx = resolveDbContext?.()
+    if (!ctx || !ctx.assetId || !ctx.dbType) return { key: 'ai.dbContextRequired' }
+    if (!ctx.databaseName) return { key: 'ai.dbContextMissingField', params: { field: t('common.database') } }
+    return null
+  }
+
+  const sendMessageToMain = async (
+    userContent: string,
+    sendType: string,
+    tabId?: string,
+    truncateAtMessageTs?: number,
+    contentParts?: ContentPart[],
+    overrideHosts?: Host[],
+    toolResult?: ToolResultPayload
+  ): Promise<'BLOCKED' | undefined> => {
+    try {
+      const targetTab = tabId ? chatTabs.value.find((tab) => tab.id === tabId) : currentTab.value
+
+      if (!targetTab || !targetTab.session) {
+        return
+      }
+
+      const session = targetTab.session
+      // Use overrideHosts if provided, otherwise use targetTab.hosts
+      const targetHosts = overrideHosts || targetTab.hosts || []
+
+      const hostsArray = targetHosts.map((h) => ({
+        host: h.host,
+        uuid: h.uuid,
+        connection: h.connection,
+        ...(h.assetType ? { assetType: h.assetType } : {})
+      }))
+
+      let message: WebviewMessage
+      if (session.chatHistory.length === 0) {
+        // Guard: reject DB workspace new-task messages that lack a valid
+        // dbContext. This covers all callers of sendMessageWithContent
+        // (edit-resend, event-bus, summary, etc.) not just the primary
+        // sendMessage path, which has its own early-return check.
+        const dbValidation = validateDbContextForNewTask()
+        if (dbValidation) {
+          logger.warn('blocked newTask: invalid db context for database workspace', {
+            event: 'chat.newTask.db_context_invalid'
+          })
+          return 'BLOCKED'
+        }
+        message = {
+          type: 'newTask',
+          askResponse: 'messageResponse',
+          text: userContent,
+          hosts: hostsArray,
+          taskId: tabId || currentChatId.value,
+          contentParts
+        }
+      } else if (sendType === 'commandSend') {
+        message = {
+          type: 'askResponse',
+          askResponse: 'yesButtonClicked',
+          ...(toolResult ? { toolResult } : { text: userContent }),
+          hosts: hostsArray,
+          contentParts
+        }
+      } else {
+        message = {
+          type: 'askResponse',
+          askResponse: 'messageResponse',
+          text: userContent,
+          hosts: hostsArray,
+          contentParts,
+          truncateAtMessageTs
+        }
+      }
+
+      const messageWithTabId: WebviewMessage = {
+        ...message,
+        tabId: tabId || currentChatId.value,
+        taskId: tabId || currentChatId.value,
+        modelName: targetTab.modelValue || undefined
+      }
+
+      // Stage 1 of #18: when the AiTab is mounted in the Database
+      // workspace, stamp the outgoing payload with `workspace` + optional
+      // `dbContext` so the main-process Task constructor can route it to
+      // the DB ChatBot track. Fields are additive — WebviewMessage uses
+      // a zod passthrough schema and the main side (#11) adds the typed
+      // fields when that task lands. For `workspace='terminal'` (the
+      // default) we intentionally do NOT emit the `workspace` field so
+      // bytes on the wire stay identical to pre-#18 for server Agent.
+      if (workspace === 'database') {
+        // Cast through unknown so we can attach fields that #11 will
+        // formalise on WebviewMessage. zod passthrough preserves them.
+        const augmented = messageWithTabId as unknown as WebviewMessage & {
+          workspace?: AiTabWorkspace
+          dbContext?: AiTabDbContext
+        }
+        augmented.workspace = 'database'
+        const ctx = resolveDbContext?.()
+        if (ctx) {
+          augmented.dbContext = { ...ctx }
+        }
+      }
+
+      logger.debug('Send message to main process', { data: messageWithTabId })
+      await window.api.sendToMain(messageWithTabId)
+      // console.log('Main process response:', response)
+      return undefined
+    } catch (error) {
+      logger.error('Failed to send message to main process', { error: error })
+      return undefined
+    }
+  }
+
+  const sendMessage = async (sendType: string) => {
+    const checkModelConfigResult = await checkModelConfig()
+    if (!checkModelConfigResult.success) {
+      const messageKey = checkModelConfigResult.message || 'user.checkModelConfigFailMessage'
+      const descriptionKey = checkModelConfigResult.description || 'user.checkModelConfigFailDescription'
+
+      notification.error({
+        message: t(messageKey),
+        description: t(descriptionKey),
+        duration: 5
+      })
+
+      // Open model settings after a short delay
+      setTimeout(() => {
+        eventBus.emit('openUserTab', 'userConfig')
+        setTimeout(() => {
+          eventBus.emit('switchToModelSettingsTab')
+        }, 200)
+      }, 500)
+
+      return 'SEND_ERROR'
+    }
+
+    const contentParts = chatInputParts.value.length > 0 ? [...chatInputParts.value] : []
+    const hasChips = contentParts.length > 0 && contentParts.some((part) => part.type === 'chip' || part.type === 'image')
+
+    const userContent = buildPlainTextFromParts(contentParts).trim()
+    if (userContent === '' && !hasChips) {
+      notification.error({
+        message: t('ai.sendContentError'),
+        description: t('ai.sendContentEmpty'),
+        duration: 3
+      })
+      return 'SEND_ERROR'
+    }
+
+    if (!userContent && !hasChips) return
+
+    // Validate database context before creating a DB workspace task.
+    const dbValidationError = validateDbContextForNewTask()
+    if (dbValidationError) {
+      const desc = dbValidationError.params ? t(dbValidationError.key, dbValidationError.params as Record<string, unknown>) : t(dbValidationError.key)
+      notification.error({
+        message: t('ai.sendContentError'),
+        description: desc,
+        duration: 4
+      })
+      return 'SEND_ERROR'
+    }
+
+    if (chatTypeValue.value === 'agent' && hosts.value.some((host) => isSwitchAssetType(host.assetType))) {
+      chatTypeValue.value = 'cmd'
+      Notice.open({
+        type: 'info',
+        description: t('ai.switchNotSupportAgent'),
+        placement: 'bottomRight'
+      })
+      return 'SEND_ERROR'
+    }
+
+    // if (hosts.value.length === 0 && chatTypeValue.value !== 'chat') {
+    //   notification.error({
+    //     message: t('ai.getAssetInfoFailed'),
+    //     description: t('ai.pleaseConnectAsset'),
+    //     duration: 3
+    //   })
+    //   return 'ASSET_ERROR'
+    // }
+
+    if (sendType === 'send' && currentTodos.value.length > 0) {
+      if (currentSession.value) {
+        clearTodoState(currentSession.value.chatHistory)
+      }
+    }
+
+    // Clear draft input only after validations pass to avoid losing content on failures.
+    chatInputParts.value = []
+
+    return await sendMessageWithContent(userContent, sendType, undefined, undefined, contentParts)
+  }
+
+  const sendMessageWithContent = async (
+    userContent: string,
+    sendType: string,
+    tabId?: string,
+    truncateAtMessageTs?: number,
+    contentParts?: ContentPart[],
+    overrideHosts?: Host[],
+    toolResult?: ToolResultPayload
+  ) => {
+    const targetTab = tabId ? chatTabs.value.find((tab: ChatTab) => tab.id === tabId) : currentTab.value
+
+    if (!targetTab || !targetTab.session) {
+      return
+    }
+
+    const session = targetTab.session
+    session.isCancelled = false
+    // Strip Vue proxies before IPC to avoid structured clone failures.
+    contentParts = contentParts ? contentParts.map((part) => (isProxy(part) ? (toRaw(part) as ContentPart) : part)) : undefined
+    const sendResult = await sendMessageToMain(userContent, sendType, tabId, truncateAtMessageTs, contentParts, overrideHosts, toolResult)
+    if (sendResult === 'BLOCKED') {
+      return
+    }
+
+    const userMessage: ChatMessage = {
+      id: uuidv4(),
+      role: 'user',
+      content: userContent,
+      contentParts,
+      type: 'message',
+      ask: '',
+      say: '',
+      ts: 0
+    }
+
+    // Set hosts: use overrideHosts if provided, otherwise use targetTab.hosts
+    if (overrideHosts) {
+      userMessage.hosts = overrideHosts
+    } else if (targetTab.hosts && targetTab.hosts.length > 0) {
+      userMessage.hosts = targetTab.hosts
+    }
+
+    if (sendType === 'commandSend') {
+      userMessage.role = 'assistant'
+      userMessage.say = 'command_output'
+    }
+
+    session.chatHistory.push(userMessage)
+    session.responseLoading = true
+    session.showRetryButton = false
+
+    if (!tabId || tabId === currentChatId.value) {
+      scrollToBottom(true)
+    }
+
+    return
+  }
+
+  const handleModelApiReqFailed = (message: any, targetTab: ChatTab) => {
+    const session = targetTab.session
+    const newAssistantMessage = createNewMessage(
+      'assistant',
+      message.partialMessage.text,
+      message.partialMessage.type,
+      message.partialMessage.type === 'ask' ? message.partialMessage.ask : '',
+      message.partialMessage.type === 'say' ? message.partialMessage.say : '',
+      message.partialMessage.ts,
+      false
+    )
+    newAssistantMessage.contentParts = message.partialMessage.contentParts
+
+    cleanupPartialCommandMessages(session.chatHistory)
+    session.chatHistory.push(newAssistantMessage)
+    logger.info('showRetryButton for tab', { data: targetTab.id })
+    session.showRetryButton = true
+    session.responseLoading = false
+  }
+
+  const knowledgeSummaryRelPaths = new Map<number, string>()
+
+  /**
+   * Handle knowledge_summary streaming: create file, open editor, and write content incrementally
+   */
+  const handleKnowledgeSummary = async (partial: any) => {
+    try {
+      const data = JSON.parse(partial.text || '{}')
+      const { fileName, summary } = data
+      if (!fileName || !summary) {
+        logger.info('Missing fileName or summary')
+        return
+      }
+
+      const key = partial.ts ?? 0
+      let relPath = knowledgeSummaryRelPaths.get(key)
+
+      if (!relPath) {
+        const normalizedFileName = fileName.endsWith('.md') ? fileName : `${fileName}.md`
+        const result = await window.api.kbCreateFile('summary', normalizedFileName, summary)
+        relPath = result?.relPath ?? `summary/${normalizedFileName}`
+        knowledgeSummaryRelPaths.set(key, relPath)
+
+        eventBus.emit('openUserTab', {
+          content: 'KnowledgeCenterEditor',
+          title: relPath.split('/').pop() || 'Knowledge',
+          props: { relPath }
+        })
+      } else {
+        await window.api.kbWriteFile(relPath, summary)
+        eventBus.emit('kb:content-changed', {
+          relPath,
+          content: summary
+        })
+      }
+
+      if (!partial.partial) {
+        knowledgeSummaryRelPaths.delete(key)
+      }
+    } catch (error) {
+      logger.error('Failed to save knowledge', { error: error })
+      notification.error({
+        message: t('ai.knowledgeSaveFailed'),
+        description: error instanceof Error ? error.message : String(error),
+        duration: 5
+      })
+    }
+  }
+
+  const skillSummaryCreated = new Map<number, boolean>()
+
+  /**
+   * Handle skill_summary streaming: create skill when streaming completes
+   */
+  const handleSkillSummary = async (partial: any) => {
+    try {
+      // Only create skill when streaming is complete
+      if (partial.partial) {
+        return
+      }
+
+      const data = JSON.parse(partial.text || '{}')
+      const { skillName, description, content } = data
+      if (!skillName || !description || !content) {
+        logger.info('Missing skillName, description, or content')
+        return
+      }
+
+      const key = partial.ts ?? 0
+      if (skillSummaryCreated.get(key)) {
+        return
+      }
+      skillSummaryCreated.set(key, true)
+
+      await window.api.createSkill({ name: skillName, description }, content)
+
+      notification.success({
+        message: t('ai.skillCreated'),
+        description: skillName,
+        duration: 5
+      })
+
+      skillSummaryCreated.delete(key)
+    } catch (error) {
+      logger.error('Failed to create skill', { error: error })
+      notification.error({
+        message: t('ai.skillCreateFailed'),
+        description: error instanceof Error ? error.message : String(error),
+        duration: 5
+      })
+    }
+  }
+
+  const processMainMessage = async (message: ExtensionMessage) => {
+    const targetTabId = message?.tabId ?? message?.taskId
+    if (!targetTabId) {
+      logger.error('Ignoring message for no target tab', { data: message.type })
+      return
+    }
+
+    const targetTab = chatTabs.value.find((tab) => tab.id === targetTabId)
+    if (!targetTab) {
+      logger.warn('Ignoring message for deleted tab', { detail: targetTabId })
+      return
+    }
+
+    logger.info('Received main process message', { data: { type: message.type } })
+
+    const session = targetTab.session
+    const isActiveTab = targetTabId === currentChatId.value
+    const previousMainMessage = session.lastStreamMessage
+    const previousPartialMessage = session.lastPartialMessage
+
+    if (message?.type === 'partialMessage' && session.isCancelled) {
+      logger.info('Ignoring partial message because task is cancelled')
+      return
+    }
+
+    if (message?.type === 'partialMessage') {
+      const partial = message.partialMessage
+      if (!partial) {
+        return
+      }
+
+      if (partial.type === 'ask' && partial.ask === 'completion_result') {
+        session.responseLoading = false
+        if (isActiveTab) {
+          scrollToBottom()
+        }
+        return
+      }
+
+      if (partial.say === 'knowledge_summary') {
+        await handleKnowledgeSummary(partial)
+        session.lastPartialMessage = message
+        if (isActiveTab) {
+          scrollToBottom()
+        }
+        return
+      }
+
+      if (partial.say === 'skill_summary') {
+        await handleSkillSummary(partial)
+        session.lastPartialMessage = message
+        if (isActiveTab) {
+          scrollToBottom()
+        }
+        return
+      }
+
+      if (partial.type === 'ask' && (partial.ask === 'api_req_failed' || partial.ask === 'ssh_con_failed')) {
+        handleModelApiReqFailed(message, targetTab)
+        if (isActiveTab) {
+          scrollToBottom()
+        }
+        return
+      }
+
+      session.showRetryButton = false
+      session.showSendButton = false
+      const lastMessageInChat = session.chatHistory.at(-1)
+
+      const openNewMessage =
+        (previousMainMessage?.type === 'state' && !previousPartialMessage?.partialMessage?.partial) ||
+        lastMessageInChat?.role === 'user' ||
+        !previousMainMessage ||
+        previousPartialMessage?.partialMessage?.ts !== partial.ts
+
+      if (previousPartialMessage && JSON.stringify(previousPartialMessage) === JSON.stringify(message)) {
+        return
+      }
+
+      if (isActiveTab) {
+        isCurrentChatMessage.value = true
+      }
+
+      if (openNewMessage) {
+        const hostInfo = pickHostInfo(partial as Partial<ChatMessage>)
+
+        const newAssistantMessage = createNewMessage(
+          'assistant',
+          partial.text ?? '',
+          partial.type ?? '',
+          partial.type === 'ask' ? (partial.ask ?? '') : '',
+          partial.type === 'say' ? (partial.say ?? '') : '',
+          partial.ts ?? 0,
+          partial.partial,
+          hostInfo
+        )
+
+        if (!partial.partial && partial.type === 'ask' && partial.text) {
+          newAssistantMessage.content = parseMessageContent(partial.text)
+        }
+
+        if (partial.contentParts) {
+          newAssistantMessage.contentParts = partial.contentParts
+        }
+
+        if (partial.mcpToolCall) {
+          newAssistantMessage.mcpToolCall = partial.mcpToolCall
+        }
+
+        if (partial.type === 'say' && partial.say === 'command') {
+          session.isExecutingCommand = true
+        }
+
+        session.lastChatMessageId = newAssistantMessage.id
+        cleanupPartialCommandMessages(session.chatHistory)
+        session.chatHistory.push(newAssistantMessage)
+      } else if (lastMessageInChat && lastMessageInChat.role === 'assistant') {
+        lastMessageInChat.content = partial.text ?? ''
+        lastMessageInChat.type = partial.type ?? ''
+        lastMessageInChat.ask = partial.type === 'ask' ? (partial.ask ?? '') : ''
+        lastMessageInChat.say = partial.type === 'say' ? (partial.say ?? '') : ''
+        lastMessageInChat.partial = partial.partial
+        if (partial.contentParts) {
+          lastMessageInChat.contentParts = partial.contentParts
+        }
+
+        if (partial.mcpToolCall) {
+          lastMessageInChat.mcpToolCall = partial.mcpToolCall
+        }
+
+        // Update host info for existing message
+        const hostInfo = pickHostInfo(partial as Partial<ChatMessage>)
+        if (hostInfo) {
+          lastMessageInChat.hostId = hostInfo.hostId
+          lastMessageInChat.hostName = hostInfo.hostName
+          lastMessageInChat.colorTag = hostInfo.colorTag
+        }
+
+        if (!partial.partial && partial.type === 'ask' && partial.text) {
+          lastMessageInChat.content = parseMessageContent(partial.text)
+        }
+
+        if (partial.type === 'say' && partial.say === 'command_output' && !partial.partial) {
+          session.isExecutingCommand = false
+        }
+      }
+
+      session.lastPartialMessage = message
+      if (!partial.partial) {
+        session.showSendButton = true
+        if (
+          (partial.type === 'ask' &&
+            (partial.ask === 'command' || partial.ask === 'db_sql_approval' || partial.ask === 'mcp_tool_call' || partial.ask === 'followup')) ||
+          partial.say === 'command_blocked'
+        ) {
+          session.responseLoading = false
+        }
+      }
+      if (isActiveTab) {
+        scrollToBottom()
+      }
+    } else if (message?.type === 'state') {
+      const chatermMessages = message.state?.chatermMessages ?? []
+      const lastStateChatermMessages = chatermMessages.at(-1)
+      // Cache chatermMessages so contextUsage remains stable when
+      // partialMessage overwrites lastStreamMessage during streaming.
+      if (chatermMessages.length > 0) {
+        session.lastStateChatermMessages = chatermMessages
+      }
+      const isWaitingForUserResponse =
+        lastStateChatermMessages?.type === 'ask' ||
+        lastStateChatermMessages?.say === 'command_blocked' ||
+        lastStateChatermMessages?.say === 'completion_result'
+      if (
+        chatermMessages.length > 0 &&
+        lastStateChatermMessages?.partial != undefined &&
+        !lastStateChatermMessages.partial &&
+        session.responseLoading &&
+        isWaitingForUserResponse
+      ) {
+        session.responseLoading = false
+      }
+    } else if (message?.type === 'todoUpdated') {
+      logger.info('Received todoUpdated message', { data: message })
+
+      if (Array.isArray(message.todos) && message.todos.length > 0) {
+        markLatestMessageWithTodoUpdate(session.chatHistory, message.todos as Todo[])
+      } else {
+        clearTodoState(session.chatHistory)
+      }
+      if (isActiveTab) {
+        scrollToBottom()
+      }
+    } else if (message?.type === 'taskTitleUpdated') {
+      logger.info('Received taskTitleUpdated message', { data: message })
+
+      if (message.title && message.taskId) {
+        targetTab.title = message.title
+        logger.info('Updated chat title', { data: message.title })
+      }
+    }
+
+    session.lastStreamMessage = message
+  }
+
+  const shouldBypassPartialThrottle = (message: ExtensionMessage): boolean => {
+    if (message?.type !== 'partialMessage') {
+      return true
+    }
+
+    const partial = message.partialMessage
+    if (!partial) {
+      return true
+    }
+
+    if (!partial.partial) {
+      return true
+    }
+
+    if (partial.say === 'knowledge_summary' || partial.say === 'skill_summary') {
+      return true
+    }
+
+    return partial.type === 'ask' && ['completion_result', 'api_req_failed', 'ssh_con_failed'].includes(partial.ask ?? '')
+  }
+
+  const flushPendingPartialMessageForTab = async (tabId: string) => {
+    clearPendingPartialFlushTimer(tabId)
+    const pendingMessage = takePendingPartialMessage(tabId)
+    if (pendingMessage) {
+      await processMainMessage(pendingMessage)
+    }
+  }
+
+  const handleIncomingMainMessage = async (message: ExtensionMessage) => {
+    const targetTabId = message?.tabId ?? message?.taskId
+
+    if (message?.type !== 'partialMessage' || !targetTabId || shouldBypassPartialThrottle(message)) {
+      if (targetTabId) {
+        await flushPendingPartialMessageForTab(targetTabId)
+      }
+      await processMainMessage(message)
+      return
+    }
+
+    pendingPartialMessages.set(targetTabId, message)
+    if (pendingPartialFlushTimers.has(targetTabId)) {
+      return
+    }
+
+    const timer = setTimeout(() => {
+      pendingPartialFlushTimers.delete(targetTabId)
+      const pendingMessage = takePendingPartialMessage(targetTabId)
+      if (!pendingMessage) {
+        return
+      }
+
+      processMainMessage(pendingMessage).catch((error) => {
+        logger.error('Failed to process throttled main process message', { error: error })
+      })
+    }, STREAM_RENDER_THROTTLE_MS)
+
+    pendingPartialFlushTimers.set(targetTabId, timer)
+  }
+
+  const initializeListener = () => {
+    // Only register IPC listener once globally to prevent duplicate event handling
+    if (globalIpcListenerInitialized) {
+      return
+    }
+    globalIpcListenerInitialized = true
+
+    window.api.onMainMessage((message: any) => {
+      handleIncomingMainMessage(message).catch((error) => {
+        logger.error('Failed to process main process message', { error: error })
+      })
+    })
+  }
+
+  onMounted(() => {
+    initializeListener()
+  })
+
+  const handleFeedback = async (message: ChatMessage, type: 'like' | 'dislike') => {
+    if (!currentSession.value) return
+    // Use message timestamp as the feedback key because messageId is frontend-only and not persisted
+    // by the backend. History restore regenerates ids with uuidv4(), so id-based feedback cannot work.
+    const messageTs = String(message.ts)
+    const currentFeedback = messageFeedbacks.value[messageTs]
+
+    if (currentFeedback === type) {
+      delete messageFeedbacks.value[messageTs]
+      const feedbacks = ((await getGlobalState('messageFeedbacks')) || {}) as Record<string, 'like' | 'dislike'>
+      delete feedbacks[messageTs]
+      await updateGlobalState('messageFeedbacks', feedbacks)
+      return
+    }
+
+    messageFeedbacks.value[messageTs] = type
+    const feedbacks = ((await getGlobalState('messageFeedbacks')) || {}) as Record<string, 'like' | 'dislike'>
+    feedbacks[messageTs] = type
+    await updateGlobalState('messageFeedbacks', feedbacks)
+    const messageRsp: WebviewMessage = {
+      type: 'taskFeedback',
+      feedbackType: type === 'like' ? 'thumbs_up' : 'thumbs_down',
+      taskId: currentChatId.value || undefined
+    }
+    await window.api.sendToMain(messageRsp)
+  }
+
+  const getMessageFeedback = (messageTs: number): 'like' | 'dislike' | undefined => {
+    return messageFeedbacks.value[String(messageTs)]
+  }
+
+  const isMessageFeedbackSubmitted = (messageTs: number): boolean => {
+    return !!messageFeedbacks.value[String(messageTs)]
+  }
+
+  /**
+   * Handle edit and resend from UserMessage
+   */
+  const handleTruncateAndSend = async ({ message, contentParts, hosts }: { message: ChatMessage; contentParts: ContentPart[]; hosts?: Host[] }) => {
+    if (!currentSession.value) return
+
+    const chatHistory = currentSession.value.chatHistory
+
+    const index = chatHistory.findIndex((m) => m.id === message.id)
+    if (index === -1) return
+
+    const truncateAtMessageTs = message.ts
+
+    chatHistory.splice(index)
+
+    // Build plain text content with @absPath for chips
+    const newContent = buildPlainTextFromParts(contentParts)
+    await sendMessageWithContent(newContent, 'send', undefined, truncateAtMessageTs, contentParts, hosts)
+  }
+
+  /**
+   * Handle summarize to knowledge base button click.
+   * Sends a command chip that will be replaced with full prompt in the backend.
+   * @param message - Optional message to summarize up to (when clicking button on specific message)
+   *                  When not provided, summarizes the entire conversation (when typing command in input)
+   */
+  const handleSummarizeToKnowledge = async (message?: ChatMessage) => {
+    // Build ContentPart with command chip - backend will replace it with the full prompt
+    const commandChipPart: ContentPart = {
+      type: 'chip',
+      chipType: 'command',
+      ref: {
+        command: '/summary-to-doc',
+        label: '/Summary to Doc',
+        summarizeUpToTs: message?.ts // Include timestamp to limit summarization scope
+      }
+    }
+
+    await sendMessageWithContent('/summary-to-doc', 'send', undefined, undefined, [commandChipPart])
+  }
+
+  /**
+   * Handle summarize to skill button click.
+   * Sends a command chip that will be replaced with full prompt in the backend.
+   * @param message - Optional message to summarize up to (when clicking button on specific message)
+   */
+  const handleSummarizeToSkill = async (message?: ChatMessage) => {
+    const commandChipPart: ContentPart = {
+      type: 'chip',
+      chipType: 'command',
+      ref: {
+        command: '/summary-to-skill',
+        label: '/Summary to Skill',
+        summarizeUpToTs: message?.ts
+      }
+    }
+
+    await sendMessageWithContent('/summary-to-skill', 'send', undefined, undefined, [commandChipPart])
+  }
+
+  return {
+    markdownRendererRefs,
+    isCurrentChatMessage,
+    sendMessageToMain,
+    sendMessage,
+    sendMessageWithContent,
+    handleIncomingMainMessage,
+    processMainMessage,
+    handleModelApiReqFailed,
+    handleFeedback,
+    getMessageFeedback,
+    isMessageFeedbackSubmitted,
+    setMarkdownRendererRef,
+    formatParamValue,
+    cleanupPartialCommandMessages,
+    isLocalHost,
+    handleTruncateAndSend,
+    handleSummarizeToKnowledge,
+    handleSummarizeToSkill
+  }
+}

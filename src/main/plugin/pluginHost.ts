@@ -1,0 +1,64 @@
+import { InstallHint } from './pluginManager'
+import { StateLike, SecretsLike } from './pluginGlobalState'
+import type { BastionCapability, BastionDefinition } from '../ssh/capabilityRegistry'
+
+export type VersionProviderFn = () => string | null | Promise<string | null>
+
+export interface ITreeItem {
+  id: string
+  label: string
+  collapsibleState?: 'none' | 'collapsed'
+  command?: string
+  args?: any[]
+}
+export interface PluginHostModules {
+  ssh2?: typeof import('ssh2')
+}
+
+export interface PluginHostLogger {
+  debug(message: string, meta?: Record<string, unknown>): void
+  info(message: string, meta?: Record<string, unknown>): void
+  warn(message: string, meta?: Record<string, unknown>): void
+  error(message: string, meta?: Record<string, unknown>): void
+}
+
+export interface PluginHostLoggerFactory {
+  createLogger(module: string): PluginHostLogger
+}
+
+export interface PluginHost {
+  registerVersionProvider: (fn: () => string | null | Promise<string | null>) => void
+  registerInstallHint: (hint: InstallHint) => void
+  globalState: StateLike
+  workspaceState: StateLike
+  secrets: SecretsLike
+  logger?: PluginHostLoggerFactory
+  registerTreeDataProvider: (
+    viewId: string,
+    provider: {
+      getChildren: (element?: any) => Promise<ITreeItem[]>
+    }
+  ) => void
+  executeCommand: (commandId: string, ...args: any[]) => Promise<any>
+  registerCommand: (commandId: string, handler: (...args: any[]) => any) => void
+  setContext: (key: string, value: any) => void
+  refreshTree: (viewId: string) => void
+  asAbsolutePath: (relativePath: string) => string
+  readFile: (filePath: string) => Promise<string>
+  writeFile: (filePath: string, content: string) => Promise<boolean>
+  modules: PluginHostModules
+
+  /**
+   * Register a bastion capability for plugin-based bastion host integration.
+   * JumpServer is built-in and does not use this mechanism.
+   * @param capability The bastion capability to register
+   */
+  registerBastionCapability: (capability: BastionCapability) => void
+
+  /**
+   * Register a bastion definition (plugin metadata) for dynamic UI/DB/routing.
+   * Should be called alongside registerBastionCapability.
+   * @param definition The bastion definition to register
+   */
+  registerBastionDefinition: (definition: BastionDefinition) => void
+}

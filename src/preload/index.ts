@@ -1,0 +1,1975 @@
+import { mark as perfMark, reportPreloadMarksToMain } from './perf'
+import { isMonacoEditorShortcutTarget } from './shortcutGuards'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
+import { electronAPI } from '@electron-toolkit/preload'
+import type { WebviewMessage } from '../main/agent/shared/WebviewMessage'
+import type { ChatermMessagesPage } from '../main/agent/shared/ExtensionMessage'
+import {
+  DB_AI_IPC_CHANNELS,
+  type DbAiCancelResult,
+  type DbAiDoneEvent,
+  type DbAiStartRequest,
+  type DbAiStartResult,
+  type DbAiStreamEvent,
+  type DbAiToolEvent
+} from '../shared/db-ai-types'
+
+import * as dotenv from 'dotenv'
+import * as path from 'path'
+import * as fs from 'fs'
+
+interface FileRecord {
+  name: string
+  path: string
+  isDir: boolean
+  mode: string
+  isLink: boolean
+  modTime: string
+  size: number
+}
+
+interface SftpConnectionInfo {
+  id: string
+  isSuccess: boolean
+  sftp?: import('ssh2').SFTPWrapper
+  error?: string
+  rootPath?: string
+}
+
+interface BrandingConfig {
+  enabled: boolean
+  displayName: string
+  productNameZh?: string
+  productNameEn?: string
+  logoUrl?: string
+  logoLightUrl?: string
+  logoDarkUrl?: string
+  iconPngPath?: string
+  iconIcoPath?: string
+  iconIcnsPath?: string
+}
+
+// Command list reception timeout (ms)
+const COMMAND_LIST_TIMEOUT = 30000
+
+perfMark('chaterm/preload/willLoadEnv')
+const envPath = path.resolve(__dirname, '../../../build/.env')
+
+// Ensure path exists
+if (!fs.existsSync(envPath)) {
+  // Can try other paths or set default values
+}
+
+// Load environment variables
+dotenv.config({ path: envPath })
+
+// Global variable to track vim mode state
+let isVimMode = false
+
+// Listen for vim mode state updates from renderer process
+perfMark('chaterm/preload/willRegisterDomListeners')
+window.addEventListener('message', (event) => {
+  if (event.data && event.data.type === 'VIM_MODE_UPDATE') {
+    isVimMode = event.data.isVimMode
+  }
+})
+
+// Intercept Ctrl+F and Ctrl+W shortcuts, prevent browser default behavior and trigger in-app functionality (Windows only)
+window.addEventListener(
+  'keydown',
+  (e) => {
+    // Only intercept shortcuts on Windows, keep default behavior on Mac
+    // Don't intercept shortcuts in vim mode, let vim keep default behavior
+    if (process.platform === 'win32' && e.ctrlKey && !isVimMode) {
+      if (e.key === 'f' && !isMonacoEditorShortcutTarget(e.target)) {
+        e.preventDefault()
+        e.stopPropagation()
+        // Send to renderer process via postMessage
+        window.postMessage({ type: 'TRIGGER_SEARCH' }, '*')
+      }
+    }
+  },
+  true
+)
+perfMark('chaterm/preload/didRegisterDomListeners')
+
+// If there is a .env file for a specific environment, it can also be loaded
+const nodeEnv = process.env.NODE_ENV || 'development'
+const envSpecificPath = path.resolve(__dirname, `../../build/.env.${nodeEnv}`)
+const envContent: Record<string, string> = {}
+
+if (fs.existsSync(envSpecificPath)) {
+  dotenv.config({ path: envSpecificPath })
+
+  try {
+    const fileContent = fs.readFileSync(envSpecificPath, 'utf8')
+    // Manually parse environment variables
+    fileContent.split('\n').forEach((line) => {
+      // Ignore comments and empty lines
+      if (!line || line.startsWith('#')) return
+
+      const match = line.match(/^\s*([\w.-]+)\s*=\s*(.*)?\s*$/)
+      if (match) {
+        const key = match[1]
+        let value = match[2] || ''
+
+        // Remove quotes
+        value = value.replace(/^['"]|['"]$/g, '')
+
+        // Store parsed environment variables in an object
+        envContent[key] = value
+
+        // Set to process.env
+        process.env[key] = value
+      }
+    })
+  } catch {
+    // Ignore env parse errors in preload bootstrap path
+  }
+} else {
+  // Environment file not found, proceed with defaults
+}
+perfMark('chaterm/preload/didLoadEnv')
+
+// Custom APIs for renderer
+import os from 'os'
+import { ExecResult } from '../main/ssh/sshHandle'
+import { SftpConnectResult } from '../main/ssh/sftpTransfer'
+
+const getLocalIP = (): string => {
+  const interfaces = os.networkInterfaces()
+  for (const name of Object.keys(interfaces)) {
+    const iface = interfaces[name]
+    if (!iface) continue
+    for (const info of iface) {
+      if (info.family === 'IPv4' && !info.internal) {
+        return info.address
+      }
+    }
+  }
+  return '127.0.0.1'
+}
+const getMacAddress = () => {
+  const interfaces = os.networkInterfaces() || {}
+  for (const name of Object.keys(interfaces)) {
+    for (const net of interfaces[name] || []) {
+      if (!net.internal && net.mac !== '00:00:00:00:00:00') {
+        return net.mac
+      }
+    }
+  }
+  return ''
+}
+// Get current URL
+const getCookieUrl = async () => {
+  const cookieUrl = await ipcRenderer.invoke('get-cookie-url')
+  return cookieUrl
+}
+
+// Set Cookie
+const setCookie = async (name, value, expirationDays = 7) => {
+  const result = await ipcRenderer.invoke('set-cookie', name, value, expirationDays)
+  return result
+}
+// Get cookie
+const getCookie = async (name) => {
+  try {
+    const result = await ipcRenderer.invoke('get-cookie', name)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+// Get all Cookies
+const getAllCookies = async () => {
+  try {
+    const result = await ipcRenderer.invoke('get-cookie', null) // If no name is passed, get all Cookies
+    return result
+  } catch (error) {
+    return { success: false, error }
+  }
+}
+// Remove a Cookie
+const removeCookie = async (name) => {
+  try {
+    const result = await ipcRenderer.invoke('remove-cookie', { name })
+    return result
+  } catch (error) {
+    return { success: false, error }
+  }
+}
+
+const queryCommand = async (data: { command: string; ip: string }) => {
+  try {
+    const result = await ipcRenderer.invoke('query-command', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const insertCommand = async (data: { command: string; ip: string }) => {
+  try {
+    const result = await ipcRenderer.invoke('insert-command', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const queryFigSpec = async (data: { commandLine: string; tokens: string[] }) => {
+  try {
+    return await ipcRenderer.invoke('query-fig-spec', data)
+  } catch (error) {
+    return []
+  }
+}
+
+const aiSuggestCommand = async (data: { command: string; osInfo?: string }): Promise<{ command: string; explanation: string } | null> => {
+  try {
+    const result = await ipcRenderer.invoke('ai-suggest-command', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+// Chaterm database related IPC handlers
+const getLocalAssetRoute = async (data: { searchType: string; params?: unknown[] }) => {
+  try {
+    const result = await ipcRenderer.invoke('asset-route-local-get', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const recordConnection = async (data: {
+  assetUuid: string
+  assetIp: string
+  assetLabel?: string
+  assetPort?: number
+  assetUsername?: string
+  assetType: string
+  organizationId?: string
+}) => {
+  try {
+    await ipcRenderer.invoke('record-connection', data)
+  } catch {
+    // Non-critical: silently ignore recording failures
+  }
+}
+
+const updateLocalAssetLabel = async (data: { uuid: string; label: string }) => {
+  try {
+    const result = await ipcRenderer.invoke('asset-route-local-update', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const updateLocalAsseFavorite = async (data: { uuid: string; status: number }) => {
+  try {
+    const result = await ipcRenderer.invoke('asset-route-local-favorite', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const getKeyChainSelect = async () => {
+  try {
+    const result = await ipcRenderer.invoke('key-chain-local-get')
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const getPasswordChainSelect = async () => {
+  try {
+    const result = await ipcRenderer.invoke('password-chain-local-get')
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const getAssetGroup = async () => {
+  try {
+    const result = await ipcRenderer.invoke('asset-group-local-get')
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const chatermInsert = async (data: { sql: string; params?: unknown[] }) => {
+  try {
+    const result = await ipcRenderer.invoke('chaterm-insert', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const chatermUpdate = async (data: { sql: string; params?: unknown[] }) => {
+  try {
+    const result = await ipcRenderer.invoke('chaterm-update', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const deleteAsset = async (data: { uuid: string }) => {
+  try {
+    const result = await ipcRenderer.invoke('asset-delete', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const createAsset = async (data: { form: Record<string, unknown> }) => {
+  try {
+    const result = await ipcRenderer.invoke('asset-create', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+// ==================== Database Asset API ====================
+
+interface DbAssetPayload {
+  name: string
+  db_type: 'mysql' | 'postgresql' | 'sqlite' | 'oracle'
+  host?: string | null
+  port?: number | null
+  file_path?: string | null
+  connection_mode?: 'readwrite' | 'readonly' | null
+  group_id?: string | null
+  username?: string | null
+  password?: string | null
+  database_name?: string | null
+  schema_name?: string | null
+  environment?: string | null
+  group_name?: string | null
+  ssl_mode?: string | null
+  jdbc_url?: string | null
+  options_json?: string | null
+  tags_json?: string | null
+  sort_order?: number
+}
+
+interface DbAssetGroupPayload {
+  name: string
+  parent_id?: string | null
+  sort_order?: number
+}
+
+const dbAssetGroupList = async () => {
+  try {
+    return await ipcRenderer.invoke('db-asset-group-list')
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const dbAssetGroupCreate = async (payload: DbAssetGroupPayload) => {
+  try {
+    return await ipcRenderer.invoke('db-asset-group-create', payload)
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const dbAssetGroupUpdate = async (payload: { id: string; patch: Partial<DbAssetGroupPayload> }) => {
+  try {
+    return await ipcRenderer.invoke('db-asset-group-update', payload)
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const dbAssetGroupDelete = async (id: string) => {
+  try {
+    return await ipcRenderer.invoke('db-asset-group-delete', id)
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const dbAssetList = async () => {
+  try {
+    return await ipcRenderer.invoke('db-asset-list')
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const dbAssetGet = async (id: string) => {
+  try {
+    return await ipcRenderer.invoke('db-asset-get', id)
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const dbAssetCreate = async (payload: DbAssetPayload) => {
+  try {
+    return await ipcRenderer.invoke('db-asset-create', payload)
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const dbAssetUpdate = async (payload: { id: string; patch: Partial<DbAssetPayload> }) => {
+  try {
+    return await ipcRenderer.invoke('db-asset-update', payload)
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const dbAssetDelete = async (id: string) => {
+  try {
+    return await ipcRenderer.invoke('db-asset-delete', id)
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const dbAssetTestConnection = async (payload: DbAssetPayload) => {
+  try {
+    return await ipcRenderer.invoke('db-asset-test-connection', payload)
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const dbAssetConnect = async (id: string) => {
+  try {
+    return await ipcRenderer.invoke('db-asset-connect', id)
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const dbAssetDisconnect = async (id: string) => {
+  try {
+    return await ipcRenderer.invoke('db-asset-disconnect', id)
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const dbAssetListChildren = async (payload: {
+  id: string
+  databaseName?: string
+  schemaName?: string
+  objectKind?: 'tables' | 'views' | 'functions' | 'procedures'
+  tableName?: string
+}) => {
+  try {
+    return await ipcRenderer.invoke('db-asset-list-children', payload)
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const dbAssetListSchemas = async (payload: { id: string; databaseName: string }) => {
+  try {
+    return await ipcRenderer.invoke('db-asset-list-schemas', payload)
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const dbAssetExecuteQuery = async (payload: { id: string; sql: string; databaseName?: string; schemaName?: string }) => {
+  try {
+    return await ipcRenderer.invoke('db-asset-execute-query', payload)
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const dbAssetTableDdl = async (payload: { id: string; database: string; schema?: string; table: string }) => {
+  try {
+    return await ipcRenderer.invoke('db-asset-table-ddl', payload)
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const dbAssetQueryTable = async (payload: {
+  id: string
+  database: string
+  schema?: string
+  table: string
+  filters?: Array<{ column: string; operator: string; value?: string; values?: string[] }>
+  sort?: { column: string; direction: 'asc' | 'desc' } | null
+  whereRaw?: string | null
+  orderByRaw?: string | null
+  page: number
+  pageSize: number
+  withTotal?: boolean
+}) => {
+  try {
+    return await ipcRenderer.invoke('db-asset-query-table', payload)
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const dbAssetCountTable = async (payload: {
+  id: string
+  database: string
+  schema?: string
+  table: string
+  filters?: Array<{ column: string; operator: string; value?: string; values?: string[] }>
+  whereRaw?: string | null
+}) => {
+  try {
+    return await ipcRenderer.invoke('db-asset-count-table', payload)
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const dbAssetColumnDistinct = async (payload: { id: string; database: string; schema?: string; table: string; column: string; limit?: number }) => {
+  try {
+    return await ipcRenderer.invoke('db-asset-column-distinct', payload)
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const dbAssetDetectPrimaryKey = async (payload: { id: string; database: string; schema?: string; table: string }) => {
+  try {
+    return await ipcRenderer.invoke('db-asset:detect-primary-key', payload)
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const dbAssetExecuteMutations = async (payload: {
+  id: string
+  database?: string
+  schema?: string
+  statements: Array<{ sql: string; params: unknown[] }>
+}) => {
+  try {
+    return await ipcRenderer.invoke('db-asset:execute-mutations', payload)
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// DB-AI (single-turn, track A) preload surface. See docs/database_ai.md §5.2.
+// Subscription helpers return an unsubscribe function so renderers can clean
+// up on component unmount without leaking listeners across navigations.
+// ---------------------------------------------------------------------------
+
+const dbAiStart = async (req: DbAiStartRequest): Promise<DbAiStartResult> => {
+  try {
+    return await ipcRenderer.invoke(DB_AI_IPC_CHANNELS.start, req)
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const dbAiCancel = async (reqId: string): Promise<DbAiCancelResult> => {
+  try {
+    return await ipcRenderer.invoke(DB_AI_IPC_CHANNELS.cancel, reqId)
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const dbAiOnStream = (cb: (event: DbAiStreamEvent) => void): (() => void) => {
+  const listener = (_e: unknown, event: DbAiStreamEvent): void => cb(event)
+  ipcRenderer.on(DB_AI_IPC_CHANNELS.stream, listener)
+  return () => ipcRenderer.removeListener(DB_AI_IPC_CHANNELS.stream, listener)
+}
+
+const dbAiOnTool = (cb: (event: DbAiToolEvent) => void): (() => void) => {
+  const listener = (_e: unknown, event: DbAiToolEvent): void => cb(event)
+  ipcRenderer.on(DB_AI_IPC_CHANNELS.tool, listener)
+  return () => ipcRenderer.removeListener(DB_AI_IPC_CHANNELS.tool, listener)
+}
+
+const dbAiOnDone = (cb: (event: DbAiDoneEvent) => void): (() => void) => {
+  const listener = (_e: unknown, event: DbAiDoneEvent): void => cb(event)
+  ipcRenderer.on(DB_AI_IPC_CHANNELS.done, listener)
+  return () => ipcRenderer.removeListener(DB_AI_IPC_CHANNELS.done, listener)
+}
+
+const dbAi = {
+  start: dbAiStart,
+  cancel: dbAiCancel,
+  onStream: dbAiOnStream,
+  onTool: dbAiOnTool,
+  onDone: dbAiOnDone
+}
+
+const createOrUpdateAsset = async (data: { form: Record<string, unknown> }) => {
+  try {
+    const result = await ipcRenderer.invoke('asset-create-or-update', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const updateAsset = async (data: { form: Record<string, unknown> }) => {
+  try {
+    const result = await ipcRenderer.invoke('asset-update', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const getKeyChainList = async () => {
+  try {
+    const result = await ipcRenderer.invoke('key-chain-local-get-list')
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const createKeyChain = async (data: { form: Record<string, unknown> }) => {
+  try {
+    const result = await ipcRenderer.invoke('key-chain-local-create', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const deleteKeyChain = async (data: { id: number }) => {
+  try {
+    const result = await ipcRenderer.invoke('key-chain-local-delete', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const getKeyChainInfo = async (data: { id: number }) => {
+  try {
+    const result = await ipcRenderer.invoke('key-chain-local-get-info', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const updateKeyChain = async (data: { form: Record<string, unknown> }) => {
+  try {
+    const result = await ipcRenderer.invoke('key-chain-local-update', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const connectAssetInfo = async (data: { uuid: string; organizationUuid?: string; ip?: string }) => {
+  try {
+    const result = await ipcRenderer.invoke('chaterm-connect-asset-info', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+const chatermGetChatermMessages = async (data: { taskId: string }) => {
+  try {
+    const result = await ipcRenderer.invoke('agent-chaterm-messages', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const chatermGetChatermMessagesPage = async (data: {
+  taskId: string
+  beforeCursor?: number | null
+  limit?: number
+}): Promise<ChatermMessagesPage> => {
+  try {
+    const result = await ipcRenderer.invoke('agent-chaterm-messages-page', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const getPlatform = () => ipcRenderer.invoke('get-platform')
+const invokeCustomAdsorption = (data: { appX: number; appY: number }) => ipcRenderer.invoke('custom-adsorption', data)
+
+const getTaskMetadata = async (taskId) => {
+  try {
+    const result = await ipcRenderer.invoke('get-task-metadata', { taskId })
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const saveTaskTitle = async (taskId: string, title: string) => {
+  try {
+    return await ipcRenderer.invoke('set-task-title', { taskId, title })
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const saveTaskFavorite = async (taskId: string, favorite: boolean) => {
+  try {
+    return await ipcRenderer.invoke('set-task-favorite', { taskId, favorite })
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const getTaskList = async (workspace?: 'server' | 'database') => {
+  try {
+    return await ipcRenderer.invoke('get-task-list', { workspace })
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const getUserHosts = async (search: string, limit?: number) => {
+  try {
+    const result = await ipcRenderer.invoke('get-user-hosts', { search, limit })
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const initUserDatabase = async (data: { uid: number }) => {
+  try {
+    const result = await ipcRenderer.invoke('init-user-database', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+// User snippet operations
+const userSnippetOperation = async (data: { operation: 'list' | 'create' | 'delete' | 'update' | 'swap' | 'reorder'; params?: unknown }) => {
+  try {
+    const result = await ipcRenderer.invoke('user-snippet-operation', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const refreshOrganizationAssets = async (data: { organizationUuid: string; jumpServerConfig: Record<string, unknown> }) => {
+  try {
+    const result = await ipcRenderer.invoke('refresh-organization-assets', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const updateOrganizationAssetFavorite = async (data: { organizationUuid: string; host: string; status: number }) => {
+  try {
+    const result = await ipcRenderer.invoke('organization-asset-favorite', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const updateOrganizationAssetComment = async (data: { organizationUuid: string; host: string; comment: string }) => {
+  try {
+    const result = await ipcRenderer.invoke('organization-asset-comment', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+// Organization asset management API
+const getOrganizationAssets = async (data: { organizationUuid: string; search?: string; page?: number; pageSize?: number }) => {
+  try {
+    const result = await ipcRenderer.invoke('get-organization-assets', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const createOrganizationAsset = async (data: { organizationUuid: string; hostname: string; host: string; comment?: string }) => {
+  try {
+    const result = await ipcRenderer.invoke('create-organization-asset', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const updateOrganizationAsset = async (data: { uuid: string; hostname?: string; host?: string; comment?: string }) => {
+  try {
+    const result = await ipcRenderer.invoke('update-organization-asset', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const deleteOrganizationAsset = async (data: { uuid: string }) => {
+  try {
+    const result = await ipcRenderer.invoke('delete-organization-asset', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const batchDeleteOrganizationAssets = async (data: { uuids: string[] }) => {
+  try {
+    const result = await ipcRenderer.invoke('batch-delete-organization-assets', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+// Custom folder management API
+const createCustomFolder = async (data: { name: string; description?: string }) => {
+  try {
+    const result = await ipcRenderer.invoke('create-custom-folder', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const getCustomFolders = async () => {
+  try {
+    const result = await ipcRenderer.invoke('get-custom-folders')
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const updateCustomFolder = async (data: { folderUuid: string; name: string; description?: string }) => {
+  try {
+    const result = await ipcRenderer.invoke('update-custom-folder', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const deleteCustomFolder = async (data: { folderUuid: string }) => {
+  try {
+    const result = await ipcRenderer.invoke('delete-custom-folder', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const moveAssetToFolder = async (data: { folderUuid: string; organizationUuid: string; assetHost: string }) => {
+  try {
+    const result = await ipcRenderer.invoke('move-asset-to-folder', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const removeAssetFromFolder = async (data: { folderUuid: string; organizationUuid: string; assetHost: string }) => {
+  try {
+    const result = await ipcRenderer.invoke('remove-asset-from-folder', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const getAssetsInFolder = async (data: { folderUuid: string }) => {
+  try {
+    const result = await ipcRenderer.invoke('get-assets-in-folder', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+const getSystemInfo = async (id: string) => {
+  try {
+    const result = await ipcRenderer.invoke('ssh:get-system-info', { id })
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const api = {
+  isE2E: () => process.env.CHATERM_E2E === '1',
+  getSystemInfo,
+  getLocalIP,
+  getMacAddress,
+  removeCookie,
+  getAllCookies,
+  getCookie,
+  getCookieUrl,
+  setCookie,
+  invokeCustomAdsorption,
+  getPlatform,
+  getBrandingConfig: (): Promise<BrandingConfig> => ipcRenderer.invoke('app:get-branding-config'),
+  queryCommand,
+  insertCommand,
+  queryFigSpec,
+  aiSuggestCommand,
+  getLocalAssetRoute,
+  recordConnection,
+  updateLocalAssetLabel,
+  updateLocalAsseFavorite,
+  getKeyChainSelect,
+  getPasswordChainSelect,
+  getKeyChainList,
+  getAssetGroup,
+  dbAssetList,
+  dbAssetGroupList,
+  dbAssetGroupCreate,
+  dbAssetGroupUpdate,
+  dbAssetGroupDelete,
+  dbAssetGet,
+  dbAssetCreate,
+  dbAssetUpdate,
+  dbAssetDelete,
+  dbAssetTestConnection,
+  dbAssetConnect,
+  dbAssetDisconnect,
+  dbAssetListChildren,
+  dbAssetListSchemas,
+  dbAssetExecuteQuery,
+  dbAssetTableDdl,
+  dbAssetQueryTable,
+  dbAssetCountTable,
+  dbAssetColumnDistinct,
+  dbAssetDetectPrimaryKey,
+  dbAssetExecuteMutations,
+  dbAi,
+  chatermInsert,
+  chatermUpdate,
+  deleteAsset,
+  createAsset,
+  createOrUpdateAsset,
+  updateAsset,
+  createKeyChain,
+  deleteKeyChain,
+  getKeyChainInfo,
+  updateKeyChain,
+  connectAssetInfo,
+  chatermGetChatermMessages,
+  chatermGetChatermMessagesPage,
+  getTaskMetadata,
+  saveTaskTitle,
+  saveTaskFavorite,
+  getTaskList,
+  getUserHosts,
+  initUserDatabase,
+  userSnippetOperation,
+  refreshOrganizationAssets,
+  updateOrganizationAssetFavorite,
+  updateOrganizationAssetComment,
+  getOrganizationAssets,
+  createOrganizationAsset,
+  updateOrganizationAsset,
+  deleteOrganizationAsset,
+  batchDeleteOrganizationAssets,
+  createCustomFolder,
+  getCustomFolders,
+  updateCustomFolder,
+  deleteCustomFolder,
+  moveAssetToFolder,
+  removeAssetFromFolder,
+  getAssetsInFolder,
+  getPathForFile: (file: File) => webUtils.getPathForFile(file), // Get the real path from File instead of using file.path
+  setDataSyncEnabled: (enabled: boolean) => ipcRenderer.invoke('data-sync:set-enabled', enabled),
+  // Chat Sync V2
+  chatSyncSetEnabled: (enabled: boolean) => ipcRenderer.invoke('chat-sync:set-enabled', enabled),
+  chatSyncGetStatus: () => ipcRenderer.invoke('chat-sync:get-status'),
+  chatSyncSyncNow: () => ipcRenderer.invoke('chat-sync:sync-now'),
+  chatSyncSetAiTabVisible: (visible: boolean) => ipcRenderer.invoke('chat-sync:set-ai-tab-visible', visible),
+  maximizeWindow: () => ipcRenderer.invoke('window:maximize'),
+  unmaximizeWindow: () => ipcRenderer.invoke('window:unmaximize'),
+  isMaximized: () => ipcRenderer.invoke('window:is-maximized'),
+  minimizeWindow: () => ipcRenderer.invoke('window:minimize'),
+  closeWindow: () => ipcRenderer.invoke('window:close'),
+  onMaximized: (callback: () => void) => {
+    const listener = (_event) => callback()
+    ipcRenderer.on('window:maximized', listener)
+    return () => ipcRenderer.removeListener('window:maximized', listener)
+  },
+  onUnmaximized: (callback: () => void) => {
+    const listener = (_event) => callback()
+    ipcRenderer.on('window:unmaximized', listener)
+    return () => ipcRenderer.removeListener('window:unmaximized', listener)
+  },
+  openBrowserWindow: (url: string): void => {
+    ipcRenderer.send('open-browser-window', url)
+  },
+  openExternalUrl: (url: string): Promise<{ success: boolean; error?: string }> => ipcRenderer.invoke('open-external-url', url),
+  onUrlChange: (callback: (url: string) => void): void => {
+    ipcRenderer.on('url-changed', (_event, url) => callback(url))
+  },
+  goBack: (): void => {
+    ipcRenderer.send('browser-go-back')
+  },
+  goForward: (): void => {
+    ipcRenderer.send('browser-go-forward')
+  },
+  refresh: (): void => {
+    ipcRenderer.send('browser-refresh')
+  },
+  onNavigationStateChanged: (callback: (state: { canGoBack: boolean; canGoForward: boolean }) => void): void => {
+    ipcRenderer.on('navigation-state-changed', (_event, state) => callback(state))
+  },
+  // Add function to handle protocol URLs, especially for Linux systems
+  handleProtocolUrl: (url: string): Promise<{ success: boolean; error?: string }> => {
+    return ipcRenderer.invoke('handle-protocol-url', url)
+  },
+  // Get protocol prefix based on edition
+  getProtocolPrefix: (): Promise<string> => {
+    return ipcRenderer.invoke('get-protocol-prefix')
+  },
+  onXshellWakeup: (callback: (payload: any) => void) => {
+    const listener = (_event, payload) => callback(payload)
+    ipcRenderer.on('external-xshell-wakeup', listener)
+    return () => ipcRenderer.removeListener('external-xshell-wakeup', listener)
+  },
+  consumePendingXshellWakeups: () => ipcRenderer.invoke('xshell-wakeup:consume-pending'),
+
+  // keyboard-interactive authentication
+  onKeyboardInteractiveTimeout: (callback) => {
+    const listener = (_event, data) => {
+      callback(data)
+    }
+    ipcRenderer.on('ssh:keyboard-interactive-timeout', listener)
+    return () => ipcRenderer.removeListener('ssh:keyboard-interactive-timeout', listener)
+  },
+  onKeyboardInteractiveRequest: (callback) => {
+    const listener = (_event, data) => {
+      callback(data)
+    }
+    ipcRenderer.on('ssh:keyboard-interactive-request', listener)
+    return () => ipcRenderer.removeListener('ssh:keyboard-interactive-request', listener)
+  },
+  submitKeyboardInteractiveResponse: (id, code) => {
+    ipcRenderer.send(`ssh:keyboard-interactive-response:${id}`, [code])
+  },
+  cancelKeyboardInteractive: (id) => {
+    ipcRenderer.send(`ssh:keyboard-interactive-cancel:${id}`)
+  },
+  onKeyboardInteractiveResult: (callback) => {
+    const listener = (_event, data) => {
+      callback(data)
+    }
+    ipcRenderer.on('ssh:keyboard-interactive-result', listener)
+    return () => ipcRenderer.removeListener('ssh:keyboard-interactive-result', listener)
+  },
+
+  // JumpServer user selection
+  onUserSelectionRequest: (callback) => {
+    const listener = (_event, data) => {
+      callback(data)
+    }
+    ipcRenderer.on('jumpserver:user-selection-request', listener)
+    return () => ipcRenderer.removeListener('jumpserver:user-selection-request', listener)
+  },
+  onUserSelectionTimeout: (callback) => {
+    const listener = (_event, data) => {
+      callback(data)
+    }
+    ipcRenderer.on('jumpserver:user-selection-timeout', listener)
+    return () => ipcRenderer.removeListener('jumpserver:user-selection-timeout', listener)
+  },
+  sendUserSelectionResponse: (id, userId) => {
+    ipcRenderer.send(`jumpserver:user-selection-response:${id}`, userId)
+  },
+  sendUserSelectionCancel: (id) => {
+    ipcRenderer.send(`jumpserver:user-selection-cancel:${id}`)
+  },
+
+  // MCP configuration management
+  getMcpConfigPath: () => ipcRenderer.invoke('mcp:get-config-path'),
+  readMcpConfig: async () => {
+    const configPath = await ipcRenderer.invoke('mcp:get-config-path')
+    const content = await fs.promises.readFile(configPath, 'utf-8')
+    return content
+  },
+  writeMcpConfig: async (content: string) => {
+    const configPath = await ipcRenderer.invoke('mcp:get-config-path')
+    await fs.promises.writeFile(configPath, content, 'utf-8')
+  },
+  getMcpServers: () => ipcRenderer.invoke('mcp:get-servers'),
+  toggleMcpServer: (serverName: string, disabled: boolean) => ipcRenderer.invoke('toggle-mcp-server', serverName, disabled),
+  deleteMcpServer: (serverName: string) => ipcRenderer.invoke('delete-mcp-server', serverName),
+  getMcpToolState: (serverName: string, toolName: string) => ipcRenderer.invoke('mcp:get-tool-state', serverName, toolName),
+  setMcpToolState: (serverName: string, toolName: string, enabled: boolean) =>
+    ipcRenderer.invoke('mcp:set-tool-state', serverName, toolName, enabled),
+  getAllMcpToolStates: () => ipcRenderer.invoke('mcp:get-all-tool-states'),
+  setMcpToolAutoApprove: (serverName: string, toolName: string, autoApprove: boolean) =>
+    ipcRenderer.invoke('mcp:set-tool-auto-approve', serverName, toolName, autoApprove),
+  onMcpStatusUpdate: (callback: (servers: any[]) => void) => {
+    const listener = (_event, servers) => callback(servers)
+    ipcRenderer.on('mcp:status-update', listener)
+    return () => ipcRenderer.removeListener('mcp:status-update', listener)
+  },
+  onMcpServerUpdate: (callback: (server: any) => void) => {
+    const listener = (_event, server) => callback(server)
+    ipcRenderer.on('mcp:server-update', listener)
+    return () => ipcRenderer.removeListener('mcp:server-update', listener)
+  },
+  onMcpConfigFileChanged: (callback: (content: string) => void) => {
+    const listener = (_event, content) => callback(content)
+    ipcRenderer.on('mcp:config-file-changed', listener)
+    return () => ipcRenderer.removeListener('mcp:config-file-changed', listener)
+  },
+
+  // Skills management
+  getSkills: () => ipcRenderer.invoke('skills:get-all'),
+  getEnabledSkills: () => ipcRenderer.invoke('skills:get-enabled'),
+  setSkillEnabled: (skillId: string, enabled: boolean) => ipcRenderer.invoke('skills:set-enabled', skillId, enabled),
+  getSkillsUserPath: () => ipcRenderer.invoke('skills:get-user-path'),
+  reloadSkills: () => ipcRenderer.invoke('skills:reload'),
+  createSkill: (metadata: any, content: string) => ipcRenderer.invoke('skills:create', metadata, content),
+  deleteSkill: (skillId: string) => ipcRenderer.invoke('skills:delete', skillId),
+  openSkillsFolder: () => ipcRenderer.invoke('skills:open-folder'),
+  importSkillZip: (zipPath: string, overwrite?: boolean) => ipcRenderer.invoke('skills:import-zip', zipPath, overwrite),
+  readSkillContent: (skillName: string) => ipcRenderer.invoke('skills:read-content', skillName),
+  updateSkill: (skillName: string, metadata: any, content: string) => ipcRenderer.invoke('skills:update', skillName, metadata, content),
+  exportSkillZip: (skillName: string) => ipcRenderer.invoke('skills:export-zip', skillName),
+  onSkillsUpdate: (callback: (skills: any[]) => void) => {
+    const listener = (_event, data) => callback(data.skills)
+    ipcRenderer.on('skillsUpdate', listener)
+    return () => ipcRenderer.removeListener('skillsUpdate', listener)
+  },
+
+  // Local host API
+  getLocalWorkingDirectory: () => ipcRenderer.invoke('local:get-working-directory'),
+  // executeLocalCommand removed: dangerous RCE vector via XSS.
+  // Local command execution is only used by the Agent system in the main process
+  // and should never be exposed to the renderer process via contextBridge.
+
+  // SSH API
+  connect: (connectionInfo) => ipcRenderer.invoke('ssh:connect', connectionInfo),
+  forkSession: (params) => ipcRenderer.invoke('ssh:fork-session', params),
+  startSshTunnel: (params: {
+    connectionId: string
+    tunnelId: string
+    type: 'local_forward' | 'remote_forward' | 'dynamic_socks'
+    localPort: number
+    remotePort?: number
+  }) => ipcRenderer.invoke('ssh:tunnel:start', params),
+  stopSshTunnel: (params: { tunnelId: string }) => ipcRenderer.invoke('ssh:tunnel:stop', params),
+  connectReadyData: (id) => {
+    return new Promise((resolve) => {
+      const channel = `ssh:connect:data:${id}`
+      let resolved = false
+
+      const handler = (_event, data) => {
+        // Only resolve when receiving non-empty command list
+        if (data?.commandList?.length > 0 && !resolved) {
+          resolved = true
+          ipcRenderer.removeListener(channel, handler)
+          resolve(data)
+        }
+      }
+
+      ipcRenderer.on(channel, handler)
+
+      setTimeout(() => {
+        if (!resolved) {
+          resolved = true
+          ipcRenderer.removeListener(channel, handler)
+          resolve({ hasSudo: false, commandList: [] })
+        }
+      }, COMMAND_LIST_TIMEOUT)
+    })
+  },
+  checkSftpConnAvailable: (id: string) => ipcRenderer.invoke('ssh:sftp:conn:check', { id }),
+  shell: (params) => ipcRenderer.invoke('ssh:shell', params),
+  resizeShell: (id, cols, rows) => ipcRenderer.invoke('ssh:shell:resize', { id, cols, rows }),
+  sshSftpList: (opts: { id: string; path: string }) => ipcRenderer.invoke('ssh:sftp:list', opts) as Promise<FileRecord[] | string[]>,
+  sftpConnList: () => ipcRenderer.invoke('ssh:sftp:conn:list') as Promise<SftpConnectionInfo[]>,
+  sftpConnect: (connectionInfo) => ipcRenderer.invoke('ssh:sftp:connect', connectionInfo) as Promise<SftpConnectResult>,
+  sftpClose: (payload: { id: string }) => ipcRenderer.invoke('ssh:sftp:close', payload),
+  sftpCancel: (payload: { id: string; requestId: string }) => ipcRenderer.invoke('ssh:sftp:cancel', payload),
+  sshConnExec: (args: { id: string; cmd: string }) => ipcRenderer.invoke('ssh:conn:exec', args) as Promise<ExecResult>,
+  writeToShell: (params) => ipcRenderer.send('ssh:shell:write', params),
+
+  setShellPid: (id: string) => ipcRenderer.invoke('ssh:shell-pid-set', { id }),
+  getCwd: (payload: { id: string }) => ipcRenderer.invoke('ssh:cwd:get', payload) as Promise<any>,
+  disconnect: (params) => ipcRenderer.invoke('ssh:disconnect', params),
+  selectPrivateKey: () => ipcRenderer.invoke('ssh:select-private-key'),
+  getAppPath: (name) => ipcRenderer.invoke('app:get-path', { name }),
+  onShellData: (id, callback) => {
+    const listener = (_event, data) => callback(data)
+    ipcRenderer.on(`ssh:shell:data:${id}`, listener)
+    return () => ipcRenderer.removeListener(`ssh:shell:data:${id}`, listener)
+  },
+  onShellError: (id, callback) => {
+    const listener = (_event, data) => callback(data)
+    ipcRenderer.on(`ssh:shell:stderr:${id}`, listener)
+    return () => ipcRenderer.removeListener(`ssh:shell:stderr:${id}`, listener)
+  },
+  onShellClose: (id, callback) => {
+    const listener = (_event, data) => callback(data)
+    ipcRenderer.on(`ssh:shell:close:${id}`, listener)
+    return () => ipcRenderer.removeListener(`ssh:shell:close:${id}`, listener)
+  },
+  recordTerminalState: (params) => ipcRenderer.invoke('ssh:recordTerminalState', params),
+  recordCommand: (params) => ipcRenderer.invoke('ssh:recordCommand', params),
+
+  chatermConnectAssetInfo: async (data) => {
+    const result = await ipcRenderer.invoke('chaterm-connect-asset-info', data)
+    return result
+  },
+  cancelTask: async (tabContext?: { tabId?: string } | string) => {
+    try {
+      const payload = typeof tabContext === 'string' ? { tabId: tabContext } : tabContext
+      const result = await ipcRenderer.invoke('cancel-task', payload)
+      return result
+    } catch (error) {
+      return Promise.reject(error)
+    }
+  },
+  gracefulCancelTask: async (tabContext?: { tabId?: string } | string) => {
+    try {
+      const payload = typeof tabContext === 'string' ? { tabId: tabContext } : tabContext
+      const result = await ipcRenderer.invoke('graceful-cancel-task', payload)
+      return result
+    } catch (error) {
+      return Promise.reject(error)
+    }
+  },
+  sendToMain: (message: WebviewMessage) => ipcRenderer.invoke('webview-to-main', message) as Promise<void | null>,
+  onMainMessage: (callback) => {
+    const handler = (_event, message) => callback(message)
+    ipcRenderer.on('main-to-webview', handler)
+    return () => {
+      ipcRenderer.removeListener('main-to-webview', handler)
+    }
+  },
+  // Dedicated IPC channel for command generation responses
+  onCommandGenerationResponse: (callback) => {
+    const handler = (_event, response) => callback(response)
+    ipcRenderer.on('command-generation-response', handler)
+    return () => {
+      ipcRenderer.removeListener('command-generation-response', handler)
+    }
+  },
+  // Dedicated IPC channel for explain command responses
+  onCommandExplainResponse: (callback) => {
+    const handler = (_event, response) => callback(response)
+    ipcRenderer.on('command-explain-response', handler)
+    return () => {
+      ipcRenderer.removeListener('command-explain-response', handler)
+    }
+  },
+  // New method to call executeRemoteCommand in the main process
+  executeRemoteCommandViaPreload: async () => {
+    try {
+      const result = await ipcRenderer.invoke('execute-remote-command')
+      return result
+    } catch (error) {
+      // Ensure error is a serializable object
+      if (error instanceof Error) {
+        return {
+          success: false,
+          error: { message: error.message, name: error.name, stack: error.stack }
+        }
+      }
+      return { success: false, error: { message: 'An unknown error occurred in preload' } }
+    }
+  },
+
+  validateApiKey: async (configuration?: Record<string, unknown>) => {
+    try {
+      const result = await ipcRenderer.invoke('validate-api-key', configuration)
+      return result
+    } catch (error) {
+      return Promise.reject(error)
+    }
+  },
+  // Telemetry events
+  captureButtonClick: async (button: string, properties?: Record<string, unknown>) => {
+    try {
+      const result = await ipcRenderer.invoke('capture-telemetry-event', {
+        eventType: 'button_click',
+        data: { button, properties }
+      })
+      return result
+    } catch (error) {
+      return Promise.reject(error)
+    }
+  },
+  checkUpdate: () => ipcRenderer.invoke('update:checkUpdate'),
+  download: () => ipcRenderer.invoke('update:download'),
+  showOpenDialog: (options) => ipcRenderer.invoke('dialog:openFile', options),
+  stageChatAttachment: (payload: { taskId: string; srcAbsPath: string }) =>
+    ipcRenderer.invoke('agent:stage-chat-attachment', payload) as Promise<{ mode: 'as_is'; refPath: string } | { mode: 'offload'; refPath: string }>,
+  getHomePath: () => ipcRenderer.invoke('app:getHomePath'),
+  autoUpdate: (update) => {
+    ipcRenderer.on('update:autoUpdate', (_event, params) => update(params))
+  },
+  quitAndInstall: () => ipcRenderer.invoke('update:quitAndInstall'),
+  getVersionPrompt: () => ipcRenderer.invoke('version:operation', 'getPrompt'),
+  dismissVersionPrompt: () => ipcRenderer.invoke('version:operation', 'dismissPrompt'),
+  getReleaseNotes: (version?: string) => ipcRenderer.invoke('version:operation', 'getReleaseNotes', { version }),
+  updateTheme: (params) => ipcRenderer.invoke('update-theme', params),
+  mainWindowShow: () => ipcRenderer.invoke('main-window-show'),
+  onSystemThemeChanged: (callback: (theme: string) => void) => {
+    const listener = (_event: unknown, theme: string) => callback(theme)
+    ipcRenderer.on('system-theme-changed', listener)
+    return () => ipcRenderer.removeListener('system-theme-changed', listener)
+  },
+  // Add JumpServer status update listener
+  onJumpServerStatusUpdate: (callback) => {
+    const listener = (_event, data) => {
+      callback(data)
+    }
+    ipcRenderer.on('jumpserver:status-update', listener)
+    return () => ipcRenderer.removeListener('jumpserver:status-update', listener)
+  },
+  openExternalLogin: () => ipcRenderer.invoke('open-external-login'),
+
+  // sftp
+  onTransferProgress: (callback: (data: { id: string; remotePath: string; bytes: number; total: number; type: 'download' | 'upload' }) => void) => {
+    ipcRenderer.removeAllListeners('ssh:sftp:transfer-progress')
+    ipcRenderer.on('ssh:sftp:transfer-progress', (_event, data) => callback(data))
+  },
+  uploadFile: (opts: { id: string; remotePath: string; localPath: string }) => ipcRenderer.invoke('ssh:sftp:upload-file', opts),
+  uploadDirectory: (opts: { id: string; localDir: string; remoteDir: string }) => ipcRenderer.invoke('ssh:sftp:upload-directory', opts),
+  downloadFile: (opts: { id: string; remotePath: string; localPath: string }) => ipcRenderer.invoke('ssh:sftp:download-file', opts),
+  writeRemoteFile: (opts: { id: string; remotePath: string; content: string }) => ipcRenderer.invoke('ssh:sftp:write-file', opts),
+  onFileEditorReplace: (callback: () => void) => {
+    const listener = () => callback()
+    ipcRenderer.on('file-editor:replace', listener)
+    return () => ipcRenderer.removeListener('file-editor:replace', listener)
+  },
+  cancelFileTask: (opts: { taskKey: string }) => ipcRenderer.invoke('ssh:sftp:cancel-task', opts),
+  renameFile: (opts: { id: string; oldPath: string; newPath: string }) => ipcRenderer.invoke('ssh:sftp:rename-move', opts),
+  deleteFile: (opts: { id: string; remotePath: string }) => ipcRenderer.invoke('ssh:sftp:delete-file', opts),
+  chmodFile: (opts: { id: string; remotePath: string; mode: number; recursive: boolean }) => ipcRenderer.invoke('ssh:sftp:chmod', opts),
+  openFileDialog: () => ipcRenderer.invoke('dialog:open-file'),
+  openDirectoryDialog: () => ipcRenderer.invoke('dialog:open-directory'),
+  openSaveDialog: (opts: { fileName: string }) => ipcRenderer.invoke('dialog:save-file', opts),
+  writeLocalFile: async (filePath: string, content: string) => {
+    await fs.promises.writeFile(filePath, content, 'utf-8')
+  },
+  downloadDirectory: (args: { id: string; remoteDir: string; localDir: string }) => ipcRenderer.invoke('ssh:sftp:download-directory', args),
+
+  transferFileRemoteToRemote: (args: { fromId: string; toId: string; fromPath: string; toPath: string; autoRename?: boolean }) =>
+    ipcRenderer.invoke('sftp:r2r:file', args),
+
+  transferDirectoryRemoteToRemote: (args: {
+    fromId: string
+    toId: string
+    fromDir: string
+    toDir: string
+    autoRename?: boolean
+    concurrency?: number
+  }) => ipcRenderer.invoke('sftp:r2r:dir', args),
+
+  copyOrMoveBySftp: (args: { id: string; srcPath: string; targetPath: string; action: 'copy' | 'move' }) =>
+    ipcRenderer.invoke('ssh:sftp:copy-or-move', args),
+
+  kbCheckPath: (absPath: string) => ipcRenderer.invoke('kb:check-path', { absPath }),
+  kbEnsureRoot: () => ipcRenderer.invoke('kb:ensure-root'),
+  kbGetRoot: () => ipcRenderer.invoke('kb:get-root'),
+  kbListDir: (relDir: string) => ipcRenderer.invoke('kb:list-dir', { relDir }),
+  kbReadFile: (relPath: string, encoding?: 'utf-8' | 'base64') => ipcRenderer.invoke('kb:read-file', { relPath, encoding }),
+  kbWriteFile: (relPath: string, content: string, encoding?: 'utf-8' | 'base64') =>
+    ipcRenderer.invoke('kb:write-file', { relPath, content, encoding }),
+  kbCreateImage: (relDir: string, name: string, base64: string) => ipcRenderer.invoke('kb:create-image', { relDir, name, base64 }),
+  kbMkdir: (relDir: string, name: string) => ipcRenderer.invoke('kb:mkdir', { relDir, name }),
+  kbCreateFile: (relDir: string, name: string, content?: string) => ipcRenderer.invoke('kb:create-file', { relDir, name, content }),
+  kbRename: (relPath: string, newName: string) => ipcRenderer.invoke('kb:rename', { relPath, newName }),
+  kbDelete: (relPath: string, recursive?: boolean) => ipcRenderer.invoke('kb:delete', { relPath, recursive }),
+  kbMove: (srcRelPath: string, dstRelDir: string) => ipcRenderer.invoke('kb:move', { srcRelPath, dstRelDir }),
+  kbCopy: (srcRelPath: string, dstRelDir: string) => ipcRenderer.invoke('kb:copy', { srcRelPath, dstRelDir }),
+  kbImportFile: (srcAbsPath: string, dstRelDir: string) => ipcRenderer.invoke('kb:import-file', { srcAbsPath, dstRelDir }),
+  kbImportFolder: (srcAbsPath: string, dstRelDir: string) => ipcRenderer.invoke('kb:import-folder', { srcAbsPath, dstRelDir }),
+  kbSetSearchEnabled: (enabled: boolean) => ipcRenderer.invoke('kb:set-search-enabled', enabled),
+  onKbTransferProgress: (callback: (data: { jobId: string; transferred: number; total: number; destRelPath: string }) => void) => {
+    const listener = (_event: unknown, data: { jobId: string; transferred: number; total: number; destRelPath: string }) => callback(data)
+    ipcRenderer.on('kb:transfer-progress', listener)
+    return () => ipcRenderer.removeListener('kb:transfer-progress', listener)
+  },
+  kbSyncGetStatus: () => ipcRenderer.invoke('kb:sync-get-status'),
+  kbSyncLastTime: () => ipcRenderer.invoke('kb:sync-last-time'),
+  kbSyncLastResults: () => ipcRenderer.invoke('kb:sync-last-results'),
+  getKbCloudStorage: () => ipcRenderer.invoke('kb:get-cloud-storage'),
+
+  agentEnableAndConfigure: (opts: { enabled: boolean }) => ipcRenderer.invoke('ssh:agent:enable-and-configure', opts),
+  addKey: (opts: { keyData: string; passphrase?: string; comment?: string }) => ipcRenderer.invoke('ssh:agent:add-key', opts),
+  removeKey: (opts: { keyId: string }) => ipcRenderer.invoke('ssh:agent:remove-key', opts),
+  listKeys: () => ipcRenderer.invoke('ssh:agent:list-key') as Promise<[]>,
+
+  connectLocal: (config: {
+    id: string
+    shell?: string
+    cwd?: string
+    env?: Record<string, string>
+    cols?: number
+    rows?: number
+    startupMode?: 'interactive' | 'fast'
+  }) => ipcRenderer.invoke('local:connect', config),
+  sendDataLocal: (terminalId: string, data: string) => ipcRenderer.invoke('local:send:data', terminalId, data),
+  resizeLocal: (terminalId: string, cols: number, rows: number) => ipcRenderer.invoke('local:resize', terminalId, cols, rows),
+  closeLocal: (terminalId: string) => ipcRenderer.invoke('local:close', terminalId),
+  getShellsLocal: () => ipcRenderer.invoke('local:get:shells'),
+  onDataLocal: (id: string, callback: (data: string) => void) => {
+    const channel = `local:data:${id}`
+    const listener = (_event: unknown, data: string) => callback(data)
+    ipcRenderer.on(channel, listener)
+    return () => ipcRenderer.removeListener(channel, listener)
+  },
+
+  onErrorLocal: (id: string, callback: (error: unknown) => void) => {
+    const channel = `local:error:${id}`
+    const listener = (_event: unknown, error: unknown) => callback(error)
+    ipcRenderer.on(channel, listener)
+    return () => ipcRenderer.removeListener(channel, listener)
+  },
+
+  onExitLocal: (id: string, callback: (exitCode: unknown) => void) => {
+    const channel = `local:exit:${id}`
+    const listener = (_event: unknown, code: unknown) => callback(code)
+    ipcRenderer.on(channel, listener)
+    return () => ipcRenderer.removeListener(channel, listener)
+  },
+
+  // Serial (UART) terminal API
+  connectSerial: (config: {
+    id: string
+    path: string
+    baudRate?: number
+    dataBits?: number
+    stopBits?: number
+    parity?: string
+    flowControl?: string
+    cols?: number
+    rows?: number
+    termType?: string
+  }) => ipcRenderer.invoke('serial:connect', config),
+  sendDataSerial: (terminalId: string, data: string) => ipcRenderer.invoke('serial:send:data', terminalId, data),
+  resizeSerial: (terminalId: string, cols: number, rows: number) => ipcRenderer.invoke('serial:resize', terminalId, cols, rows),
+  closeSerial: (terminalId: string) => ipcRenderer.invoke('serial:close', terminalId),
+  getSerialPorts: () => ipcRenderer.invoke('serial:get:ports'),
+  onDataSerial: (id: string, callback: (data: string) => void) => {
+    const channel = `serial:data:${id}`
+    const listener = (_event: unknown, data: string) => callback(data)
+    ipcRenderer.on(channel, listener)
+    return () => ipcRenderer.removeListener(channel, listener)
+  },
+  onErrorSerial: (id: string, callback: (error: unknown) => void) => {
+    const channel = `serial:error:${id}`
+    const listener = (_event: unknown, error: unknown) => callback(error)
+    ipcRenderer.on(channel, listener)
+    return () => ipcRenderer.removeListener(channel, listener)
+  },
+  onExitSerial: (id: string, callback: (exitCode: unknown) => void) => {
+    const channel = `serial:exit:${id}`
+    const listener = (_event: unknown, code: unknown) => callback(code)
+    ipcRenderer.on(channel, listener)
+    return () => ipcRenderer.removeListener(channel, listener)
+  },
+
+  // Security configuration
+  openSecurityConfig: () => ipcRenderer.invoke('security-open-config'),
+  getSecurityConfigPath: () => ipcRenderer.invoke('security-get-config-path'),
+  readSecurityConfig: () => ipcRenderer.invoke('security-read-config'),
+  writeSecurityConfig: (content: string) => ipcRenderer.invoke('security-write-config', content),
+  onSecurityConfigFileChanged: (callback: (content: string) => void) => {
+    const listener = (_event, content) => callback(content)
+    ipcRenderer.on('security-config-file-changed', listener)
+    return () => ipcRenderer.removeListener('security-config-file-changed', listener)
+  },
+
+  // Keyword Highlight configuration
+  getKeywordHighlightConfigPath: () => ipcRenderer.invoke('keyword-highlight-get-config-path'),
+  readKeywordHighlightConfig: () => ipcRenderer.invoke('keyword-highlight-read-config'),
+  writeKeywordHighlightConfig: (content: string) => ipcRenderer.invoke('keyword-highlight-write-config', content),
+  onKeywordHighlightConfigFileChanged: (callback: (content: string) => void) => {
+    const listener = (_event, content) => callback(content)
+    ipcRenderer.on('keyword-highlight-config-file-changed', listener)
+    return () => ipcRenderer.removeListener('keyword-highlight-config-file-changed', listener)
+  },
+
+  // IndexedDB migration related API
+  getMigrationStatus: (params: { dataSource?: string }) => ipcRenderer.invoke('db:migration:status', params),
+  aliasesQuery: (params: { action: string; searchText?: string; alias?: string }) => ipcRenderer.invoke('db:aliases:query', params),
+  aliasesMutate: (params: { action: string; data?: any; alias?: string }) => ipcRenderer.invoke('db:aliases:mutate', params),
+  kvGet: (params: { key?: string }) => ipcRenderer.invoke('db:kv:get', params),
+  kvMutate: (params: { action: string; key: string; value?: string }) => ipcRenderer.invoke('db:kv:mutate', params),
+  async kvTransaction(
+    callback: (tx: { get(key: string): Promise<string | null>; set(key: string, value: string): void; delete(key: string): void }) => Promise<void>
+  ): Promise<void> {
+    const ops: Array<{ action: 'set'; key: string; value: string } | { action: 'delete'; key: string }> = []
+    const tx = {
+      async get(key: string): Promise<string | null> {
+        const row = await ipcRenderer.invoke('db:kv:get', { key })
+        if (row && row.value) {
+          return row.value
+        }
+        return null
+      },
+      set(key: string, value: string): void {
+        ops.push({ action: 'set', key, value })
+      },
+      delete(key: string): void {
+        ops.push({ action: 'delete', key })
+      }
+    }
+    await callback(tx)
+    if (ops.length > 0) {
+      await ipcRenderer.invoke('db:kv:transaction', ops)
+    }
+  },
+  saveCustomBackground: (sourcePath: string) => ipcRenderer.invoke('saveCustomBackground', sourcePath),
+
+  // Plugin
+  installPlugin(filePath: string) {
+    return ipcRenderer.invoke('plugins.install', filePath)
+  },
+
+  // Uninstall plugin
+  uninstallPlugin(pluginId: string) {
+    return ipcRenderer.invoke('plugins.uninstall', pluginId)
+  },
+
+  reloadPlugins() {
+    return ipcRenderer.invoke('plugins.reload')
+  },
+
+  listPlugins() {
+    return ipcRenderer.invoke('plugins.listUi')
+  },
+
+  getPluginsVersion(): Promise<string | null> {
+    return ipcRenderer.invoke('plugins.getPluginsVersion')
+  },
+
+  getPluginDetails(pluginName: string) {
+    return ipcRenderer.invoke('plugins.details', pluginName)
+  },
+
+  downloadPluginPackage(url: string) {
+    return ipcRenderer.invoke('plugin:downloadPackage', { url })
+  },
+
+  installPluginFromUrl(payload: { pluginId: string; version?: string; fileName?: string; url: string; sha256?: string }) {
+    return ipcRenderer.invoke('plugin:installFromUrl', payload)
+  },
+
+  cancelPluginInstall(pluginId: string) {
+    return ipcRenderer.invoke('plugin:cancelInstall', { pluginId })
+  },
+
+  onPluginInstallProgress(
+    callback: (payload: {
+      pluginId: string
+      stage: 'downloading' | 'verifying' | 'installing' | 'done' | 'error' | 'cancelled'
+      receivedBytes?: number
+      totalBytes?: number
+      percent?: number
+    }) => void
+  ) {
+    const listener = (
+      _event: any,
+      payload: {
+        pluginId: string
+        stage: 'downloading' | 'verifying' | 'installing' | 'done' | 'error' | 'cancelled'
+        receivedBytes?: number
+        totalBytes?: number
+        percent?: number
+      }
+    ) => callback(payload)
+    ipcRenderer.on('plugin:install-progress', listener)
+    return () => ipcRenderer.removeListener('plugin:install-progress', listener)
+  },
+
+  installPluginFromBuffer(payload: { pluginId: string; version?: string; fileName?: string; data: ArrayBuffer }) {
+    return ipcRenderer.invoke('plugin:installFromBuffer', payload)
+  },
+
+  getInstallHint(pluginId: string) {
+    return ipcRenderer.invoke('plugins:get-install-hint', pluginId)
+  },
+  getPluginViews: () => ipcRenderer.invoke('plugin:get-views'),
+
+  // Obtain detailed configuration of the view
+  getViewMetadata: (viewId: string) => ipcRenderer.invoke('plugin:get-view-metadata', viewId),
+  onPluginMetadataChanged: (callback) => {
+    const listener = () => callback()
+    ipcRenderer.on('plugin:metadata-changed', listener)
+    return () => ipcRenderer.removeListener('plugin:metadata-changed', listener)
+  },
+
+  // Request the plugin to provide tree node data
+  getTreeNodes: (params: { viewId: string; element?: any }) => ipcRenderer.invoke('plugin:get-tree-nodes', params),
+
+  // Retrieve all context variables currently in memory (for initializing ExtensionViewHost)
+  getAllContexts: () => ipcRenderer.invoke('plugin:get-all-contexts'),
+
+  // Monitor context changes pushed by the main process
+  onContextUpdate: (callback: (data: { key: string; value: any }) => void) => {
+    const subscription = (_event: any, data: any) => callback(data)
+    ipcRenderer.on('plugin:context-changed', subscription)
+    return () => ipcRenderer.removeListener('plugin:context-changed', subscription)
+  },
+
+  // Monitor refresh view instructions from the plugin or main process
+  onRefreshView: (viewId: string, callback: () => void) => {
+    const channel = `plugin:refresh-view:${viewId}`
+    const subscription = () => callback()
+    ipcRenderer.on(channel, subscription)
+    return () => ipcRenderer.removeListener(channel, subscription)
+  },
+
+  readFile: (filePath: string) => ipcRenderer.invoke('plugin:read-file', filePath),
+
+  writeFile: (filePath: string, content: string) => ipcRenderer.invoke('plugin:write-file', { filePath, content }),
+
+  // Execute the command for plugin registration or the host core command
+  executeCommand: (commandId: string, ...args: any[]) =>
+    ipcRenderer.invoke('plugin:execute-command', { commandId, args: args.length === 1 ? args[0] : args }),
+
+  // Listen for the "Open Editor" request
+  onOpenEditorRequest: (callback: (params: any) => void) => {
+    const subscription = (_event: any, params: any) => callback(params)
+    ipcRenderer.on('plugin:open-editor-request', subscription)
+    return () => ipcRenderer.removeListener('plugin:open-editor-request', subscription)
+  },
+  // Listen for the "Open User Tab" request
+  onOpenUserTabRequest: (callback: (params: any) => void) => {
+    const subscription = (_event: any, params: any) => callback(params)
+    ipcRenderer.on('plugin:open-user-tab-request', subscription)
+    return () => ipcRenderer.removeListener('plugin:open-user-tab-request', subscription)
+  },
+
+  // Get registered bastion types (plugin-based, not including built-in JumpServer)
+  getRegisteredBastionTypes(): Promise<string[]> {
+    return ipcRenderer.invoke('plugin:getRegisteredBastionTypes')
+  },
+
+  // Get all registered bastion definitions (plugin metadata for UI rendering)
+  // Returns BastionDefinition[] as defined in index.d.ts
+  getBastionDefinitions(): Promise<import('./index.d').BastionDefinition[]> {
+    return ipcRenderer.invoke('plugin:getBastionDefinitions')
+  },
+
+  // Get a specific bastion definition by type
+  // Returns BastionDefinition | undefined as defined in index.d.ts
+  getBastionDefinition(type: string): Promise<import('./index.d').BastionDefinition | undefined> {
+    return ipcRenderer.invoke('plugin:getBastionDefinition', type)
+  },
+
+  // Check if a specific bastion type is available
+  hasBastionCapability(type: string): Promise<boolean> {
+    return ipcRenderer.invoke('plugin:hasBastionCapability', type)
+  },
+
+  // XTS file parsing
+  parseXtsFile: (data: { data: number[]; fileName: string }) => ipcRenderer.invoke('parseXtsFile', data),
+
+  pickUploadFiles: () => ipcRenderer.invoke('zmodem:pickUploadFiles'),
+  pickSavePath: (name) => ipcRenderer.invoke('zmodem:pickSavePath', name),
+  openStream: (savePath) => ipcRenderer.invoke('zmodem:openStream', savePath),
+  writeChunk: (streamId, chunk) => ipcRenderer.invoke('zmodem:writeChunk', streamId, chunk),
+  closeStream: (streamId) => ipcRenderer.invoke('zmodem:closeStream', streamId),
+
+  // K8s APIs
+  k8sGetContexts: () => ipcRenderer.invoke('k8s:get-contexts'),
+  k8sGetContextDetail: (contextName: string) => ipcRenderer.invoke('k8s:get-context-detail', contextName),
+  k8sSwitchContext: (contextName: string) => ipcRenderer.invoke('k8s:switch-context', contextName),
+  k8sReloadConfig: () => ipcRenderer.invoke('k8s:reload-config'),
+  k8sValidateContext: (contextName: string) => ipcRenderer.invoke('k8s:validate-context', contextName),
+  k8sInitialize: () => ipcRenderer.invoke('k8s:initialize'),
+
+  // K8s Proxy Configuration APIs
+  k8sSetProxy: (
+    proxyConfig: {
+      type?: 'HTTP' | 'HTTPS' | 'SOCKS4' | 'SOCKS5'
+      host: string
+      port: number
+      enableProxyIdentity?: boolean
+      username?: string
+      password?: string
+    } | null
+  ) => ipcRenderer.invoke('k8s:set-proxy', proxyConfig),
+  k8sGetProxy: () => ipcRenderer.invoke('k8s:get-proxy'),
+
+  // K8s watch stream APIs
+  k8sStartWatch: (contextName: string, resourceType: string, options?: any) =>
+    ipcRenderer.invoke('k8s:start-watch', contextName, resourceType, options),
+  k8sStopWatch: (contextName: string, resourceType: string) => ipcRenderer.invoke('k8s:stop-watch', contextName, resourceType),
+  k8sOnDeltaBatch: (callback: (batch: any) => void) => {
+    const listener = (_event: any, batch: any) => callback(batch)
+    ipcRenderer.on('k8s:delta-batch', listener)
+    return () => ipcRenderer.removeListener('k8s:delta-batch', listener)
+  },
+
+  // K8s Cluster Management APIs
+  k8sClusterList: () => ipcRenderer.invoke('k8s:cluster:list'),
+  k8sClusterGet: (id: string) => ipcRenderer.invoke('k8s:cluster:get', id),
+  k8sClusterAdd: (params: {
+    name: string
+    kubeconfigPath?: string
+    kubeconfigContent?: string
+    contextName: string
+    serverUrl: string
+    authType?: string
+    autoConnect?: boolean
+    defaultNamespace?: string
+  }) => ipcRenderer.invoke('k8s:cluster:add', params),
+  k8sClusterUpdate: (
+    id: string,
+    params: {
+      name?: string
+      kubeconfigPath?: string
+      kubeconfigContent?: string
+      contextName?: string
+      serverUrl?: string
+      authType?: string
+      isActive?: boolean
+      connectionStatus?: string
+      autoConnect?: boolean
+      defaultNamespace?: string
+    }
+  ) => ipcRenderer.invoke('k8s:cluster:update', id, params),
+  k8sClusterRemove: (id: string) => ipcRenderer.invoke('k8s:cluster:remove', id),
+  k8sClusterTest: (params: { kubeconfigPath?: string; kubeconfigContent?: string; contextName: string }) =>
+    ipcRenderer.invoke('k8s:cluster:test', params),
+  k8sClusterImportKubeconfig: (kubeconfigPath: string) => ipcRenderer.invoke('k8s:cluster:import-kubeconfig', kubeconfigPath),
+  k8sClusterConnect: (id: string) => ipcRenderer.invoke('k8s:cluster:connect', id),
+  k8sClusterDisconnect: (id: string) => ipcRenderer.invoke('k8s:cluster:disconnect', id),
+
+  // K8s Terminal APIs
+  k8sTerminalCreate: (config: { id: string; clusterId: string; namespace?: string; cols?: number; rows?: number }) =>
+    ipcRenderer.invoke('k8s:terminal:create', config),
+  k8sTerminalWrite: (terminalId: string, data: string) => ipcRenderer.invoke('k8s:terminal:write', terminalId, data),
+  k8sTerminalResize: (terminalId: string, cols: number, rows: number) => ipcRenderer.invoke('k8s:terminal:resize', terminalId, cols, rows),
+  k8sTerminalClose: (terminalId: string) => ipcRenderer.invoke('k8s:terminal:close', terminalId),
+  k8sTerminalList: (clusterId: string) => ipcRenderer.invoke('k8s:terminal:list', clusterId),
+  k8sOnTerminalData: (terminalId: string, callback: (data: string) => void) => {
+    const channel = `k8s:terminal:data:${terminalId}`
+    const listener = (_event: any, data: string) => callback(data)
+    ipcRenderer.on(channel, listener)
+    return () => ipcRenderer.removeListener(channel, listener)
+  },
+  k8sOnTerminalExit: (terminalId: string, callback: (exitCode: any) => void) => {
+    const channel = `k8s:terminal:exit:${terminalId}`
+    const listener = (_event: any, exitCode: any) => callback(exitCode)
+    ipcRenderer.on(channel, listener)
+    return () => ipcRenderer.removeListener(channel, listener)
+  },
+
+  // ============================================================================
+  // K8S Agent API
+  // ============================================================================
+
+  k8sAgentSetCluster: (params: {
+    clusterId: string
+    contextName: string
+    kubeconfigPath?: string
+    kubeconfigContent?: string
+    sourceType?: string
+    bastionUuid?: string
+    bastionAssetAddress?: string
+    bastionAssetName?: string
+    bastionAssetIdLast?: number | null
+  }) => ipcRenderer.invoke('k8s:agent:set-cluster', params),
+
+  k8sAgentSetProxy: (
+    proxyConfig: {
+      type?: 'HTTP' | 'HTTPS' | 'SOCKS4' | 'SOCKS5'
+      host: string
+      port: number
+      enableProxyIdentity?: boolean
+      username?: string
+      password?: string
+    } | null
+  ) => ipcRenderer.invoke('k8s:agent:set-proxy', proxyConfig),
+
+  k8sAgentKubectl: (command: string, timeout?: number) => ipcRenderer.invoke('k8s:agent:kubectl', command, timeout),
+
+  k8sAgentGetPods: (namespace?: string) => ipcRenderer.invoke('k8s:agent:get-pods', namespace),
+
+  k8sAgentGetNodes: () => ipcRenderer.invoke('k8s:agent:get-nodes'),
+
+  k8sAgentGetNamespaces: () => ipcRenderer.invoke('k8s:agent:get-namespaces'),
+
+  k8sAgentGetServices: (namespace?: string) => ipcRenderer.invoke('k8s:agent:get-services', namespace),
+
+  k8sAgentGetDeployments: (namespace?: string) => ipcRenderer.invoke('k8s:agent:get-deployments', namespace),
+
+  k8sAgentGetPodLogs: (params: { podName: string; namespace?: string; container?: string; tailLines?: number }) =>
+    ipcRenderer.invoke('k8s:agent:get-pod-logs', params),
+
+  k8sAgentDescribe: (params: { resourceType: string; resourceName: string; namespace?: string }) => ipcRenderer.invoke('k8s:agent:describe', params),
+
+  k8sAgentTestConnection: () => ipcRenderer.invoke('k8s:agent:test-connection'),
+
+  k8sAgentGetCurrentCluster: () => ipcRenderer.invoke('k8s:agent:get-current-cluster'),
+
+  k8sAgentCleanup: () => ipcRenderer.invoke('k8s:agent:cleanup'),
+
+  k8sJumpserverSyncAssets: (params: { bastionUuid: string }) => ipcRenderer.invoke('k8s:jumpserver:sync-assets', params),
+
+  // ============================================================================
+  // Interactive Command Execution API
+  // ============================================================================
+
+  /**
+   * Listen for interaction requests from main process
+   */
+  onInteractionNeeded: (callback: (request: import('./index.d').InteractionRequest) => void) => {
+    const listener = (_event: any, request: import('./index.d').InteractionRequest) => callback(request)
+    ipcRenderer.on('interaction-needed', listener)
+    return () => ipcRenderer.removeListener('interaction-needed', listener)
+  },
+
+  /**
+   * Listen for interaction close events from main process
+   */
+  onInteractionClosed: (callback: (data: { commandId: string }) => void) => {
+    const listener = (_event: any, data: { commandId: string }) => callback(data)
+    ipcRenderer.on('interaction-closed', listener)
+    return () => ipcRenderer.removeListener('interaction-closed', listener)
+  },
+
+  /**
+   * Listen for interaction suppressed events from main process
+   */
+  onInteractionSuppressed: (callback: (data: { commandId: string }) => void) => {
+    const listener = (_event: any, data: { commandId: string }) => callback(data)
+    ipcRenderer.on('interaction-suppressed', listener)
+    return () => ipcRenderer.removeListener('interaction-suppressed', listener)
+  },
+
+  /**
+   * Listen for TUI detected events from main process
+   */
+  onTuiDetected: (callback: (data: { commandId: string; taskId?: string; message: string }) => void) => {
+    const listener = (_event: any, data: { commandId: string; taskId?: string; message: string }) => callback(data)
+    ipcRenderer.on('tui-detected', listener)
+    return () => ipcRenderer.removeListener('tui-detected', listener)
+  },
+
+  /**
+   * Listen for alternate screen entered events (TUI programs like vim, man, git log)
+   */
+  onAlternateScreenEntered: (callback: (data: { commandId: string; taskId?: string; message: string }) => void) => {
+    const listener = (_event: any, data: { commandId: string; taskId?: string; message: string }) => callback(data)
+    ipcRenderer.on('alternate-screen-entered', listener)
+    return () => ipcRenderer.removeListener('alternate-screen-entered', listener)
+  },
+
+  /**
+   * Submit user interaction response
+   */
+  submitInteraction: (response: import('./index.d').InteractionResponse) => ipcRenderer.invoke('submit-interaction', response),
+
+  /**
+   * Cancel interaction (sends Ctrl+C)
+   */
+  cancelInteraction: (commandId: string) => ipcRenderer.invoke('cancel-interaction', commandId),
+
+  /**
+   * Dismiss interaction (close UI but continue detection)
+   */
+  dismissInteraction: (commandId: string) => ipcRenderer.invoke('dismiss-interaction', commandId),
+
+  /**
+   * Suppress interaction detection for a command
+   */
+  suppressInteraction: (commandId: string) => ipcRenderer.invoke('suppress-interaction', commandId),
+
+  /**
+   * Resume interaction detection for a suppressed command
+   */
+  unsuppressInteraction: (commandId: string) => ipcRenderer.invoke('unsuppress-interaction', commandId),
+
+  // Performance marks
+  reportPerfMarks: (marks: Array<{ name: string; startTime: number; timestamp: number }>) => ipcRenderer.invoke('perf:report-marks', marks),
+  getPerfTimeline: () => ipcRenderer.invoke('perf:get-startup-timeline'),
+
+  /**
+   * Send a log entry from renderer to main process
+   */
+  log: (payload: {
+    level: 'debug' | 'info' | 'warn' | 'error'
+    process: 'renderer' | 'preload'
+    module: string
+    message: string
+    meta?: Record<string, unknown>
+  }) => ipcRenderer.invoke('log:write', payload),
+
+  /**
+   * Open the log directory in the system file manager
+   */
+  openLogDir: () => ipcRenderer.invoke('logging:openDir'),
+
+  /**
+   * Listen for auth token expiry notifications from main process.
+   * Returns an unsubscribe function.
+   */
+  onTokenExpired: (callback: () => void): (() => void) => {
+    const listener = () => callback()
+    ipcRenderer.on('auth:token-expired', listener)
+    return () => ipcRenderer.removeListener('auth:token-expired', listener)
+  }
+}
+// Custom API for browser control
+
+// Use `contextBridge` APIs to expose Electron APIs to
+// renderer only if context isolation is enabled, otherwise
+// just add to the DOM global.
+perfMark('chaterm/preload/willExposeBridge')
+if (process.contextIsolated) {
+  try {
+    contextBridge.exposeInMainWorld('electron', {
+      electronAPI,
+      ipcRenderer: {
+        send: (channel, ...args) => ipcRenderer.send(channel, ...args),
+        on: (channel, listener) => ipcRenderer.on(channel, listener),
+        removeAllListeners: (channel) => ipcRenderer.removeAllListeners(channel)
+      },
+      getCurrentURL: () => window.location.href // Get current URL via window.location
+    })
+    contextBridge.exposeInMainWorld('api', api)
+    perfMark('chaterm/preload/didExposeBridge')
+  } catch {
+    perfMark('chaterm/preload/didFailExposeBridge')
+    // Silently ignore contextBridge errors
+  }
+} else {
+  // @ts-ignore (define in dts)
+  window.electron = electronAPI
+  // @ts-ignore (define in dts)
+  window.api = api
+  perfMark('chaterm/preload/didExposeBridge')
+}
+
+void reportPreloadMarksToMain()

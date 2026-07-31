@@ -1,0 +1,3806 @@
+// ============ Performance Marks (must be the very first import) ============
+// Catch EPIPE errors on stdout/stderr — non-fatal but noisy when the parent pipe closes.
+process.stdout?.on?.('error', (err: NodeJS.ErrnoException) => {
+  if (err.code === 'EPIPE') return
+  throw err
+})
+process.stderr?.on?.('error', (err: NodeJS.ErrnoException) => {
+  if (err.code === 'EPIPE') return
+  throw err
+})
+
+import { mark, registerPerfIpcHandlers, collectAndLogTimeline, scheduleStartupTimelineFallback, logStartupTimeline } from '@perf'
+// 'chaterm/main/start' is recorded at module load time inside @perf
+
+// ============ Initialize userData path FIRST (MUST be before all other imports) ============
+import { initUserDataPath, getUserDataPath } from './config/edition'
+mark('chaterm/main/willInitUserDataPath')
+initUserDataPath()
+mark('chaterm/main/didInitUserDataPath')
+// ============ userData path initialization complete ============
+
+// ============ Migrate database directory BEFORE Chromium initializes ============
+// IMPORTANT: This must be done before importing Electron modules
+import { migrateDbDirBeforeChromium } from './storage/db/early-migration'
+mark('chaterm/main/willEarlyMigration')
+migrateDbDirBeforeChromium()
+mark('chaterm/main/didEarlyMigration')
+// ============ Early migration complete ============
+
+import { app, shell, BrowserWindow, ipcMain, session, net, protocol } from 'electron'
+import path, { join } from 'path'
+import { electronApp } from '@electron-toolkit/utils'
+import { is } from '@electron-toolkit/utils'
+import * as fs from 'fs/promises'
+import { startDataSync, AuthExpiredError } from './storage/data_sync/index'
+import type { SyncController as DataSyncController } from './storage/data_sync/core/SyncController'
+import { getChatermDbPathForUser, getCurrentUserId, setMainWindowWebContents } from './storage/db/connection'
+import { migrateCnUserDataOnFirstLaunch } from './storage/editionDataMigration'
+
+// Set environment variables
+process.env.IS_DEV = is.dev ? 'true' : 'false'
+
+import { registerSSHHandlers } from './ssh/sshHandle'
+import { registerLocalSSHHandlers } from './ssh/localSSHHandle'
+import { registerSerialHandlers, closeSerialTerminalByPath } from './ssh/serialHandle'
+import { registerRemoteTerminalHandlers } from './ssh/agentHandle'
+import { registerK8sHandlers } from './k8s/k8sHandle'
+import { registerDbAssetHandlers } from './database/dbAssetHandle'
+import { registerDbAiHandlers } from './database/dbAiHandle'
+import { autoCompleteDatabaseService, ChatermDatabaseService, setCurrentUserId } from './storage/database'
+import { getGuestUserId } from './storage/db/connection'
+import { Controller } from './agent/core/controller'
+import { executeRemoteCommand } from './agent/integrations/remote-terminal/example'
+import {
+  initializeStorageMain,
+  testStorageFromMain as testRendererStorageFromMain,
+  getGlobalState,
+  updateGlobalState,
+  getAllExtensionState
+} from './agent/core/storage/state'
+import { getTaskMetadata, saveTaskTitle, saveTaskFavorite, getTaskList } from './agent/core/storage/disk'
+import { createMainWindow, type WindowCreationResult } from './windowManager'
+import { registerWindowIpcHandlers } from './windowIpc'
+import { registerWindowMenu } from './windowMenu'
+import { registerUpdater } from './updater'
+import { setupPluginIpc } from './plugin/pluginIpc'
+import { telemetryService, checkIsFirstLaunch, getMacAddress } from './agent/services/telemetry/TelemetryService'
+import { envelopeEncryptionService } from './storage/data_sync/envelope_encryption/service'
+import { versionPromptService } from './version/versionPromptService'
+import { authFailureNotifier } from './services/authFailureNotifier'
+
+import * as fsSync from 'fs'
+import { createHash, createVerify, randomUUID } from 'crypto'
+import { pathToFileURL } from 'url'
+import { loadAllPlugins } from './plugin/pluginLoader'
+import {
+  getInstalledPlugin,
+  getAllPluginVersions,
+  installPlugin,
+  listPlugins,
+  PluginManifest,
+  uninstallPlugin,
+  getInstallHint,
+  getPluginCacheRoot
+} from './plugin/pluginManager'
+import { getPluginDetailsByName, getLocalizedStrings, getUserLanguage } from './plugin/pluginDetails'
+import { capabilityRegistry } from './ssh/capabilityRegistry'
+import { getActualTheme, loadUserTheme } from './themeManager'
+import { getLoginBaseUrl, getEdition, getProtocolPrefix, getProtocolName } from './config/edition'
+import { getBrandingConfig } from './config/branding'
+import { TelemetrySetting } from '@shared/TelemetrySetting'
+import { registerKnowledgeBaseHandlers, initKbSearchManager, closeKbSearchManager } from './services/knowledgebase'
+import { registerStageChatAttachmentHandlers } from './services/agent/stageChatAttachment'
+import { startKbSync, stopKbSync } from './services/knowledgebase/sync'
+import { setupInteractionIpcHandlers } from './agent/services/interaction-detector/ipc-handlers'
+import type { WebviewMessage } from '@shared/WebviewMessage'
+import type { SkillMetadata } from '@shared/skills'
+import { registerFileSystemHandlers } from './ssh/sftpTransfer'
+import { initLogging, logRendererCrash } from '@logging'
+import { parseXshellWakeupFromArgv, redactXshellWakeupForLog, type XshellWakeupPayload } from './integrations/xshellWakeup'
+
+const logger = createLogger('main')
+
+const getPluginUninstallErrorCode = (error: unknown): string => {
+  const message = String(error instanceof Error ? error.message : error || '')
+  if (/EPERM|EACCES|Permission denied/i.test(message)) {
+    return 'PLUGIN_UNINSTALL_DIRECTORY_BUSY'
+  }
+  return 'PLUGIN_UNINSTALL_FAILED'
+}
+
+type PreinstalledPluginConfig = {
+  id: string
+  fileName?: string
+  required?: boolean
+  autoInstall?: boolean
+  source?: 'preinstalled' | 'store' | 'local'
+}
+
+const parsePolicyEnabled = (raw: unknown): boolean | null => {
+  if (typeof raw !== 'string') return null
+  const normalized = raw.trim().toLowerCase()
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false
+  return null
+}
+
+const parseDeployStatus = (raw: unknown): number => {
+  if (typeof raw === 'number' && Number.isFinite(raw)) return raw
+  if (typeof raw !== 'string') return 0
+  const parsed = Number.parseInt(raw.trim(), 10)
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+// This runtime flag controls whether the client must require and verify signed OAuth Deep Link callbacks.
+const oauthDeepLinkSignatureEnabled = parsePolicyEnabled(process.env.CHATERM_OAUTH_DEEPLINK_SIGNATURE_ENABLED) === true
+const oauthDeepLinkPublicKeyPath = app.isPackaged
+  ? path.join(process.resourcesPath, 'oauth_deeplink_public_key.pem')
+  : path.join(process.cwd(), 'resources', 'oauth_deeplink_public_key.pem')
+
+const decodeBase64Url = (value: string): Buffer => {
+  const normalized = value.replace(/-/g, '+').replace(/_/g, '/')
+  const padding = normalized.length % 4
+  const paddedValue = padding === 0 ? normalized : normalized + '='.repeat(4 - padding)
+  return Buffer.from(paddedValue, 'base64')
+}
+
+const buildStableOAuthDeepLinkUserInfoJson = (userInfo: Record<string, unknown>): string => {
+  const keys = Object.keys(userInfo).sort()
+  const serializedEntries = keys.map((key) => `${JSON.stringify(key)}:${JSON.stringify(userInfo[key])}`)
+  return `{${serializedEntries.join(',')}}`
+}
+
+const buildOAuthDeepLinkSignaturePayload = (userInfo: Record<string, unknown>, method: string, state: string, timestamp: string): string => {
+  return `userInfo=${buildStableOAuthDeepLinkUserInfoJson(userInfo)}&method=${method}&state=${state}&timestamp=${timestamp}`
+}
+
+const verifyOAuthDeepLinkSignature = (params: {
+  userInfo: Record<string, unknown>
+  method: string
+  state: string
+  timestamp: string
+  sign: string
+}): boolean => {
+  const publicKey = fsSync.readFileSync(oauthDeepLinkPublicKeyPath, 'utf8')
+  const verifier = createVerify('RSA-SHA256')
+  const payload = buildOAuthDeepLinkSignaturePayload(params.userInfo, params.method, params.state, params.timestamp)
+  verifier.update(payload)
+  verifier.end()
+  return verifier.verify(publicKey, decodeBase64Url(params.sign))
+}
+
+const parsePreinstalledPluginConfig = (): PreinstalledPluginConfig[] => {
+  const raw = process.env.CHATERM_PREINSTALLED_PLUGINS
+  if (!raw) return []
+  try {
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((item): item is PreinstalledPluginConfig => typeof item?.id === 'string' && item.id.trim().length > 0)
+  } catch (error) {
+    logger.warn('Failed to parse preinstalled plugin config', { error: error })
+    return []
+  }
+}
+
+const compareVersion = (a?: string | null, b?: string | null): number => {
+  if (!a && !b) return 0
+  if (!a) return -1
+  if (!b) return 1
+  const pa = a.split('.').map((n) => Number.parseInt(n, 10) || 0)
+  const pb = b.split('.').map((n) => Number.parseInt(n, 10) || 0)
+  const length = Math.max(pa.length, pb.length)
+  for (let i = 0; i < length; i++) {
+    const va = pa[i] || 0
+    const vb = pb[i] || 0
+    if (va > vb) return 1
+    if (va < vb) return -1
+  }
+  return 0
+}
+
+const getPreinstalledPluginPackagePath = (plugin: PreinstalledPluginConfig): string => {
+  const fileName = plugin.fileName || `${plugin.id}.chaterm`
+  const resourceDir = app.isPackaged ? process.resourcesPath : path.join(process.cwd(), 'resources')
+  return path.join(resourceDir, 'preinstalled-plugins', fileName)
+}
+
+const bootstrapPreinstalledPlugins = async () => {
+  if (parseDeployStatus(process.env.CHATERM_DEPLOY_STATUS) === 0) {
+    return
+  }
+
+  const configuredPlugins = parsePreinstalledPluginConfig().filter((plugin) => plugin.autoInstall !== false)
+  if (configuredPlugins.length === 0) {
+    return
+  }
+
+  for (const plugin of configuredPlugins) {
+    const packagePath = getPreinstalledPluginPackagePath(plugin)
+    if (!fsSync.existsSync(packagePath)) {
+      logger.warn('Preinstalled plugin package not found', { pluginId: plugin.id, packagePath })
+      continue
+    }
+
+    const installed = getInstalledPlugin(plugin.id)
+    let shouldInstall = !installed
+
+    try {
+      const zip = new (require('adm-zip'))(packagePath)
+      const entry = zip.getEntry('plugin.json')
+      if (!entry) {
+        logger.warn('Preinstalled plugin package missing plugin.json', { pluginId: plugin.id, packagePath })
+        continue
+      }
+      const manifest = JSON.parse(zip.readAsText(entry)) as PluginManifest
+      if (!installed || compareVersion(installed.version, manifest.version) < 0) {
+        shouldInstall = true
+      } else {
+        shouldInstall = false
+      }
+    } catch (error) {
+      logger.warn('Failed to inspect preinstalled plugin package', { pluginId: plugin.id, packagePath, error: error })
+      continue
+    }
+
+    if (!shouldInstall) {
+      continue
+    }
+
+    if (installed) {
+      uninstallPlugin(plugin.id, { force: true })
+    }
+
+    installPlugin(packagePath, {
+      source: plugin.source || 'preinstalled',
+      required: plugin.required === true
+    })
+  }
+}
+
+let mainWindow: BrowserWindow
+let COOKIE_URL = 'http://localhost'
+let browserWindow: BrowserWindow | null = null
+let browserWindowOwner: BrowserWindow | null = null
+let forceQuit = false
+const mainWindows = new Set<BrowserWindow>()
+
+let autoCompleteService: autoCompleteDatabaseService
+let chatermDbService: ChatermDatabaseService
+let controller: Controller
+let dataSyncController: DataSyncController | null = null
+let chatSyncScheduler: import('./storage/chat_sync/services/ChatSyncScheduler').ChatSyncScheduler | null = null
+let pendingXshellWakeups: XshellWakeupPayload[] = []
+const EXTERNAL_LOGIN_STATE_TTL_MS = 5 * 60 * 1000
+
+type PendingExternalLoginState = {
+  state: string
+  createdAt: number
+  expiresAt: number
+  windowId: number
+}
+
+let pendingExternalLoginState: PendingExternalLoginState | null = null
+
+let winReadyResolve
+let winReady = new Promise((resolve) => (winReadyResolve = resolve))
+
+// Initialize unified logging system before app is ready
+initLogging()
+
+// Promise that resolves when the renderer page finishes loading.
+// Main-process initialization proceeds in parallel without waiting for this.
+let windowContentLoaded: Promise<void>
+
+const getPrimaryWindow = (): BrowserWindow | null => {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    return mainWindow
+  }
+
+  return [...mainWindows].find((window) => !window.isDestroyed()) ?? null
+}
+
+const getWindowFromSender = (sender: Electron.WebContents): BrowserWindow | null => {
+  const senderWindow = BrowserWindow.fromWebContents(sender)
+  if (senderWindow && !senderWindow.isDestroyed()) {
+    return senderWindow
+  }
+
+  return getPrimaryWindow()
+}
+
+const sendToRendererWindows = (channel: string, ...args: unknown[]): boolean => {
+  const windows = [...mainWindows].filter((window) => !window.isDestroyed())
+  for (const window of windows) {
+    if (!window.webContents.isDestroyed()) {
+      window.webContents.send(channel, ...args)
+    }
+  }
+  return windows.length > 0
+}
+
+const clearPendingExternalLoginState = async (): Promise<void> => {
+  pendingExternalLoginState = null
+
+  if (process.platform !== 'linux') {
+    return
+  }
+
+  try {
+    await session.defaultSession.cookies.remove(COOKIE_URL, 'chaterm_auth_state')
+  } catch (error) {
+    logger.warn('Failed to clear external login auth state cookie', { error: error })
+  }
+}
+
+const loadPendingExternalLoginStateFromCookie = async (): Promise<PendingExternalLoginState | null> => {
+  if (process.platform !== 'linux') {
+    return pendingExternalLoginState
+  }
+
+  try {
+    const authStateCookie = await session.defaultSession.cookies.get({
+      url: COOKIE_URL,
+      name: 'chaterm_auth_state'
+    })
+
+    if (!authStateCookie || authStateCookie.length === 0) {
+      return pendingExternalLoginState
+    }
+
+    const parsedState = JSON.parse(authStateCookie[0].value) as Partial<PendingExternalLoginState>
+    if (
+      typeof parsedState?.state !== 'string' ||
+      typeof parsedState?.createdAt !== 'number' ||
+      typeof parsedState?.expiresAt !== 'number' ||
+      typeof parsedState?.windowId !== 'number'
+    ) {
+      return null
+    }
+
+    return {
+      state: parsedState.state,
+      createdAt: parsedState.createdAt,
+      expiresAt: parsedState.expiresAt,
+      windowId: parsedState.windowId
+    }
+  } catch (error) {
+    logger.error('Failed to load external login auth state cookie', { error: error })
+    return null
+  }
+}
+
+async function createWindow(): Promise<WindowCreationResult> {
+  const result: WindowCreationResult = await createMainWindow(
+    (url: string) => {
+      COOKIE_URL = url
+    },
+    () => !forceQuit && [...mainWindows].filter((window) => !window.isDestroyed()).length <= 1
+  )
+  mainWindow = result.window
+  mainWindows.add(result.window)
+  windowContentLoaded = result.contentLoaded
+  setMainWindowWebContents(mainWindow.webContents)
+  initializeStorageMain(mainWindow)
+
+  mainWindow.on('closed', () => {
+    mainWindows.delete(result.window)
+
+    if (mainWindow !== result.window) {
+      return
+    }
+
+    const nextWindow = [...mainWindows].find((window) => !window.isDestroyed())
+    if (nextWindow) {
+      mainWindow = nextWindow
+      setMainWindowWebContents(nextWindow.webContents)
+      initializeStorageMain(nextWindow)
+    } else {
+      setMainWindowWebContents(null)
+    }
+  })
+
+  // Monitor renderer process crashes for audit logging
+  result.window.webContents.on('render-process-gone', (_event, details) => {
+    logRendererCrash({
+      webContentsId: result.window.webContents.id,
+      reason: details.reason,
+      exitCode: details.exitCode
+    })
+  })
+
+  result.window.webContents.on('will-navigate', (event, url) => {
+    const protocolPrefix = getProtocolPrefix()
+    const isExternal = !url.startsWith('http://localhost') && !url.startsWith('file://') && !url.startsWith(protocolPrefix)
+
+    if (isExternal) {
+      event.preventDefault()
+      shell.openExternal(url)
+    }
+  })
+
+  return result
+}
+
+// Send request to renderer process and wait for response
+export async function getUserConfigFromRenderer(): Promise<any> {
+  if (!mainWindow) throw new Error('mainWindow not ready')
+
+  const wc = mainWindow.webContents
+
+  // Wait for renderer process to load
+  if (wc.isLoadingMainFrame()) {
+    await new Promise<void>((resolve) => wc.once('did-finish-load', () => resolve()))
+  }
+
+  return new Promise((resolve, reject) => {
+    const responseHandler = (_event: Electron.IpcMainEvent, config: any) => {
+      cleanup()
+      resolve(config)
+    }
+
+    const errorHandler = (_event: Electron.IpcMainEvent, errMsg: string) => {
+      cleanup()
+      reject(new Error(errMsg))
+    }
+
+    const cleanup = () => {
+      ipcMain.removeListener('userConfig:get-response', responseHandler)
+      ipcMain.removeListener('userConfig:get-error', errorHandler)
+    }
+
+    ipcMain.on('userConfig:get-response', responseHandler)
+    ipcMain.on('userConfig:get-error', errorHandler)
+
+    logger.info('Main process sending userConfig:get to renderer process')
+    wc.send('userConfig:get')
+  })
+}
+
+app.whenReady().then(async () => {
+  mark('chaterm/main/appReady')
+
+  // [Security] Verify ffmpeg.dll integrity asynchronously (Windows Only)
+  let ffmpegVerification: Promise<void> | null = null
+  if (process.platform === 'win32' && process.env.IS_DEV !== 'true') {
+    ffmpegVerification = (async () => {
+      try {
+        const crypto = require('crypto')
+        const ffmpegPath = path.join(path.dirname(process.execPath), 'ffmpeg.dll')
+        const KNOWN_HASH = 'E7AEC5CA86D80540EA30C5ACDF0A13ACB34D1D9DD0F9E78B36FB21776B711A1E'
+
+        try {
+          await fs.access(ffmpegPath)
+        } catch {
+          logger.warn('[Security] ffmpeg.dll not found for verification.')
+          return
+        }
+
+        logger.info('[Security] Verifying ffmpeg.dll integrity...')
+        const buffer = await fs.readFile(ffmpegPath)
+        const hash = crypto.createHash('sha256').update(buffer).digest('hex').toUpperCase()
+
+        if (hash !== KNOWN_HASH) {
+          logger.error(`[Security] CRITICAL: ffmpeg.dll hash mismatch! Expected: ${KNOWN_HASH}, Actual: ${hash}`)
+          const { dialog } = require('electron')
+          dialog.showErrorBox(
+            'Security Error',
+            'System integrity check failed (ffmpeg.dll). The application files may have been tampered with. Application will terminate.'
+          )
+          app.quit()
+          process.exit(1) // Force exit
+        }
+        logger.info('[Security] ffmpeg.dll integrity verified.')
+      } catch (error) {
+        logger.error('[Security] Failed to verify ffmpeg.dll', { error: error })
+      }
+    })()
+  }
+  // Set edition-specific AppUserModelId for Windows taskbar grouping and process identification
+  const edition = getEdition()
+  const appUserModelId = edition === 'global' ? 'ai.chaterm.global' : 'ai.chaterm.cn'
+  electronApp.setAppUserModelId(appUserModelId)
+
+  // Start CN user data migration in parallel (usually a no-op, but can be
+  // slow on first launch of global edition due to process detection)
+  const migrationPromise = migrateCnUserDataOnFirstLaunch().catch((err) => logger.error('CN migration failed', { error: err }))
+
+  if (process.platform === 'darwin') {
+    const brandingConfig = getBrandingConfig()
+    app.dock?.setIcon(brandingConfig.iconPngPath || join(__dirname, '../../resources/icon.png'))
+  }
+
+  protocol.handle('local-resource', (request) => {
+    // Strip query string before resolving to a file path (e.g. cache-busting ?t=xxx params)
+    const rawPath = request.url.slice('local-resource://'.length).split('?')[0]
+    let filePath = decodeURIComponent(rawPath)
+
+    if (process.platform === 'win32' && /^\/[A-Za-z]:\//.test(filePath)) {
+      filePath = filePath.slice(1)
+    }
+
+    if (filePath.length >= 2 && /[A-Z]/.test(filePath[0]) && filePath[1] === '/') {
+      filePath = filePath[0] + ':' + filePath.slice(1)
+    } else if (process.platform !== 'win32' && !filePath.startsWith('/') && !filePath.includes(':')) {
+      if (filePath.startsWith('Users/') || filePath.startsWith('home/') || filePath.startsWith('var/') || filePath.startsWith('opt/')) {
+        filePath = '/' + filePath
+      }
+    }
+
+    try {
+      const fileUrl = pathToFileURL(filePath).toString()
+      return net.fetch(fileUrl)
+    } catch (error) {
+      logger.error('Error in local-resource handler', { error: error })
+      return new Response('File Not Found', { status: 404 })
+    }
+  })
+
+  app.on('browser-window-created', (_, _window) => {})
+
+  // IPC test
+  ipcMain.on('ping', () => logger.info('pong'))
+  mark('chaterm/main/willSetupIPC')
+  setupIPC()
+  registerWindowIpcHandlers({
+    createAppWindow: createWindow,
+    getFallbackWindow: getPrimaryWindow,
+    winReady,
+    mark,
+    isDev: is.dev,
+    collectAndLogTimeline
+  })
+  registerWindowMenu({ createAppWindow: createWindow })
+  registerPerfIpcHandlers()
+  mark('chaterm/main/didSetupIPC')
+
+  // Create the BrowserWindow. Content loading starts in parallel (not awaited).
+  mark('chaterm/main/willCreateWindow')
+  await createWindow()
+  mark('chaterm/main/didCreateWindow')
+
+  // Initialize storage system (only needs the BrowserWindow reference)
+  mark('chaterm/main/willInitStorage')
+  initializeStorageMain(mainWindow)
+  mark('chaterm/main/didInitStorage')
+
+  // Register SSH components (only needs ipcMain, no window content needed)
+  mark('chaterm/main/willRegisterSSH')
+  registerSSHHandlers()
+  registerLocalSSHHandlers()
+  registerSerialHandlers()
+  registerRemoteTerminalHandlers()
+  registerFileSystemHandlers()
+  mark('chaterm/main/didRegisterSSH')
+
+  mark('chaterm/main/willRegisterUpdater')
+  registerUpdater(mainWindow, (value) => (forceQuit = value))
+  mark('chaterm/main/didRegisterUpdater')
+
+  mark('chaterm/main/willSetupPluginIpc')
+  setupPluginIpc()
+  mark('chaterm/main/didSetupPluginIpc')
+
+  // Register K8s handlers
+  mark('chaterm/main/willRegisterK8s')
+  registerK8sHandlers()
+  mark('chaterm/main/didRegisterK8s')
+
+  // Register Database asset handlers
+  mark('chaterm/main/willRegisterDatabase')
+  registerDbAssetHandlers()
+
+  // Register Database AI (single-turn, track A) handlers
+  registerDbAiHandlers()
+  mark('chaterm/main/didRegisterDatabase')
+
+  // Register interactive command IPC handlers
+  mark('chaterm/main/willRegisterInteraction')
+  setupInteractionIpcHandlers()
+  mark('chaterm/main/didRegisterInteraction')
+
+  // Run plugin loading and security config in parallel
+  mark('chaterm/main/willLoadPlugins')
+  await Promise.all([
+    loadAllPlugins().then(() => mark('chaterm/main/didLoadPlugins')),
+    (async () => {
+      try {
+        mark('chaterm/main/willLoadSecurityConfig')
+        const SecurityConfigModule = await import('./agent/core/security/SecurityConfig')
+        const { SecurityConfigManager } = SecurityConfigModule
+        const securityManager = new SecurityConfigManager()
+        await securityManager.loadConfig()
+        mark('chaterm/main/didLoadSecurityConfig')
+        logger.info('Security configuration initialized successfully')
+      } catch (error) {
+        logger.error('Failed to initialize security configuration', { error: error })
+      }
+    })()
+  ])
+
+  app.on('activate', function () {
+    // On macOS it's common to re-create a window in the app when the
+    // dock icon is clicked and there are no other windows open.
+    const targetWindow = getPrimaryWindow()
+    if (targetWindow) {
+      targetWindow.show()
+      targetWindow.focus()
+    } else {
+      createWindow()
+    }
+  })
+
+  try {
+    // Create a message sender that routes messages to dedicated IPC channels
+    const messageSender = (message) => {
+      // Route commandGenerationResponse to its dedicated channel
+      if (message.type === 'commandGenerationResponse') {
+        return Promise.resolve(
+          sendToRendererWindows('command-generation-response', {
+            command: message.command,
+            error: message.error,
+            tabId: message.tabId
+          })
+        )
+      }
+
+      // Route explainCommandResponse to its dedicated channel
+      if (message.type === 'explainCommandResponse') {
+        return Promise.resolve(
+          sendToRendererWindows('command-explain-response', {
+            explanation: message.explanation,
+            error: message.error,
+            tabId: message.tabId,
+            commandMessageId: message.commandMessageId
+          })
+        )
+      }
+
+      // Route mcpServersUpdate to its dedicated channel for backward compatibility
+      if (message.type === 'mcpServersUpdate') {
+        return Promise.resolve(sendToRendererWindows('mcp:status-update', message.mcpServers))
+      }
+
+      // Route mcpServerUpdate (singular) to its dedicated channel for granular updates
+      if (message.type === 'mcpServerUpdate') {
+        return Promise.resolve(sendToRendererWindows('mcp:server-update', message.mcpServer))
+      }
+
+      // Route mcpConfigFileChanged to its dedicated channel
+      if (message.type === 'mcpConfigFileChanged') {
+        return Promise.resolve(sendToRendererWindows('mcp:config-file-changed', message.content))
+      }
+
+      // Default: send to the general channel for other message types
+      return Promise.resolve(sendToRendererWindows('main-to-webview', message))
+    }
+
+    mark('chaterm/main/willCreateController')
+    controller = new Controller(messageSender, ensureMcpConfigFileExists)
+    mark('chaterm/main/didCreateController')
+  } catch (error) {
+    logger.error('Failed to initialize Controller', { error: error })
+  }
+
+  // All IPC handlers and Controller are ready - release the main-window-show gate.
+  // The renderer's first IPC call (main-window-show) awaits winReady, so there
+  // is no race condition even though content may still be loading.
+  winReadyResolve()
+
+  // Ensure parallel tasks complete before marking ready
+  if (ffmpegVerification) await ffmpegVerification
+  await migrationPromise
+
+  // Function to initialize telemetry setting
+  const initializeTelemetrySetting = async () => {
+    let telemetrySetting: TelemetrySetting
+    try {
+      telemetrySetting = (await getGlobalState('telemetrySetting')) || 'enabled'
+    } catch (error) {
+      telemetrySetting = 'enabled'
+    }
+    if (parsePolicyEnabled(process.env.CHATERM_TELEMETRY_ENABLED) === false) {
+      telemetrySetting = 'disabled'
+      await updateGlobalState('telemetrySetting', 'disabled')
+    }
+
+    if (controller) {
+      await controller.updateTelemetrySetting(telemetrySetting)
+    }
+
+    const isFirstLaunch = checkIsFirstLaunch()
+
+    if (isFirstLaunch) {
+      telemetryService.captureAppFirstLaunch()
+    }
+
+    telemetryService.captureAppStarted()
+  }
+
+  // Call the test function (imported from ./agent/core/storage/state.ts)
+  if (mainWindow && mainWindow.webContents) {
+    if (mainWindow.webContents.isLoading()) {
+      mainWindow.webContents.once('did-finish-load', () => {
+        logger.info('[Main Index] Main window finished loading. Calling testRendererStorageFromMain.')
+        testRendererStorageFromMain()
+      })
+    } else {
+      logger.info('[Main Index] Main window already loaded. Calling testRendererStorageFromMain directly.')
+      testRendererStorageFromMain()
+    }
+  } else {
+    logger.warn('[Main Index] mainWindow or webContents not available when trying to schedule testRendererStorageFromMain.')
+  }
+
+  setTimeout(initializeTelemetrySetting, 1000)
+
+  mark('chaterm/main/ready')
+
+  // Log startup timeline in development mode.
+  // Wait for the renderer content to finish loading first so that renderer
+  // perf marks have time to be reported back to the main process.
+  if (is.dev) {
+    windowContentLoaded
+      .then(() => {
+        mark('chaterm/main/windowDidFinishLoad')
+        scheduleStartupTimelineFallback(mainWindow)
+      })
+      .catch((err) => {
+        logger.warn('windowContentLoaded rejected, logging main-process timeline only', { error: err })
+        mark('chaterm/main/windowDidFinishLoad')
+        logStartupTimeline()
+      })
+  }
+})
+
+// Quit when all windows are closed, except on macOS. There, it's common
+// for applications and their menu bar to stay active until the user quits
+// explicitly with Cmd + Q.
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') {
+    app.quit()
+  }
+})
+
+// Add the before-quit event listener here or towards the end of the file
+app.on('before-quit', async () => {
+  forceQuit = true
+  logger.info('Application is about to quit. Disposing resources...')
+  if (controller) {
+    try {
+      await controller.dispose()
+      logger.info('Controller disposed successfully.')
+    } catch (error) {
+      logger.error('Error during controller disposal', { error: error })
+    }
+  }
+  if (dataSyncController) {
+    try {
+      await dataSyncController.destroy()
+      dataSyncController = null
+      logger.info('Data sync controller disposed successfully.')
+    } catch (error) {
+      logger.error('Error during data sync controller disposal', { error: error })
+    }
+  }
+  if (chatSyncScheduler) {
+    try {
+      chatSyncScheduler.destroy()
+      chatSyncScheduler = null
+      logger.info('Chat sync scheduler disposed successfully.')
+    } catch (error) {
+      logger.error('Error during chat sync scheduler disposal', { error: error })
+    }
+  }
+})
+
+const getCookieByName = async (name) => {
+  try {
+    if (!COOKIE_URL) {
+      return { success: false, error: 'Cookie URL not initialized' }
+    }
+    const cookies = await session.defaultSession.cookies.get({ url: COOKIE_URL })
+    const targetCookie = cookies.find((cookie) => cookie.name === name)
+    return targetCookie ? { success: true, value: targetCookie.value } : { success: false, value: null }
+  } catch (error) {
+    return { success: false, error }
+  }
+}
+ipcMain.handle('get-platform', () => {
+  return process.platform
+})
+
+ipcMain.handle('app:get-branding-config', () => {
+  return getBrandingConfig()
+})
+
+/**
+ * Ensure MCP configuration file exists, create with default config if not
+ * @returns Promise<string> - The absolute path to the MCP configuration file
+ */
+export async function ensureMcpConfigFileExists(): Promise<string> {
+  const configPath = join(app.getPath('userData'), 'setting', 'mcp_settings.json')
+  const configDir = join(app.getPath('userData'), 'setting')
+
+  try {
+    // Ensure directory exists
+    await fs.mkdir(configDir, { recursive: true })
+
+    // Check if file exists
+    try {
+      await fs.access(configPath)
+    } catch (error: any) {
+      // File doesn't exist, create with default configuration
+      if (error.code === 'ENOENT') {
+        const defaultConfig = {
+          mcpServers: {}
+        }
+        await fs.writeFile(configPath, JSON.stringify(defaultConfig, null, 2), 'utf-8')
+        logger.info('[MCP] Created default configuration file at', { value: configPath })
+      } else {
+        throw error
+      }
+    }
+
+    return configPath
+  } catch (error) {
+    logger.error('[MCP] Failed to ensure config file exists', { error: error })
+    throw error
+  }
+}
+
+// MCP configuration file path
+ipcMain.handle('mcp:get-config-path', async () => {
+  return await ensureMcpConfigFileExists()
+})
+
+// Get initial MCP server list
+ipcMain.handle('mcp:get-servers', async () => {
+  try {
+    if (controller && controller.mcpHub) {
+      return controller.mcpHub.getAllServers()
+    }
+    return []
+  } catch (error) {
+    logger.error('Failed to get MCP servers', { error: error })
+    return []
+  }
+})
+
+// Toggle MCP server disabled state
+ipcMain.handle('toggle-mcp-server', async (_event, serverName: string, disabled: boolean) => {
+  try {
+    if (controller && controller.mcpHub) {
+      await controller.mcpHub.toggleServerDisabled(serverName, disabled)
+    } else {
+      throw new Error('Controller or McpHub not initialized')
+    }
+  } catch (error) {
+    logger.error('Failed to toggle MCP server', { error: error })
+    throw error
+  }
+})
+
+// Delete MCP server
+ipcMain.handle('delete-mcp-server', async (_event, serverName: string) => {
+  try {
+    if (controller && controller.mcpHub) {
+      await controller.mcpHub.deleteServer(serverName)
+    } else {
+      throw new Error('Controller or McpHub not initialized')
+    }
+  } catch (error) {
+    logger.error('Failed to delete MCP server', { error: error })
+    throw error
+  }
+})
+
+// MCP tool state management
+ipcMain.handle('mcp:get-tool-state', async (_event, serverName: string, toolName: string) => {
+  try {
+    const dbService = await ChatermDatabaseService.getInstance()
+    return dbService.getMcpToolState(serverName, toolName)
+  } catch (error) {
+    logger.error('Failed to get MCP tool state', { error: error })
+    throw error
+  }
+})
+
+ipcMain.handle('mcp:set-tool-state', async (_event, serverName: string, toolName: string, enabled: boolean) => {
+  try {
+    const dbService = await ChatermDatabaseService.getInstance()
+    dbService.setMcpToolState(serverName, toolName, enabled)
+  } catch (error) {
+    logger.error('Failed to set MCP tool state', { error: error })
+    throw error
+  }
+})
+
+ipcMain.handle('mcp:set-tool-auto-approve', async (_event, serverName: string, toolName: string, autoApprove: boolean) => {
+  try {
+    if (controller && controller.mcpHub) {
+      await controller.mcpHub.toggleToolAutoApprove(serverName, [toolName], autoApprove)
+    } else {
+      throw new Error('Controller or McpHub not initialized')
+    }
+  } catch (error) {
+    logger.error('Failed to set MCP tool auto-approve', { error: error })
+    throw error
+  }
+})
+
+ipcMain.handle('mcp:get-all-tool-states', async () => {
+  try {
+    const dbService = await ChatermDatabaseService.getInstance()
+    return dbService.getAllMcpToolStates()
+  } catch (error) {
+    logger.error('Failed to get all MCP tool states', { error: error })
+    throw error
+  }
+})
+
+// ==================== Skills IPC Handlers ====================
+
+ipcMain.handle('skills:get-all', async () => {
+  try {
+    if (controller && controller.skillsManager) {
+      return controller.skillsManager.getAllSkills().map((skill) => ({
+        name: skill.metadata.name,
+        description: skill.metadata.description,
+        enabled: skill.enabled,
+        path: skill.path
+      }))
+    }
+    return []
+  } catch (error) {
+    logger.error('Failed to get skills', { error: error })
+    throw error
+  }
+})
+
+ipcMain.handle('skills:get-enabled', async () => {
+  try {
+    if (controller && controller.skillsManager) {
+      return controller.skillsManager.getEnabledSkills().map((skill) => ({
+        name: skill.metadata.name,
+        description: skill.metadata.description,
+        enabled: skill.enabled
+      }))
+    }
+    return []
+  } catch (error) {
+    logger.error('Failed to get enabled skills', { error: error })
+    throw error
+  }
+})
+
+ipcMain.handle('skills:set-enabled', async (_event, skillName: string, enabled: boolean) => {
+  try {
+    if (controller && controller.skillsManager) {
+      await controller.skillsManager.setSkillEnabled(skillName, enabled)
+    }
+  } catch (error) {
+    logger.error('Failed to set skill enabled state', { error: error })
+    throw error
+  }
+})
+
+ipcMain.handle('skills:get-user-path', async () => {
+  try {
+    if (controller && controller.skillsManager) {
+      return controller.skillsManager.getUserSkillsPath()
+    }
+    return path.join(getUserDataPath(), 'skills')
+  } catch (error) {
+    logger.error('Failed to get user skills path', { error: error })
+    throw error
+  }
+})
+
+ipcMain.handle('skills:reload', async () => {
+  try {
+    if (controller && controller.skillsManager) {
+      await controller.skillsManager.loadAllSkills()
+    }
+  } catch (error) {
+    logger.error('Failed to reload skills', { error: error })
+    throw error
+  }
+})
+
+ipcMain.handle('skills:create', async (_event, metadata: SkillMetadata, content: string) => {
+  try {
+    if (controller && controller.skillsManager) {
+      const skill = await controller.skillsManager.createUserSkill(metadata, content)
+      return {
+        name: skill.metadata.name,
+        description: skill.metadata.description,
+        enabled: skill.enabled,
+        path: skill.path
+      }
+    }
+    throw new Error('Skills manager not initialized')
+  } catch (error) {
+    logger.error('Failed to create skill', { error: error })
+    throw error
+  }
+})
+
+ipcMain.handle('skills:delete', async (_event, skillId: string) => {
+  try {
+    if (controller && controller.skillsManager) {
+      await controller.skillsManager.deleteUserSkill(skillId)
+    }
+  } catch (error) {
+    logger.error('Failed to delete skill', { error: error })
+    throw error
+  }
+})
+
+ipcMain.handle('skills:open-folder', async () => {
+  try {
+    const skillsPath = path.join(getUserDataPath(), 'skills')
+    await fs.mkdir(skillsPath, { recursive: true })
+    shell.openPath(skillsPath)
+  } catch (error) {
+    logger.error('Failed to open skills folder', { error: error })
+    throw error
+  }
+})
+
+ipcMain.handle('skills:import-zip', async (_event, zipPath: string, overwrite?: boolean) => {
+  try {
+    if (controller && controller.skillsManager) {
+      return await controller.skillsManager.importSkillFromZip(zipPath, overwrite)
+    }
+    throw new Error('Skills manager not initialized')
+  } catch (error) {
+    logger.error('Failed to import skill from ZIP', { error: error })
+    throw error
+  }
+})
+
+ipcMain.handle('skills:export-zip', async (event, skillName: string) => {
+  try {
+    if (controller && controller.skillsManager) {
+      const zipBuffer = await controller.skillsManager.exportSkillAsZip(skillName)
+
+      const { dialog } = require('electron')
+      const win = BrowserWindow.fromWebContents(event.sender)
+      const result = await dialog.showSaveDialog(win!, {
+        defaultPath: `${skillName}.zip`,
+        filters: [{ name: 'ZIP Files', extensions: ['zip'] }]
+      })
+
+      if (result.canceled || !result.filePath) {
+        return { success: false, error: 'cancelled' }
+      }
+
+      await fs.writeFile(result.filePath, zipBuffer)
+      return { success: true, filePath: result.filePath }
+    }
+    throw new Error('Skills manager not initialized')
+  } catch (error) {
+    logger.error('Failed to export skill as ZIP', { error: error })
+    throw error
+  }
+})
+
+ipcMain.handle('skills:read-content', async (_event, skillName: string) => {
+  try {
+    if (controller && controller.skillsManager) {
+      return await controller.skillsManager.readSkillContent(skillName)
+    }
+    throw new Error('Skills manager not initialized')
+  } catch (error) {
+    logger.error('Failed to read skill content', { error: error })
+    throw error
+  }
+})
+
+ipcMain.handle('skills:update', async (_event, skillName: string, metadata: any, content: string) => {
+  try {
+    if (controller && controller.skillsManager) {
+      return await controller.skillsManager.updateUserSkill(skillName, metadata, content)
+    }
+    throw new Error('Skills manager not initialized')
+  } catch (error) {
+    logger.error('Failed to update skill', { error: error })
+    throw error
+  }
+})
+
+// ==================== End Skills IPC Handlers ====================
+
+// Get all Cookies
+const getAllCookies = async () => {
+  try {
+    const cookies = await session.defaultSession.cookies.get({ url: COOKIE_URL })
+    return { success: true, cookies }
+  } catch (error) {
+    // logger.error('readAll Cookie failed', { error: error })
+    return { success: false, error }
+  }
+}
+// Remove Cookie method
+const removeCookie = async (name) => {
+  try {
+    await session.defaultSession.cookies.remove(COOKIE_URL, name)
+    // logger.info(`removeSuccess Cookie: ${name} (${COOKIE_URL})`)
+    return { success: true }
+  } catch (error) {
+    // logger.error(`removeFailed Cookie  (${COOKIE_URL}, ${name})`, { error: error })
+    return { success: false, error }
+  }
+}
+
+ipcMain.handle('get-cookie-url', () => COOKIE_URL) // Return Cookie URL
+ipcMain.handle('set-cookie', async (_, name, value, expirationDays) => {
+  const expirationDate = new Date()
+  expirationDate.setDate(expirationDate.getDate() + expirationDays)
+
+  const cookie = {
+    url: COOKIE_URL,
+    name,
+    value,
+    expirationDate: expirationDate.getTime() / 1000
+  }
+
+  try {
+    await session.defaultSession.cookies.set(cookie)
+    return { success: true }
+  } catch (error) {
+    // logger.error('Cookie set failed', { error: error })
+    return { success: false, error }
+  }
+})
+ipcMain.handle('get-cookie', async (_, name) => {
+  if (name) {
+    return getCookieByName(name)
+  } else {
+    return getAllCookies()
+  }
+})
+ipcMain.handle('remove-cookie', async (_, { name }) => {
+  return await removeCookie(name)
+})
+
+ipcMain.handle('dialog:openFile', async (event, options) => {
+  const { dialog } = require('electron')
+  const result = await dialog.showOpenDialog(BrowserWindow.fromWebContents(event.sender), options)
+  return result
+})
+
+ipcMain.handle('app:getHomePath', () => {
+  return app.getPath('home')
+})
+
+ipcMain.handle('saveCustomBackground', async (_, sourcePath: string) => {
+  try {
+    const userDataPath = app.getPath('userData')
+    const targetDir = path.join(userDataPath, 'backgrounds')
+
+    // Ensure directory exists
+    await fs.mkdir(targetDir, { recursive: true })
+
+    const ext = path.extname(sourcePath)
+    const fileName = `custom_bg${ext}`
+    const targetPath = path.join(targetDir, fileName)
+
+    // Remove any existing custom_bg files to avoid conflicts (e.g. different extensions)
+    try {
+      const files = await fs.readdir(targetDir)
+      for (const file of files) {
+        if (file.startsWith('custom_bg')) {
+          await fs.unlink(path.join(targetDir, file))
+        }
+      }
+    } catch (e) {
+      // Ignore error if directory reading fails (though we just created it)
+    }
+
+    await fs.copyFile(sourcePath, targetPath)
+
+    const fileUrl = pathToFileURL(targetPath).toString()
+
+    return { success: true, path: targetPath, fileName, url: fileUrl }
+  } catch (error) {
+    logger.error('Failed to save custom background', { error: error })
+    return { success: false, error: error instanceof Error ? error.message : String(error) }
+  }
+})
+
+function createBrowserWindow(url: string, parentWindow?: BrowserWindow | null): void {
+  const ownerWindow = parentWindow && !parentWindow.isDestroyed() ? parentWindow : getPrimaryWindow()
+
+  // If browser window already exists, focus it
+  if (browserWindow && !browserWindow.isDestroyed()) {
+    browserWindowOwner = ownerWindow
+    browserWindow.focus()
+    browserWindow.loadURL(url)
+    return
+  }
+
+  // Create new browser window
+  browserWindow = new BrowserWindow({
+    width: 1024,
+    height: 768,
+    ...(ownerWindow ? { parent: ownerWindow } : {}),
+    webPreferences: {
+      preload: join(__dirname, '../preload/browser-preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false
+    }
+  })
+  browserWindowOwner = ownerWindow
+
+  // Load specified URL
+  browserWindow.loadURL(url)
+
+  // Listen for URL changes
+  browserWindow.webContents.on('did-navigate', (_, url) => {
+    logger.info('New window navigated to', { value: url })
+    if (browserWindowOwner && !browserWindowOwner.isDestroyed()) {
+      browserWindowOwner.webContents.send('url-changed', url)
+    }
+
+    // Update navigation state
+    updateNavigationState()
+  })
+
+  browserWindow.webContents.on('did-navigate-in-page', (_, url) => {
+    if (browserWindowOwner && !browserWindowOwner.isDestroyed()) {
+      browserWindowOwner.webContents.send('url-changed', url)
+    }
+
+    // Update navigation state
+    updateNavigationState()
+  })
+
+  // Handle window close event
+  browserWindow.on('closed', () => {
+    browserWindow = null
+    browserWindowOwner = null
+  })
+}
+
+function updateNavigationState(): void {
+  if (browserWindow && !browserWindow.isDestroyed() && browserWindowOwner && !browserWindowOwner.isDestroyed()) {
+    const canGoBack = browserWindow.webContents.canGoBack()
+    const canGoForward = browserWindow.webContents.canGoForward()
+
+    browserWindowOwner.webContents.send('navigation-state-changed', {
+      canGoBack,
+      canGoForward
+    })
+  }
+}
+
+// Setup IPC handlers
+function setupIPC(): void {
+  // KnowledgeBase module (local file-based KB) IPC handlers
+  registerKnowledgeBaseHandlers()
+  registerStageChatAttachmentHandlers()
+
+  ipcMain.handle('init-user-database', async (event, { uid }) => {
+    mark('chaterm/main/willInitUserDatabase')
+    try {
+      mark('chaterm/main/willResolveStartupUser')
+      const isSkippedLogin = await event.sender.executeJavaScript("localStorage.getItem('login-skipped') === 'true'")
+      const targetUserId = uid || (isSkippedLogin ? getGuestUserId() : null)
+      if (!targetUserId) {
+        throw new Error('User ID is required')
+      }
+      mark('chaterm/main/didResolveStartupUser')
+
+      // Check if user switch occurred (user ID changed)
+      const previousUserId = getCurrentUserId()
+      const isUserSwitch = previousUserId && previousUserId !== targetUserId
+
+      setCurrentUserId(targetUserId)
+      mark('chaterm/main/willInitChatermDatabase')
+      chatermDbService = await ChatermDatabaseService.getInstance(targetUserId)
+      mark('chaterm/main/didInitChatermDatabase')
+
+      mark('chaterm/main/willInitAutocompleteDatabase')
+      autoCompleteService = await autoCompleteDatabaseService.getInstance(targetUserId)
+      mark('chaterm/main/didInitAutocompleteDatabase')
+
+      // Load and apply user theme configuration
+      mark('chaterm/main/willLoadUserTheme')
+      const dbTheme = await loadUserTheme(chatermDbService)
+      mark('chaterm/main/didLoadUserTheme')
+
+      // Sync authentication info, ensure completion before data sync starts
+      try {
+        mark('chaterm/main/willSetAuthInfo')
+        // Get user authentication info and set it to encryption service
+        const ctmToken = await event.sender.executeJavaScript("localStorage.getItem('ctm-token')")
+        if (ctmToken && ctmToken !== 'guest_token') {
+          logger.info(`Setting authentication info for user ${targetUserId}...`)
+          envelopeEncryptionService.setAuthInfo(ctmToken, targetUserId.toString())
+          authFailureNotifier.reset()
+          logger.info(`Authentication info set completed for user ${targetUserId}`)
+        } else {
+          logger.warn(`No valid authentication token found for user ${targetUserId}`)
+        }
+
+        // User switch completed, data sync will be re-initialized by renderer process
+        if (isUserSwitch) {
+          logger.info(`User switch detected: ${previousUserId} -> ${targetUserId}, cleaning up chat sync scheduler`)
+          if (chatSyncScheduler) {
+            chatSyncScheduler.destroy()
+            chatSyncScheduler = null
+            logger.info('Chat sync scheduler destroyed during user switch')
+          }
+        }
+        mark('chaterm/main/didSetAuthInfo')
+      } catch (error) {
+        mark('chaterm/main/didFailSetAuthInfo')
+        logger.warn('Exception setting authentication info', { value: error })
+        if (isUserSwitch) {
+          logger.info(`Authentication info setting failed, user switch: ${previousUserId} -> ${targetUserId}`)
+        }
+      }
+
+      // Reload skill states after user login (skills are loaded but states need user DB)
+      if (controller && controller.skillsManager) {
+        try {
+          mark('chaterm/main/willReloadSkillStates')
+          await controller.skillsManager.reloadSkillStates()
+          mark('chaterm/main/didReloadSkillStates')
+        } catch (error) {
+          mark('chaterm/main/didFailReloadSkillStates')
+          logger.warn('Failed to reload skill states after login', { value: error })
+        }
+      }
+
+      // Install preloaded plugins after the current user is resolved so they go to the correct user scope.
+      try {
+        mark('chaterm/main/willBootstrapPreinstalledPlugins')
+        await bootstrapPreinstalledPlugins()
+        mark('chaterm/main/didBootstrapPreinstalledPlugins')
+      } catch (error) {
+        mark('chaterm/main/didFailBootstrapPreinstalledPlugins')
+        logger.warn('Failed to bootstrap preinstalled plugins after login', { value: error })
+      }
+
+      // Reload plugins after user login to switch to per-user plugin directory
+      try {
+        mark('chaterm/main/willReloadUserPlugins')
+        await loadAllPlugins()
+        mark('chaterm/main/didReloadUserPlugins')
+      } catch (error) {
+        mark('chaterm/main/didFailReloadUserPlugins')
+        logger.warn('Failed to reload plugins after login', { value: error })
+      }
+
+      // Initialize KB search manager if enabled by user setting / policy.
+      // CHATERM_KB_SEARCH_ENABLED enforces enterprise policy only when set to false.
+      try {
+        mark('chaterm/main/willInitKbSearch')
+        let kbSearchEnabled = await getGlobalState('kbSearchEnabled')
+        const rawPolicy = process.env.CHATERM_KB_SEARCH_ENABLED
+        let kbPolicyEnabled: boolean | null = null
+        if (typeof rawPolicy === 'string') {
+          const normalized = rawPolicy.trim().toLowerCase()
+          if (['1', 'true', 'yes', 'on'].includes(normalized)) kbPolicyEnabled = true
+          if (['0', 'false', 'no', 'off'].includes(normalized)) kbPolicyEnabled = false
+        }
+        if (kbPolicyEnabled === false) {
+          kbSearchEnabled = false
+          await updateGlobalState('kbSearchEnabled', false)
+        }
+
+        if (kbSearchEnabled !== false) {
+          const edition = getEdition()
+          const region = edition === 'cn' ? 'cn' : 'global'
+
+          // Get API credentials from user's model configuration
+          const state = await getAllExtensionState()
+          const apiConfig = state?.apiConfiguration
+          if (apiConfig) {
+            initKbSearchManager(targetUserId.toString(), {
+              region,
+              apiKey: apiConfig.defaultApiKey ?? '',
+              baseUrl: apiConfig.defaultBaseUrl ?? ''
+            }).catch((err) => {
+              logger.warn('Failed to initialize KB search manager', { error: err })
+            })
+          }
+        }
+        mark('chaterm/main/didInitKbSearch')
+      } catch (error) {
+        mark('chaterm/main/didFailInitKbSearch')
+        logger.warn('Failed to check KB search setting', { value: error })
+      }
+
+      mark('chaterm/main/didInitUserDatabase')
+      return { success: true, theme: dbTheme }
+    } catch (error) {
+      mark('chaterm/main/didFailInitUserDatabase')
+      logger.error('Database initialization failed', { error: error })
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error occurred' }
+    }
+  })
+
+  // ==================== IndexedDB Migration Related IPC Handlers ====================
+
+  // Handler 1: Migration status query
+  ipcMain.handle('db:migration:status', async (_event, params: { dataSource?: string }) => {
+    try {
+      const userId = getCurrentUserId()
+      if (!userId) {
+        throw new Error('User not logged in')
+      }
+
+      const db = await ChatermDatabaseService.getInstance(userId)
+
+      if (params?.dataSource) {
+        return db.getMigrationStatus(params.dataSource)
+      } else {
+        return db.getAllMigrationStatus()
+      }
+    } catch (error) {
+      logger.error('db:migration:status error', { error: error })
+      throw error
+    }
+  })
+
+  // Handler 2: Alias query
+  ipcMain.handle('db:aliases:query', async (_event, params: { action: string; searchText?: string; alias?: string }) => {
+    try {
+      const userId = getCurrentUserId()
+      if (!userId) {
+        throw new Error('User not logged in')
+      }
+
+      // Parameter validation
+      if (!['getAll', 'search', 'getByAlias'].includes(params.action)) {
+        throw new Error('Invalid action type')
+      }
+
+      if (params.action === 'search' && !params.searchText) {
+        throw new Error('search action requires searchText parameter')
+      }
+
+      if (params.action === 'getByAlias' && !params.alias) {
+        throw new Error('getByAlias action requires alias parameter')
+      }
+
+      const db = await ChatermDatabaseService.getInstance(userId)
+
+      switch (params.action) {
+        case 'getAll':
+          return db.getAliases()
+        case 'search':
+          return db.searchAliases(params.searchText!)
+        case 'getByAlias': {
+          const result = db.getAliasByName(params.alias!)
+          return result ? [result] : []
+        }
+        default:
+          throw new Error('Invalid action')
+      }
+    } catch (error) {
+      logger.error('db:aliases:query error', { error: error })
+      throw error
+    }
+  })
+
+  // Handler 3: Alias mutation
+  ipcMain.handle('db:aliases:mutate', async (_event, params: { action: string; data?: any; alias?: string }) => {
+    try {
+      const userId = getCurrentUserId()
+      if (!userId) {
+        throw new Error('User not logged in')
+      }
+
+      // Parameter validation
+      if (!['save', 'delete'].includes(params.action)) {
+        throw new Error('Invalid action type')
+      }
+
+      if (params.action === 'save' && !params.data) {
+        throw new Error('save action requires data parameter')
+      }
+
+      if (params.action === 'delete' && !params.alias) {
+        throw new Error('delete action requires alias parameter')
+      }
+
+      const db = await ChatermDatabaseService.getInstance(userId)
+
+      switch (params.action) {
+        case 'save':
+          return db.saveAlias(params.data)
+        case 'delete':
+          return db.deleteAlias(params.alias!)
+        default:
+          throw new Error('Invalid action')
+      }
+    } catch (error) {
+      logger.error('db:aliases:mutate error', { error: error })
+      throw error
+    }
+  })
+
+  // Handler 4: KV read
+  ipcMain.handle('db:kv:get', async (_event, params: { key?: string }) => {
+    try {
+      let userId = getCurrentUserId()
+
+      if (!userId) {
+        userId = getGuestUserId()
+      }
+
+      const db = await ChatermDatabaseService.getInstance(userId)
+
+      if (params?.key) {
+        const row = db.getKeyValue(params.key)
+        if (row && row.value) {
+          const { deserializeStoredKvValue } = await import('./storage/db/kv-serialization')
+          const deserialized = await deserializeStoredKvValue(row.value)
+          if (deserialized.source !== 'superjson') {
+            logger.warn('db:kv:get used compatibility fallback for stored KV value', {
+              key: params.key,
+              userId,
+              source: deserialized.source,
+              rawPrefix: typeof row.value === 'string' ? row.value.slice(0, 200) : row.value
+            })
+          }
+          return { ...row, value: JSON.stringify(deserialized.value) }
+        }
+        return row
+      } else {
+        return db.getAllKeys()
+      }
+    } catch (error) {
+      logger.error('db:kv:get error', { error: error })
+      throw error
+    }
+  })
+
+  // Handler 5: KV mutation
+  ipcMain.handle('db:kv:mutate', async (_event, params: { action: string; key: string; value?: string }) => {
+    try {
+      let userId = getCurrentUserId()
+
+      if (!userId) {
+        userId = getGuestUserId()
+      }
+
+      // Parameter validation
+      if (!['set', 'delete'].includes(params.action)) {
+        throw new Error('Invalid action type')
+      }
+
+      if (!params.key) {
+        throw new Error('key parameter is required')
+      }
+
+      if (params.action === 'set' && params.value === undefined) {
+        throw new Error('set action requires value parameter')
+      }
+
+      const db = await ChatermDatabaseService.getInstance(userId)
+
+      switch (params.action) {
+        case 'set': {
+          // First parse JSON string into object
+          const valueObj = JSON.parse(params.value!)
+          // Use safeStringify to serialize into superjson format
+          const { safeStringify } = await import('./storage/db/json-serializer')
+          const result = await safeStringify(valueObj)
+          if (!result.success) {
+            throw new Error(`Failed to serialize value: ${result.error}`)
+          }
+          return db.setKeyValue({
+            key: params.key,
+            value: result.data!,
+            updated_at: Date.now()
+          })
+        }
+        case 'delete':
+          return db.deleteKeyValue(params.key)
+        default:
+          throw new Error('Invalid action')
+      }
+    } catch (error) {
+      logger.error('db:kv:mutate error', { error: error })
+      throw error
+    }
+  })
+
+  // Handler 6: KV transaction (atomic batch write)
+  ipcMain.handle('db:kv:transaction', async (_event, ops: Array<{ action: 'set' | 'delete'; key: string; value?: string }>) => {
+    try {
+      let userId = getCurrentUserId()
+
+      if (!userId) {
+        userId = getGuestUserId()
+      }
+
+      const db = await ChatermDatabaseService.getInstance(userId)
+      const { serializeKvTransactionOps } = await import('./storage/db/kv-serialization')
+      const serializedOps = await serializeKvTransactionOps(ops)
+      await db.kvTransaction(serializedOps)
+    } catch (error) {
+      logger.error('db:kv:transaction error', { error: error })
+      throw error
+    }
+  })
+
+  // Unified version related operation handler
+  ipcMain.handle('version:operation', async (_event, operation: string, payload?: any) => {
+    try {
+      switch (operation) {
+        case 'getPrompt':
+          return await versionPromptService.getVersionPrompt()
+
+        case 'dismissPrompt':
+          await versionPromptService.dismissPrompt()
+          return
+
+        case 'getReleaseNotes':
+          return await versionPromptService.getReleaseNotes(payload?.version)
+
+        default:
+          throw new Error(`Unknown version operation: ${operation}`)
+      }
+    } catch (error) {
+      logger.error(`version:operation [${operation}] error`, { error: error })
+
+      throw error
+    }
+  })
+
+  // Handler 6: IndexedDB migration data read (renderer process response)
+  // This handler listens to 'indexdb-migration:request-data' event from renderer process and responds
+
+  // ==================== Original IPC Handlers ====================
+
+  ipcMain.handle('cancel-task', async (_event, payload?: { tabId?: string }) => {
+    logger.info('cancel-task', { value: payload })
+    if (controller) {
+      return await controller.cancelTask(payload?.tabId)
+    }
+    return null
+  })
+
+  ipcMain.handle('graceful-cancel-task', async (_event, payload?: { tabId?: string }) => {
+    logger.info('graceful-cancel-task', { value: payload })
+    if (controller) {
+      return await controller.gracefulCancelTask(payload?.tabId)
+    }
+    return null
+  })
+  // Add message handler from renderer process to main process
+  ipcMain.handle('webview-to-main', async (_event, message: WebviewMessage): Promise<void | null> => {
+    // logger.info('webview-to-main', { value: message })
+    if (controller) {
+      await controller.handleWebviewMessage(message)
+      return
+    }
+    return null
+  })
+
+  // Data sync start/stop
+  ipcMain.handle('data-sync:set-enabled', async (_evt, enabled: boolean) => {
+    try {
+      const uid = getCurrentUserId()
+      if (!uid) {
+        throw new Error('User ID is required')
+      }
+      const dataSyncPolicyEnabled = parsePolicyEnabled(process.env.CHATERM_DATA_SYNC_ENABLED)
+      const resolvedEnabled = dataSyncPolicyEnabled === false ? false : enabled
+
+      if (resolvedEnabled) {
+        let authExpiredDuringStartup = false
+        if (!dataSyncController) {
+          const dbPath = getChatermDbPathForUser(uid)
+          logger.info(`Starting data sync service for user ${uid}...`)
+          try {
+            const instance = await startDataSync(dbPath, () => {
+              authFailureNotifier.notify()
+            })
+            dataSyncController = instance
+          } catch (e) {
+            if (e instanceof AuthExpiredError) {
+              authExpiredDuringStartup = true
+              logger.warn('Data sync startup aborted due to auth expiry; dataSyncController remains null')
+              // onAuthFailure already sent auth:token-expired to renderer
+            } else {
+              throw e
+            }
+          }
+        }
+
+        // Enable sync only if controller was successfully created
+        if (dataSyncController) {
+          const syncStateManager = dataSyncController.getSyncStateManager()
+          if (syncStateManager) {
+            syncStateManager.enableSync(uid)
+          }
+          startKbSync()
+        }
+
+        if (authExpiredDuringStartup) {
+          return { success: false, enabled: false, error: 'AUTH_EXPIRED', authExpired: true }
+        }
+      } else {
+        // Disable sync
+        if (dataSyncController) {
+          const syncStateManager = dataSyncController.getSyncStateManager()
+          if (syncStateManager) {
+            syncStateManager.disableSync()
+          }
+
+          logger.info('Stopping data sync service...')
+          await stopKbSync()
+          closeKbSearchManager()
+          await dataSyncController.destroy()
+          dataSyncController = null
+          logger.info('Data sync service stopped')
+        }
+      }
+      return { success: true, enabled: resolvedEnabled, managedByPolicy: dataSyncPolicyEnabled === false }
+    } catch (e: any) {
+      logger.warn('Failed to handle data-sync:set-enabled', { error: e?.message || String(e) })
+      return { success: false, error: e?.message || String(e) }
+    }
+  })
+
+  // Get user sync status
+  ipcMain.handle('data-sync:get-user-status', async () => {
+    try {
+      const uid = getCurrentUserId()
+      if (!uid) {
+        return { success: false, error: 'User ID is required' }
+      }
+
+      if (!dataSyncController) {
+        return {
+          success: true,
+          data: {
+            userId: uid,
+            enabled: false,
+            state: { state: 'disabled', enabled: false },
+            hasController: false,
+            fullSyncTimer: null
+          }
+        }
+      }
+
+      const syncStateManager = dataSyncController.getSyncStateManager()
+      const syncStatus = syncStateManager ? syncStateManager.getCurrentStatus() : null
+
+      // Get full sync timer status
+      let fullSyncTimerStatus: any = null
+      try {
+        fullSyncTimerStatus = dataSyncController.getFullSyncTimerStatus()
+      } catch (error) {
+        logger.warn('Failed to get full sync timer status', { value: error })
+      }
+
+      return {
+        success: true,
+        data: {
+          userId: uid,
+          enabled: syncStatus?.enabled || false,
+          state: syncStatus,
+          hasController: true,
+          fullSyncTimer: fullSyncTimerStatus
+        }
+      }
+    } catch (e: any) {
+      logger.warn('Failed to get user sync status', { error: e?.message || String(e) })
+      return { success: false, error: e?.message || String(e) }
+    }
+  })
+
+  // Execute full sync immediately
+  ipcMain.handle('data-sync:full-sync-now', async () => {
+    try {
+      if (!dataSyncController) {
+        return { success: false, error: 'Data sync controller not initialized' }
+      }
+
+      const result = await dataSyncController.fullSyncNow()
+      return { success: result }
+    } catch (e: any) {
+      logger.warn('Failed to execute manual full sync', { error: e?.message || String(e) })
+      return { success: false, error: e?.message || String(e) }
+    }
+  })
+
+  // Update full sync interval
+  ipcMain.handle('data-sync:update-full-sync-interval', async (_evt, intervalHours: number) => {
+    try {
+      if (!dataSyncController) {
+        return { success: false, error: 'Data sync controller not initialized' }
+      }
+
+      if (intervalHours <= 0) {
+        return { success: false, error: 'Interval must be greater than 0 hours' }
+      }
+
+      dataSyncController.updateFullSyncInterval(intervalHours)
+      return { success: true }
+    } catch (e: any) {
+      logger.warn('Failed to update full sync interval', { error: e?.message || String(e) })
+      return { success: false, error: e?.message || String(e) }
+    }
+  })
+
+  // ==================== Chat Sync V2 IPC Handlers ====================
+
+  ipcMain.handle('chat-sync:set-enabled', async (_evt, enabled: boolean) => {
+    try {
+      if (enabled) {
+        if (!chatSyncScheduler) {
+          const { ChatSnapshotStore, ChatSyncApiClient, ChatSyncEngine, ChatSyncScheduler } = await import('./storage/chat_sync/index')
+          const uid = getCurrentUserId()
+          if (!uid) throw new Error('User ID is required for chat sync')
+
+          const dbService = await ChatermDatabaseService.getInstance()
+
+          // Reuse the persistent device ID from data_sync (based on motherboard/machine ID)
+          const { getDeviceId } = await import('./storage/data_sync/config/devideId')
+          const deviceId = getDeviceId()
+
+          // Initialize the snapshot store
+          const store = ChatSnapshotStore.getInstance()
+          store.initialize(dbService, deviceId)
+
+          // Initialize the API client with real auth token from ChatermAuthAdapter
+          const { getSyncUrl } = await import('./config/edition')
+          const { chatermAuthAdapter } = await import('./storage/data_sync/envelope_encryption/services/auth')
+          const apiClient = new ChatSyncApiClient({
+            baseUrl: getSyncUrl(),
+            getAuthToken: async () => {
+              return chatermAuthAdapter.getAuthToken()
+            },
+            deviceId,
+            platform: 'desktop',
+            onAuthFailure: () => authFailureNotifier.notify()
+          })
+
+          // Initialize the sync engine
+          const engine = new ChatSyncEngine(apiClient, dbService, store)
+
+          // Initialize the scheduler
+          chatSyncScheduler = new ChatSyncScheduler(engine)
+          await chatSyncScheduler.enable()
+        }
+      } else {
+        if (chatSyncScheduler) {
+          chatSyncScheduler.destroy()
+          chatSyncScheduler = null
+        }
+      }
+      return { success: true }
+    } catch (e: any) {
+      logger.warn('Failed to handle chat-sync:set-enabled', { error: e?.message || String(e) })
+      return { success: false, error: e?.message || String(e) }
+    }
+  })
+
+  ipcMain.handle('chat-sync:get-status', async () => {
+    if (!chatSyncScheduler) {
+      return { success: true, data: { enabled: false } }
+    }
+    return { success: true, data: chatSyncScheduler.getStatus() }
+  })
+
+  ipcMain.handle('chat-sync:sync-now', async () => {
+    if (!chatSyncScheduler) {
+      return { success: false, error: 'Chat sync not enabled' }
+    }
+    try {
+      await chatSyncScheduler.syncNow()
+      return { success: true }
+    } catch (e: any) {
+      return { success: false, error: e?.message || String(e) }
+    }
+  })
+
+  ipcMain.handle('chat-sync:set-ai-tab-visible', async (_evt, visible: boolean) => {
+    if (chatSyncScheduler) {
+      chatSyncScheduler.setAiTabVisible(visible)
+    }
+    return { success: true }
+  })
+
+  // Open browser window
+  ipcMain.on('open-browser-window', (event, url) => {
+    createBrowserWindow(url, getWindowFromSender(event.sender))
+  })
+
+  ipcMain.handle('open-external-url', async (_, url: string) => {
+    try {
+      await shell.openExternal(url)
+      return { success: true }
+    } catch (error) {
+      logger.error('Failed to open external url', { error, url })
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  // Browser navigation control
+  ipcMain.on('browser-go-back', () => {
+    if (browserWindow && !browserWindow.isDestroyed() && browserWindow.webContents.canGoBack()) {
+      browserWindow.webContents.goBack()
+      // After navigation completes, the did-navigate event will be triggered, thus updating the navigation state
+    }
+  })
+
+  ipcMain.on('browser-go-forward', () => {
+    if (browserWindow && !browserWindow.isDestroyed() && browserWindow.webContents.canGoForward()) {
+      browserWindow.webContents.goForward()
+      // After navigation completes, the did-navigate event will be triggered, thus updating the navigation state
+    }
+  })
+
+  ipcMain.on('browser-refresh', () => {
+    if (browserWindow && !browserWindow.isDestroyed()) {
+      browserWindow.webContents.reload()
+    }
+  })
+
+  // Handle SPA route changes
+  ipcMain.on('spa-url-changed', (event, url) => {
+    const targetWindow = getWindowFromSender(event.sender)
+    if (targetWindow) {
+      targetWindow.webContents.send('url-changed', url)
+    }
+  })
+
+  ipcMain.handle('update-theme', (_, theme) => {
+    // Notify renderer processes that theme has been updated
+    const actualTheme = getActualTheme(theme)
+    return sendToRendererWindows('theme-updated', actualTheme)
+  })
+
+  // Add system theme change listener for Windows
+  if (process.platform === 'win32') {
+    const { nativeTheme } = require('electron')
+    nativeTheme.on('updated', () => {
+      // Check if current theme is auto mode. We'll get this from the renderer process.
+      sendToRendererWindows('system-theme-changed', nativeTheme.shouldUseDarkColors ? 'dark' : 'light')
+    })
+  }
+
+  // Security configuration handler
+  ipcMain.handle('security-open-config', async () => {
+    try {
+      // Use dynamic import instead of require to avoid path issues
+      const SecurityConfigModule = await import('./agent/core/security/SecurityConfig')
+      const { SecurityConfigManager } = SecurityConfigModule
+      const securityManager = new SecurityConfigManager()
+
+      // Directly open config file (file already ensured to exist on startup)
+      await securityManager.openConfigFile()
+
+      return { success: true }
+    } catch (error) {
+      logger.error('Failed to open security config', { error: error })
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  // Get security configuration file path
+  ipcMain.handle('security-get-config-path', async () => {
+    try {
+      const SecurityConfigModule = await import('./agent/core/security/SecurityConfig')
+      const { SecurityConfigManager } = SecurityConfigModule
+      const securityManager = new SecurityConfigManager()
+      return securityManager.getConfigPath()
+    } catch (error) {
+      logger.error('Failed to get security config path', { error: error })
+      throw new Error(`Failed to get security config path: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  })
+
+  // Read security configuration file
+  ipcMain.handle('security-read-config', async () => {
+    try {
+      const SecurityConfigModule = await import('./agent/core/security/SecurityConfig')
+      const { SecurityConfigManager } = SecurityConfigModule
+      const securityManager = new SecurityConfigManager()
+      const fs = await import('fs/promises')
+      const configPath = securityManager.getConfigPath()
+
+      // Ensure file exists, if not generate default config
+      try {
+        await fs.access(configPath)
+      } catch {
+        // File doesn't exist, generate default config
+        await securityManager.loadConfig() // This will automatically generate default config file
+      }
+
+      const content = await fs.readFile(configPath, 'utf-8')
+      logger.info(`Security config file read from: ${configPath}, length: ${content.length}`)
+      return content
+    } catch (error) {
+      logger.error('Failed to read security config', { error: error })
+      throw new Error(`Failed to read security config: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  })
+
+  // Write security configuration file
+  ipcMain.handle('security-write-config', async (_, content: string) => {
+    try {
+      const SecurityConfigModule = await import('./agent/core/security/SecurityConfig')
+      const { SecurityConfigManager } = SecurityConfigModule
+      const securityManager = new SecurityConfigManager()
+      const fs = await import('fs/promises')
+      const configPath = securityManager.getConfigPath()
+      await fs.writeFile(configPath, content, 'utf-8')
+
+      // Reload configuration to apply changes
+      await securityManager.loadConfig()
+
+      // Notify CommandSecurityManager instance to reload config (hot reload)
+      // This allows configuration changes to take effect immediately without restart
+      if (controller) {
+        try {
+          await controller.reloadSecurityConfigForAllTasks()
+          logger.info('[SecurityConfig] Hot reloaded configuration in all active Tasks')
+        } catch (error) {
+          logger.warn('[SecurityConfig] Failed to hot reload configuration in Tasks', { value: error })
+          // This is not critical - config will be loaded on next task creation
+        }
+      }
+
+      return { success: true }
+    } catch (error) {
+      logger.error('Failed to write security config', { error: error })
+      throw new Error(`Failed to write security config: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  })
+
+  // Keyword Highlight Config - Get Path
+  ipcMain.handle('keyword-highlight-get-config-path', async () => {
+    try {
+      const path = await import('path')
+      const configPath = path.join(getUserDataPath(), 'keyword-highlight.json')
+      return configPath
+    } catch (error) {
+      logger.error('Failed to get keyword highlight config path', { error: error })
+      throw new Error(`Failed to get keyword highlight config path: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  })
+
+  // Keyword Highlight Config - Read
+  ipcMain.handle('keyword-highlight-read-config', async () => {
+    try {
+      const fs = await import('fs/promises')
+      const path = await import('path')
+      const configPath = path.join(getUserDataPath(), 'keyword-highlight.json')
+
+      // Check if file exists, if not copy from default
+      try {
+        await fs.access(configPath)
+      } catch {
+        // Copy default config from project root
+        // In production, extraResources are in process.resourcesPath
+        // In development, they are in project root
+        const defaultConfigPath = app.isPackaged
+          ? path.join(process.resourcesPath, 'keyword-highlight.json')
+          : path.join(__dirname, '../../keyword-highlight.json')
+
+        try {
+          const defaultContent = await fs.readFile(defaultConfigPath, 'utf-8')
+          await fs.writeFile(configPath, defaultContent, 'utf-8')
+          logger.info('[KeywordHighlight] Created default configuration file from template')
+        } catch (copyError) {
+          logger.warn('[KeywordHighlight] Failed to copy default config, will use empty config', { value: copyError })
+          // If copy fails, create empty config
+          const emptyConfig = JSON.stringify(
+            {
+              'keyword-highlight': {
+                enabled: true,
+                applyTo: {
+                  output: true,
+                  input: false
+                },
+                rules: []
+              }
+            },
+            null,
+            2
+          )
+          await fs.writeFile(configPath, emptyConfig, 'utf-8')
+        }
+      }
+
+      const content = await fs.readFile(configPath, 'utf-8')
+      return content
+    } catch (error) {
+      logger.error('Failed to read keyword highlight config', { error: error })
+      throw new Error(`Failed to read keyword highlight config: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  })
+
+  // Keyword Highlight Config - Write
+  ipcMain.handle('keyword-highlight-write-config', async (_, content: string) => {
+    try {
+      const fs = await import('fs/promises')
+      const path = await import('path')
+      const configPath = path.join(getUserDataPath(), 'keyword-highlight.json')
+
+      await fs.writeFile(configPath, content, 'utf-8')
+
+      logger.info('[KeywordHighlight] Configuration file saved')
+
+      return { success: true }
+    } catch (error) {
+      logger.error('Failed to write keyword highlight config', { error: error })
+      throw new Error(`Failed to write keyword highlight config: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  })
+}
+
+// Initialize user database
+ipcMain.handle('query-command', async (_, data) => {
+  try {
+    const { command, ip } = data
+    const result = autoCompleteService.queryCommand(command, ip)
+    return result
+  } catch (error) {
+    logger.error('Query command failed', { error: error })
+    return null
+  }
+})
+
+ipcMain.handle('insert-command', async (_, data) => {
+  try {
+    const { command, ip } = data
+    const result = autoCompleteService.insertCommand(command, ip)
+    return result
+  } catch (error) {
+    logger.error('Insert command failed', { error: error })
+    return null
+  }
+})
+
+ipcMain.handle('query-fig-spec', async (_, data) => {
+  try {
+    const { commandLine, tokens } = data
+    if (!commandLine || !Array.isArray(tokens)) return []
+    const { getFigSuggestions } = await import('./ssh/figSpecHandler')
+    return await getFigSuggestions({ commandLine, tokens })
+  } catch (error) {
+    logger.error('query-fig-spec failed', { error: error })
+    return []
+  }
+})
+
+ipcMain.handle('ai-suggest-command', async (_, data) => {
+  try {
+    const { command, osInfo } = data
+    logger.debug('ai-suggest-command received', {
+      event: 'main.aiSuggest.ipc.received',
+      hasController: !!controller,
+      commandLength: typeof command === 'string' ? command.trim().length : 0,
+      hasOsInfo: !!osInfo
+    })
+    if (!controller) {
+      return null
+    }
+    const result = await controller.handleAiSuggestCommand(command, osInfo)
+    logger.debug('ai-suggest-command completed', {
+      event: 'main.aiSuggest.ipc.completed',
+      hasResult: !!result?.command
+    })
+    return result
+  } catch (error) {
+    logger.error('AI suggest command failed', { error })
+    return null
+  }
+})
+
+// Chaterm database related IPC handlers
+ipcMain.handle('asset-route-local-get', async (_, data) => {
+  try {
+    const { searchType, params } = data
+    const result = await chatermDbService.getLocalAssetRoute(searchType, params || [])
+    return result
+  } catch (error) {
+    logger.error('Chaterm query failed', { error: error })
+    return null
+  }
+})
+
+ipcMain.handle('record-connection', async (_, data) => {
+  try {
+    chatermDbService.recordConnection(data)
+  } catch (error) {
+    logger.error('Record connection failed', { error: error })
+  }
+})
+
+ipcMain.handle('asset-route-local-update', async (_, data) => {
+  try {
+    const { uuid, label } = data
+    const result = chatermDbService.updateLocalAssetLabel(uuid, label)
+    return result
+  } catch (error) {
+    logger.error('Chaterm data modification failed', { error: error })
+    return null
+  }
+})
+
+ipcMain.handle('asset-route-local-favorite', async (_, data) => {
+  try {
+    const { uuid, status } = data
+    const result = chatermDbService.updateLocalAsseFavorite(uuid, status)
+    return result
+  } catch (error) {
+    logger.error('Chaterm data modification failed', { error: error })
+    return null
+  }
+})
+
+ipcMain.handle('key-chain-local-get', async () => {
+  try {
+    const result = chatermDbService.getKeyChainSelect()
+    return result
+  } catch (error) {
+    logger.error('Chaterm get data failed', { error: error })
+    return null
+  }
+})
+
+ipcMain.handle('password-chain-local-get', async () => {
+  try {
+    const result = chatermDbService.getPasswordChainSelect()
+    return result
+  } catch (error) {
+    logger.error('Chaterm get password chain failed', { error: error })
+    return null
+  }
+})
+
+ipcMain.handle('asset-group-local-get', async () => {
+  try {
+    const result = chatermDbService.getAssetGroup()
+    return result
+  } catch (error) {
+    logger.error('Chaterm get data failed', { error: error })
+    return null
+  }
+})
+
+ipcMain.handle('asset-delete', async (_, data) => {
+  try {
+    const { uuid } = data
+    // Close any open serial connection on this asset's COM port before deleting
+    try {
+      const assetInfo = chatermDbService.connectAssetInfo(uuid)
+      if (assetInfo?.asset_type === 'person-serial' && assetInfo?.asset_ip) {
+        closeSerialTerminalByPath(assetInfo.asset_ip)
+      }
+    } catch (closeErr) {
+      logger.warn('Failed to close serial connection on asset delete', { event: 'asset-delete.serial.close.warn', uuid, error: closeErr })
+    }
+    const result = chatermDbService.deleteAsset(uuid)
+    return result
+  } catch (error) {
+    logger.error('Chaterm delete data failed', { error: error })
+    return null
+  }
+})
+
+ipcMain.handle('asset-create', async (_, data) => {
+  try {
+    const { form } = data
+    const result = chatermDbService.createAsset(form)
+    return result
+  } catch (error) {
+    logger.error('Chaterm create asset failed', { error: error })
+    return null
+  }
+})
+
+ipcMain.handle('asset-create-or-update', async (_, data) => {
+  try {
+    const { form } = data
+    const result = chatermDbService.createOrUpdateAsset(form)
+    return result
+  } catch (error) {
+    logger.error('Chaterm create or update asset failed', { error: error })
+    return null
+  }
+})
+
+ipcMain.handle('asset-update', async (_, data) => {
+  try {
+    const { form } = data
+    const result = chatermDbService.updateAsset(form)
+    return result
+  } catch (error) {
+    logger.error('Chaterm update asset failed', { error: error })
+    return null
+  }
+})
+
+//XTS file parsing processor
+ipcMain.handle('parseXtsFile', async (_, data) => {
+  try {
+    const { data: zipData, fileName } = data
+    logger.info(`Starting XTS file parsing: ${fileName}`)
+
+    const AdmZip = require('adm-zip')
+    const iconv = require('iconv-lite')
+
+    //Convert the array back to Buffer
+    const buffer = Buffer.from(zipData)
+
+    let zip
+    let zipEntries
+
+    try {
+      zip = new AdmZip(buffer)
+      zipEntries = zip.getEntries()
+    } catch (error) {
+      logger.error('Failed to create ZIP object', { error: error })
+      throw error
+    }
+
+    logger.info(`Found ${zipEntries.length} entries in ZIP file`)
+
+    const sessions: any[] = []
+
+    // Iterate through all files in ZIP
+    for (const entry of zipEntries) {
+      if (entry.isDirectory) continue
+
+      // 1. Handle filename encoding
+      // adm-zip defaults to UTF-8 decoding, which may produce garbled text if it fails
+      // We prioritize using rawEntryName (Buffer) for detection
+      let entryName = entry.entryName
+      let rawNameBuffer = entry.rawEntryName
+
+      // If no rawEntryName, try to fall back from entryName to Buffer (not very reliable, but as a fallback)
+      if (!rawNameBuffer) {
+        rawNameBuffer = Buffer.from(entryName, 'binary')
+      }
+
+      // Try to detect encoding: prioritize GBK/GB18030 (common Chinese archive encoding), then UTF-8
+      // If UTF-8 decoding doesn't produce garbled characters, consider it UTF-8, otherwise try GBK
+      const utf8Name = rawNameBuffer.toString('utf8')
+      if (!utf8Name.includes('') && !utf8Name.includes('♦')) {
+        entryName = utf8Name
+      } else {
+        // Try GBK decoding
+        try {
+          const gbkName = iconv.decode(rawNameBuffer, 'gbk')
+          entryName = gbkName
+        } catch (e) {
+          // If GBK fails, keep original or use UTF-8
+          entryName = utf8Name
+        }
+      }
+
+      // 2. Read file content and handle content encoding
+      let content = ''
+      try {
+        const rawContent = entry.getData()
+
+        // Check BOM (Byte Order Mark)
+        if (rawContent.length >= 2 && rawContent[0] === 0xff && rawContent[1] === 0xfe) {
+          // UTF-16 LE
+          content = iconv.decode(rawContent, 'utf-16le')
+          logger.info(`Detected UTF-16 LE BOM for ${entryName}`)
+        } else if (rawContent.length >= 2 && rawContent[0] === 0xfe && rawContent[1] === 0xff) {
+          // UTF-16 BE
+          content = iconv.decode(rawContent, 'utf-16be')
+          logger.info(`Detected UTF-16 BE BOM for ${entryName}`)
+        } else {
+          // No BOM, try UTF-8
+          const utf8Content = rawContent.toString('utf8')
+          // Check if it contains null bytes (UTF-16 characteristic) or lots of garbled text
+          if (!utf8Content.includes('\0') && !utf8Content.includes('')) {
+            content = utf8Content
+          } else {
+            // Try GBK
+            content = iconv.decode(rawContent, 'gbk')
+          }
+        }
+      } catch (e) {
+        logger.warn(`Failed to read content for ${entryName}`)
+        continue
+      }
+
+      // 3. Check if it's a session file
+      let isSessionFile = false
+      const fileNamePart = entryName.split('/').pop() || entryName
+
+      // Case A: Standard .xsh file
+      if (fileNamePart.toLowerCase().endsWith('.xsh')) {
+        isSessionFile = true
+      }
+      // Case B: Other files with extensions (e.g., .zcf) -> strictly ignore
+      else if (fileNamePart.includes('.')) {
+        isSessionFile = false
+        // logger.info(`Ignored non-xsh file: ${entryName}`)
+      }
+      // Case C: Files without extension (e.g., "D:\session_xsh") -> check content characteristics
+      else {
+        // Strictly check content characteristics to avoid misidentifying random files
+        if (content.includes('[SessionInfo]') || content.includes('[CONNECTION]') || (content.includes('Host=') && content.includes('Protocol='))) {
+          isSessionFile = true
+          logger.info(`Detected session file by content (no extension): ${entryName}`)
+        }
+      }
+
+      if (isSessionFile) {
+        try {
+          const sessionFileName = entryName.split('/').pop() || entryName
+
+          // Parse single XSH file
+          const session = parseXSHContent(content, sessionFileName, entryName)
+
+          if (session.host && session.username) {
+            // Extract group information from path
+            const pathParts = entryName.split('/')
+            let groupName = 'Default'
+
+            if (pathParts.length > 1) {
+              // Use directory name as group
+              groupName = pathParts[pathParts.length - 2] || 'Default'
+            }
+
+            session.groupName = groupName
+            sessions.push(session)
+          }
+        } catch (error) {
+          logger.error(`Failed to parse session file ${entryName}`, { error: error })
+        }
+      }
+    }
+
+    logger.info(`Total sessions parsed: ${sessions.length}`)
+
+    return {
+      success: true,
+      sessions: sessions,
+      count: sessions.length
+    }
+  } catch (error) {
+    logger.error('XTS file parsing failed', { error: error })
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+      sessions: []
+    }
+  }
+})
+
+// XSH file content parsing function
+function parseXSHContent(content: string, fileName: string, fullPath?: string): any {
+  logger.info(`Parsing XSH content for file: ${fileName}`)
+  logger.info(`Full path: ${fullPath || 'N/A'}`)
+
+  const session: any = {}
+  const lines = content.split('\n')
+
+  // Extract session name from filename (remove .xsh extension)
+  session.name = fileName.replace('.xsh', '')
+
+  let foundHost = false
+  let foundUsername = false
+  let currentSection = ''
+
+  logger.info(`Total lines in file: ${lines.length}`)
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    const trimmedLine = line.trim()
+
+    // Skip empty lines
+    if (!trimmedLine) continue
+
+    // logger.info(`Line ${i}: "${trimmedLine}"`)
+
+    // Check if it's a section header [SECTION]
+    if (trimmedLine.startsWith('[') && trimmedLine.endsWith(']')) {
+      currentSection = trimmedLine
+      logger.info(`  -> Section: ${currentSection}`)
+      continue
+    }
+
+    if (trimmedLine.includes('=')) {
+      const equalIndex = trimmedLine.indexOf('=')
+      const key = trimmedLine.substring(0, equalIndex).trim()
+      const value = trimmedLine.substring(equalIndex + 1).trim()
+
+      // logger.info(`  -> Parsed: "${key}" = "${value}" (in section: ${currentSection})`)
+
+      // Match by field name, case-insensitive
+      const lowerKey = key.toLowerCase()
+
+      if (lowerKey === 'host' || lowerKey === 'hostname') {
+        session.host = value
+        foundHost = true
+        logger.info('Parsed session field', { event: 'xsh.parse.field', field: 'host', host: value })
+      } else if (lowerKey === 'port') {
+        session.port = parseInt(value) || 22
+        logger.info('Parsed session field', { event: 'xsh.parse.field', field: 'port', port: session.port })
+      } else if (lowerKey === 'username' || lowerKey === 'user') {
+        session.username = value
+        foundUsername = true
+        logger.info('Parsed session field', { event: 'xsh.parse.field', field: 'username', username: value })
+      } else if (lowerKey === 'password') {
+        // XShell passwords are usually encrypted, only check if it exists
+        if (value && value !== '') {
+          session.password = '' // Don't save encrypted password, user needs to re-enter
+          logger.info(`*** Found password (encrypted)`)
+        }
+      } else if (lowerKey === 'userkey') {
+        // Non-empty UserKey field indicates key-based authentication
+        if (value && value !== '') {
+          session.authType = 'keyBased'
+          session.keyFile = value
+          logger.info('Parsed session field', { event: 'xsh.parse.field', field: 'userkey', authType: 'keyBased' })
+        }
+      } else if (lowerKey === 'protocol' || lowerKey === 'protocolname' || lowerKey === 'protocol name') {
+        session.protocol = value
+        logger.info('Parsed session field', { event: 'xsh.parse.field', field: 'protocol', protocol: value })
+      } else if (lowerKey === 'description') {
+        // Description information is only logged, does not update session name
+        if (value && value !== 'Xshell session file') {
+          logger.info('Parsed session field', { event: 'xsh.parse.field', field: 'description' })
+        }
+      }
+    }
+  }
+
+  // Improved host information extraction logic
+  if (!foundHost || !foundUsername) {
+    logger.info('Missing required fields, trying to extract from filename and path', {
+      event: 'xsh.parse.fallback',
+      foundHost,
+      foundUsername
+    })
+
+    // Try to extract host information from filename and path
+    const extractHostFromText = (text: string): string | null => {
+      // Try to extract IP address
+      const ipMatch = text.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/)
+      if (ipMatch) {
+        return ipMatch[1]
+      }
+
+      // Try to extract domain name
+      const domainMatch = text.match(/([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}/g)
+      if (domainMatch && domainMatch.length > 0) {
+        return domainMatch[0]
+      }
+
+      // Try to extract hostname (alphanumeric combination)
+      const hostnameMatch = text.match(/([a-zA-Z][a-zA-Z0-9\-_]{2,})/g)
+      if (hostnameMatch && hostnameMatch.length > 0) {
+        // Filter out common non-hostname words
+        const excludeWords = ['root', 'admin', 'user', 'ubuntu', 'centos', 'server', 'host', 'ssh', 'connection']
+        const validHostnames = hostnameMatch.filter((h) => !excludeWords.includes(h.toLowerCase()) && h.length >= 3)
+        if (validHostnames.length > 0) {
+          return validHostnames[0]
+        }
+      }
+
+      return null
+    }
+
+    // If host not found, try to extract from filename and path
+    if (!foundHost) {
+      let extractedHost = extractHostFromText(fileName)
+
+      // If not found in filename, try to extract from full path
+      if (!extractedHost && fullPath) {
+        extractedHost = extractHostFromText(fullPath)
+      }
+
+      if (extractedHost) {
+        session.host = extractedHost
+        foundHost = true
+        logger.info('Extracted host from filename/path', { event: 'xsh.parse.extract', field: 'host', host: session.host })
+      } else {
+        // If still not found, use filename as hostname
+        const cleanFileName = fileName.replace('.xsh', '').replace(/[^a-zA-Z0-9\-_.]/g, '')
+        if (cleanFileName.length > 0) {
+          session.host = cleanFileName
+          foundHost = true
+          logger.info('Using cleaned filename as host', { event: 'xsh.parse.extract', field: 'host', host: session.host })
+        }
+      }
+    }
+
+    // If filename contains common username patterns
+    if (!foundUsername) {
+      const commonUsers = ['root', 'admin', 'user', 'ubuntu', 'centos', 'administrator']
+      const searchText = (fileName + ' ' + (fullPath || '')).toLowerCase()
+
+      for (const user of commonUsers) {
+        if (searchText.includes(user)) {
+          session.username = user
+          foundUsername = true
+          logger.info('Extracted username from filename/path', { event: 'xsh.parse.extract', field: 'username', username: session.username })
+          break
+        }
+      }
+
+      // If still not found, set default username
+      if (!foundUsername) {
+        session.username = 'root' // Changed to default to root instead of 'undefined'
+        logger.info('Setting default username', { event: 'xsh.parse.default', field: 'username', username: session.username })
+      }
+    }
+  }
+
+  // Set default values
+  if (!session.port) session.port = 22
+  if (!session.protocol) session.protocol = 'SSH'
+  if (!session.authType) session.authType = 'password'
+
+  logger.info('Final session data', {
+    name: session.name,
+    host: session.host,
+    port: session.port,
+    username: session.username,
+    protocol: session.protocol,
+    foundHost,
+    foundUsername,
+    fileName,
+    fullPath
+  })
+
+  return session
+}
+
+ipcMain.handle('key-chain-local-get-list', async () => {
+  try {
+    const result = chatermDbService.getKeyChainList()
+    return result
+  } catch (error) {
+    logger.error('Chaterm get asset failed', { error: error })
+    return null
+  }
+})
+
+ipcMain.handle('key-chain-local-create', async (_, data) => {
+  try {
+    const { form } = data
+    const result = chatermDbService.createKeyChain(form)
+    return result
+  } catch (error) {
+    logger.error('Chaterm create keychain failed', { error: error })
+    return null
+  }
+})
+
+ipcMain.handle('key-chain-local-delete', async (_, data) => {
+  try {
+    const { id } = data
+    const result = chatermDbService.deleteKeyChain(id)
+    return result
+  } catch (error) {
+    logger.error('Chaterm delete keychain failed', { error: error })
+    return null
+  }
+})
+
+ipcMain.handle('key-chain-local-get-info', async (_, data) => {
+  try {
+    const { id } = data
+    const result = chatermDbService.getKeyChainInfo(id)
+    return result
+  } catch (error) {
+    logger.error('Chaterm get keychain failed', { error: error })
+    return null
+  }
+})
+
+ipcMain.handle('key-chain-local-update', async (_, data) => {
+  try {
+    const { form } = data
+    const result = chatermDbService.updateKeyChain(form)
+    return result
+  } catch (error) {
+    logger.error('Chaterm update keychain failed', { error: error })
+    return null
+  }
+})
+
+ipcMain.handle('chaterm-connect-asset-info', async (_, data) => {
+  try {
+    const { uuid, organizationUuid, ip } = data
+    const fallback = organizationUuid || ip ? { organizationUuid, ip } : undefined
+    const result = chatermDbService.connectAssetInfo(uuid, fallback)
+    return result
+  } catch (error) {
+    logger.error('Chaterm get asset info failed', { error: error })
+    return null
+  }
+})
+
+ipcMain.handle('agent-chaterm-messages', async (_, data) => {
+  try {
+    const { taskId } = data
+    const result = chatermDbService.getSavedChatermMessages(taskId)
+    return result
+  } catch (error) {
+    logger.error('Chaterm get UI messages failed', { error: error })
+    return null
+  }
+})
+
+ipcMain.handle('agent-chaterm-messages-page', async (_, data) => {
+  try {
+    const { taskId, beforeCursor = null, limit = 40 } = data
+    const result = await chatermDbService.getSavedChatermMessagesPage(taskId, { beforeCursor, limit })
+    return result
+  } catch (error) {
+    logger.error('Chaterm get paged UI messages failed', { error: error })
+    return { messages: [], nextCursor: null, hasMore: false }
+  }
+})
+
+// This code is newly added to handle calls from the renderer process
+ipcMain.handle('execute-remote-command', async () => {
+  logger.info('Received execute-remote-command IPC call') // Add log
+  try {
+    const output = await executeRemoteCommand()
+    logger.debug('executeRemoteCommand output', { value: output }) // Add log
+    return { success: true, output }
+  } catch (error) {
+    logger.error('Failed to execute remote command in main process', { error: error }) // Modified log
+    if (error instanceof Error) {
+      return {
+        success: false,
+        error: { message: error.message, stack: error.stack, name: error.name }
+      }
+    }
+    return { success: false, error: { message: 'An unknown error occurred in main process' } } // Modified log
+  }
+})
+
+ipcMain.handle('get-task-metadata', async (_event, { taskId }) => {
+  try {
+    const metadata = await getTaskMetadata(taskId)
+    return { success: true, data: metadata }
+  } catch (error) {
+    if (error instanceof Error) {
+      return { success: false, error: { message: error.message } }
+    }
+    return { success: false, error: { message: 'Unknown error occurred' } }
+  }
+})
+
+ipcMain.handle('set-task-title', async (_event, { taskId, title }) => {
+  try {
+    await saveTaskTitle(taskId, title)
+    sendToRendererWindows('main-to-webview', {
+      type: 'taskTitleUpdated',
+      taskId,
+      title
+    })
+    return { success: true }
+  } catch (error) {
+    return { success: false, error: { message: error instanceof Error ? error.message : 'Unknown error' } }
+  }
+})
+
+ipcMain.handle('set-task-favorite', async (_event, { taskId, favorite }) => {
+  try {
+    await saveTaskFavorite(taskId, favorite)
+    sendToRendererWindows('main-to-webview', {
+      type: 'taskFavoriteUpdated',
+      taskId,
+      favorite
+    })
+    return { success: true }
+  } catch (error) {
+    return { success: false, error: { message: error instanceof Error ? error.message : 'Unknown error' } }
+  }
+})
+
+ipcMain.handle('get-task-list', async (_event, data?: { workspace?: 'server' | 'database' }) => {
+  try {
+    const list = await getTaskList(data?.workspace)
+    return { success: true, data: list }
+  } catch (error) {
+    return { success: false, error: { message: error instanceof Error ? error.message : 'Unknown error' } }
+  }
+})
+
+ipcMain.handle('get-user-hosts', async (_, data) => {
+  try {
+    const { search, limit = 50 } = data
+    const result = chatermDbService.getUserHosts(search, limit)
+    return result
+  } catch (error) {
+    logger.error('Chaterm get user hosts list failed', { error: error })
+    return null
+  }
+})
+
+ipcMain.handle('user-snippet-operation', async (_, data) => {
+  try {
+    const { operation, params } = data
+    const result = chatermDbService.userSnippetOperation(operation, params)
+    return result
+  } catch (error) {
+    logger.error('Chaterm user snippet operation failed', { error: error })
+    return {
+      code: 500,
+      message: error instanceof Error ? error.message : 'Unknown error occurred'
+    }
+  }
+})
+
+ipcMain.handle('validate-api-key', async (_, configuration) => {
+  if (controller) {
+    // If no configuration data is passed, return error
+    if (!configuration) {
+      return { isValid: false, error: 'No API configuration provided' }
+    }
+    return await controller.validateApiKey(configuration)
+  }
+  return { isValid: false, error: 'Controller not initialized' }
+})
+
+ipcMain.handle('refresh-organization-assets', async (event, data) => {
+  try {
+    const { organizationUuid, jumpServerConfig } = data
+
+    // Generate unique connection ID for two-factor authentication
+    const connectionId = `refresh-assets-${organizationUuid}-${Date.now()}`
+
+    // Create two-factor authentication handler for interaction with renderer process
+    const keyboardInteractiveHandler = async (prompts: any[], finish: (responses: string[]) => void) => {
+      return new Promise<void>((resolve, reject) => {
+        // Send two-factor authentication request to renderer process
+        event.sender.send('ssh:keyboard-interactive-request', {
+          id: connectionId,
+          prompts: prompts.map((p) => p.prompt)
+        })
+
+        // Set timeout
+        const timeoutId = setTimeout(() => {
+          ipcMain.removeAllListeners(`ssh:keyboard-interactive-response:${connectionId}`)
+          ipcMain.removeAllListeners(`ssh:keyboard-interactive-cancel:${connectionId}`)
+          finish([])
+          event.sender.send('ssh:keyboard-interactive-timeout', { id: connectionId })
+          reject(new Error('Two-factor authentication timeout'))
+        }, 180000) // 180 second timeout
+
+        // Listen for user response
+        ipcMain.once(`ssh:keyboard-interactive-response:${connectionId}`, (_evt, responses) => {
+          clearTimeout(timeoutId)
+          finish(responses)
+          resolve() // Resolve immediately, verification result will be handled by authResultCallback
+        })
+
+        // Listen for user cancellation
+        ipcMain.once(`ssh:keyboard-interactive-cancel:${connectionId}`, () => {
+          clearTimeout(timeoutId)
+          finish([])
+          reject(new Error('User cancelled two-factor authentication'))
+        })
+      })
+    }
+
+    // Create authentication result callback
+    const authResultCallback = (success: boolean, error?: string) => {
+      logger.info('Main process: authResultCallback called', { success, error })
+      if (success) {
+        logger.info('Main process: Two-factor authentication succeeded, sending success event to frontend')
+        event.sender.send('ssh:keyboard-interactive-result', { id: connectionId, status: 'success' })
+      } else {
+        logger.info('Main process: Two-factor authentication failed, sending failure event to frontend', { value: error })
+        event.sender.send('ssh:keyboard-interactive-result', { id: connectionId, status: 'failed' })
+      }
+    }
+
+    const result = await chatermDbService.refreshOrganizationAssetsWithAuth(
+      organizationUuid,
+      jumpServerConfig,
+      keyboardInteractiveHandler,
+      authResultCallback
+    )
+    return result
+  } catch (error) {
+    logger.error('Failed to refresh organization assets', { error: error })
+    return { data: { message: 'failed', error: error instanceof Error ? error.message : String(error) } }
+  }
+})
+
+ipcMain.handle('organization-asset-favorite', async (_, data) => {
+  try {
+    const { organizationUuid, host, status } = data
+
+    if (!organizationUuid || !host || status === undefined) {
+      logger.error('Incomplete parameters', { organizationUuid, host, status })
+      return { data: { message: 'failed', error: 'Incomplete parameters' } }
+    }
+
+    const result = chatermDbService.updateOrganizationAssetFavorite(organizationUuid, host, status)
+    return result
+  } catch (error) {
+    logger.error('Main process organization-asset-favorite error', { error: error })
+    return { data: { message: 'failed', error: error instanceof Error ? error.message : String(error) } }
+  }
+})
+
+ipcMain.handle('organization-asset-comment', async (_, data) => {
+  try {
+    const { organizationUuid, host, comment } = data
+
+    if (!organizationUuid || !host) {
+      logger.error('Incomplete parameters', { organizationUuid, host, comment })
+      return { data: { message: 'failed', error: 'Incomplete parameters' } }
+    }
+
+    const result = chatermDbService.updateOrganizationAssetComment(organizationUuid, host, comment || '')
+    return result
+  } catch (error) {
+    logger.error('Main process organization-asset-comment error', { error: error })
+    return { data: { message: 'failed', error: error instanceof Error ? error.message : String(error) } }
+  }
+})
+
+// Organization asset management IPC handlers
+ipcMain.handle('get-organization-assets', async (_, data) => {
+  try {
+    const { organizationUuid, search, page, pageSize } = data
+
+    if (!organizationUuid) {
+      return { data: { message: 'failed', error: 'organizationUuid is required' } }
+    }
+
+    const result = chatermDbService.getOrganizationAssets(organizationUuid, search, page, pageSize)
+    return result
+  } catch (error) {
+    logger.error('Main process get-organization-assets error', { error: error })
+    return { data: { message: 'failed', error: error instanceof Error ? error.message : String(error) } }
+  }
+})
+
+ipcMain.handle('create-organization-asset', async (_, data) => {
+  try {
+    const { organizationUuid, hostname, host, comment } = data
+
+    if (!organizationUuid || !hostname || !host) {
+      return { data: { message: 'failed', error: 'organizationUuid, hostname, and host are required' } }
+    }
+
+    const result = chatermDbService.createOrganizationAsset(organizationUuid, { hostname, host, comment })
+    return result
+  } catch (error) {
+    logger.error('Main process create-organization-asset error', { error: error })
+    return { data: { message: 'failed', error: error instanceof Error ? error.message : String(error) } }
+  }
+})
+
+ipcMain.handle('update-organization-asset', async (_, data) => {
+  try {
+    const { uuid, hostname, host, comment } = data
+
+    if (!uuid) {
+      return { data: { message: 'failed', error: 'uuid is required' } }
+    }
+
+    const result = chatermDbService.updateOrganizationAsset(uuid, { hostname, host, comment })
+    return result
+  } catch (error) {
+    logger.error('Main process update-organization-asset error', { error: error })
+    return { data: { message: 'failed', error: error instanceof Error ? error.message : String(error) } }
+  }
+})
+
+ipcMain.handle('delete-organization-asset', async (_, data) => {
+  try {
+    const { uuid } = data
+
+    if (!uuid) {
+      return { data: { message: 'failed', error: 'uuid is required' } }
+    }
+
+    const result = chatermDbService.deleteOrganizationAsset(uuid)
+    return result
+  } catch (error) {
+    logger.error('Main process delete-organization-asset error', { error: error })
+    return { data: { message: 'failed', error: error instanceof Error ? error.message : String(error) } }
+  }
+})
+
+ipcMain.handle('batch-delete-organization-assets', async (_, data) => {
+  try {
+    const { uuids } = data
+
+    if (!uuids || !Array.isArray(uuids) || uuids.length === 0) {
+      return { data: { message: 'failed', error: 'uuids array is required' } }
+    }
+
+    const result = chatermDbService.batchDeleteOrganizationAssets(uuids)
+    return result
+  } catch (error) {
+    logger.error('Main process batch-delete-organization-assets error', { error: error })
+    return { data: { message: 'failed', error: error instanceof Error ? error.message : String(error) } }
+  }
+})
+
+// Custom folder management IPC handlers
+ipcMain.handle('create-custom-folder', async (_, data) => {
+  try {
+    const { name, description } = data
+
+    if (!name) {
+      logger.error('Incomplete parameters', { name, description })
+      return { data: { message: 'failed', error: 'Folder name cannot be empty' } }
+    }
+
+    const result = chatermDbService.createCustomFolder(name, description)
+    return result
+  } catch (error) {
+    logger.error('Main process create-custom-folder error', { error: error })
+    return { data: { message: 'failed', error: error instanceof Error ? error.message : String(error) } }
+  }
+})
+
+ipcMain.handle('get-custom-folders', async () => {
+  try {
+    const result = chatermDbService.getCustomFolders()
+    return result
+  } catch (error) {
+    logger.error('Main process get-custom-folders error', { error: error })
+    return { data: { message: 'failed', error: error instanceof Error ? error.message : String(error) } }
+  }
+})
+
+ipcMain.handle('update-custom-folder', async (_, data) => {
+  try {
+    const { folderUuid, name, description } = data
+
+    if (!folderUuid || !name) {
+      logger.error('Incomplete parameters', { folderUuid, name, description })
+      return { data: { message: 'failed', error: 'Folder UUID and name cannot be empty' } }
+    }
+
+    const result = chatermDbService.updateCustomFolder(folderUuid, name, description)
+    return result
+  } catch (error) {
+    logger.error('Main process update-custom-folder error', { error: error })
+    return { data: { message: 'failed', error: error instanceof Error ? error.message : String(error) } }
+  }
+})
+
+ipcMain.handle('delete-custom-folder', async (_, data) => {
+  try {
+    const { folderUuid } = data
+
+    if (!folderUuid) {
+      logger.error('Incomplete parameters', { folderUuid })
+      return { data: { message: 'failed', error: 'Folder UUID cannot be empty' } }
+    }
+
+    const result = chatermDbService.deleteCustomFolder(folderUuid)
+    return result
+  } catch (error) {
+    logger.error('Main process delete-custom-folder error', { error: error })
+    return { data: { message: 'failed', error: error instanceof Error ? error.message : String(error) } }
+  }
+})
+
+ipcMain.handle('move-asset-to-folder', async (_, data) => {
+  try {
+    const { folderUuid, organizationUuid, assetHost } = data
+
+    if (!folderUuid || !organizationUuid || !assetHost) {
+      logger.error('Incomplete parameters', { folderUuid, organizationUuid, assetHost })
+      return { data: { message: 'failed', error: 'Incomplete parameters' } }
+    }
+
+    const result = chatermDbService.moveAssetToFolder(folderUuid, organizationUuid, assetHost)
+    return result
+  } catch (error) {
+    logger.error('Main process move-asset-to-folder error', { error: error })
+    return { data: { message: 'failed', error: error instanceof Error ? error.message : String(error) } }
+  }
+})
+
+ipcMain.handle('remove-asset-from-folder', async (_, data) => {
+  try {
+    const { folderUuid, organizationUuid, assetHost } = data
+
+    if (!folderUuid || !organizationUuid || !assetHost) {
+      logger.error('Incomplete parameters', { folderUuid, organizationUuid, assetHost })
+      return { data: { message: 'failed', error: 'Incomplete parameters' } }
+    }
+
+    const result = chatermDbService.removeAssetFromFolder(folderUuid, organizationUuid, assetHost)
+    return result
+  } catch (error) {
+    logger.error('Main process remove-asset-from-folder error', { error: error })
+    return { data: { message: 'failed', error: error instanceof Error ? error.message : String(error) } }
+  }
+})
+
+ipcMain.handle('get-assets-in-folder', async (_, data) => {
+  try {
+    const { folderUuid } = data
+
+    if (!folderUuid) {
+      logger.error('Incomplete parameters', { folderUuid })
+      return { data: { message: 'failed', error: 'Folder UUID cannot be empty' } }
+    }
+
+    const result = chatermDbService.getAssetsInFolder(folderUuid)
+    return result
+  } catch (error) {
+    logger.error('Main process get-assets-in-folder error', { error: error })
+    return { data: { message: 'failed', error: error instanceof Error ? error.message : String(error) } }
+  }
+})
+
+ipcMain.handle('capture-telemetry-event', async (_, { eventType, data }) => {
+  try {
+    switch (eventType) {
+      case 'button_click':
+        // taskId should be provided in data if needed, otherwise undefined
+        const taskId = data?.taskId
+        telemetryService.captureButtonClick(data.button, taskId, data.properties)
+        break
+      default:
+        logger.warn('Unknown telemetry event type', { value: eventType })
+    }
+    return { success: true }
+  } catch (error) {
+    logger.error('Failed to capture telemetry event', { error: error })
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+})
+
+// Plugins
+
+ipcMain.handle('plugins.install', async (_event, pluginFilePath: string) => {
+  const record = installPlugin(pluginFilePath, { source: 'local', required: false })
+  await loadAllPlugins()
+  return record
+})
+
+const pluginInstallAbortControllers = new Map<string, AbortController>()
+
+async function installStorePluginFromBuffer(payload: { pluginId: string; version?: string; fileName?: string; data: ArrayBuffer }) {
+  const { pluginId, version, fileName, data } = payload
+  const installedPlugin = getInstalledPlugin(pluginId)
+
+  try {
+    await uninstallPlugin(pluginId, { force: true })
+  } catch (e) {
+    logger.warn('uninstall before update failed, continue install', { value: e })
+  }
+
+  const baseDir = path.join(getPluginCacheRoot(), pluginId, version || 'latest')
+  await fsSync.promises.mkdir(baseDir, { recursive: true })
+
+  const finalFileName = fileName || `${pluginId}-${version || 'latest'}.chaterm`
+  const tmpFilePath = path.join(baseDir, finalFileName)
+
+  const buffer = Buffer.from(data)
+  await fsSync.promises.writeFile(tmpFilePath, buffer)
+
+  const record = installPlugin(tmpFilePath, {
+    source: installedPlugin?.source || 'store',
+    required: installedPlugin?.required === true
+  })
+  await loadAllPlugins()
+  return record
+}
+
+ipcMain.handle('plugin:downloadPackage', async (_event, payload: { url: string }) => {
+  const url = String(payload?.url || '').trim()
+  if (!/^https?:\/\//i.test(url)) {
+    throw new Error('invalid plugin download url')
+  }
+
+  const response = await net.fetch(url)
+  if (!response.ok) {
+    throw new Error(`plugin package download failed: HTTP ${response.status}`)
+  }
+  return await response.arrayBuffer()
+})
+
+ipcMain.handle(
+  'plugin:installFromUrl',
+  async (event, payload: { pluginId: string; version?: string; fileName?: string; url: string; sha256?: string }) => {
+    const url = String(payload?.url || '').trim()
+    if (!/^https?:\/\//i.test(url)) {
+      throw new Error('invalid plugin download url')
+    }
+
+    const sendStage = (
+      stage: 'downloading' | 'verifying' | 'installing' | 'done' | 'error' | 'cancelled',
+      progress?: { receivedBytes?: number; totalBytes?: number; percent?: number }
+    ) => {
+      event.sender.send('plugin:install-progress', { pluginId: payload.pluginId, stage, ...progress })
+    }
+
+    const abortController = new AbortController()
+    pluginInstallAbortControllers.set(payload.pluginId, abortController)
+
+    try {
+      sendStage('downloading')
+      const response = await net.fetch(url, { signal: abortController.signal })
+      if (!response.ok) {
+        throw new Error(`plugin package download failed: HTTP ${response.status}`)
+      }
+
+      const totalBytes = Number(response.headers.get('content-length') || 0)
+      const reader = response.body?.getReader()
+      let data: ArrayBuffer
+      if (reader) {
+        const chunks: Uint8Array[] = []
+        let receivedBytes = 0
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          if (!value) continue
+          chunks.push(value)
+          receivedBytes += value.byteLength
+          const percent = totalBytes > 0 ? Math.min(100, Math.round((receivedBytes / totalBytes) * 100)) : 0
+          sendStage('downloading', { receivedBytes, totalBytes, percent })
+        }
+        const buffer = Buffer.concat(
+          chunks.map((chunk) => Buffer.from(chunk)),
+          receivedBytes
+        )
+        data = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)
+      } else {
+        data = await response.arrayBuffer()
+        const receivedBytes = data.byteLength
+        sendStage('downloading', { receivedBytes, totalBytes: totalBytes || receivedBytes, percent: 100 })
+      }
+      const expectedSha256 = String(payload?.sha256 || '').trim()
+      if (expectedSha256) {
+        sendStage('verifying')
+        const actualSha256 = createHash('sha256').update(Buffer.from(data)).digest('hex')
+        if (actualSha256.toLowerCase() !== expectedSha256.toLowerCase()) {
+          throw new Error('Plugin package checksum mismatch')
+        }
+      }
+
+      sendStage('installing')
+      const record = await installStorePluginFromBuffer({
+        pluginId: payload.pluginId,
+        version: payload.version,
+        fileName: payload.fileName,
+        data
+      })
+      sendStage('done')
+      return record
+    } catch (error) {
+      if (abortController.signal.aborted) {
+        sendStage('cancelled')
+        throw new Error('plugin install cancelled')
+      }
+      sendStage('error')
+      throw error
+    } finally {
+      if (pluginInstallAbortControllers.get(payload.pluginId) === abortController) {
+        pluginInstallAbortControllers.delete(payload.pluginId)
+      }
+    }
+  }
+)
+
+ipcMain.handle('plugin:cancelInstall', async (_event, payload: { pluginId: string }) => {
+  const pluginId = String(payload?.pluginId || '').trim()
+  const controller = pluginInstallAbortControllers.get(pluginId)
+  if (!controller) {
+    return { ok: false }
+  }
+  controller.abort()
+  pluginInstallAbortControllers.delete(pluginId)
+  return { ok: true }
+})
+
+ipcMain.handle(
+  'plugin:installFromBuffer',
+  async (
+    _event,
+    payload: {
+      pluginId: string
+      version?: string
+      fileName?: string
+      data: ArrayBuffer
+    }
+  ) => {
+    return installStorePluginFromBuffer(payload)
+  }
+)
+
+ipcMain.handle('plugins.uninstall', async (_event, pluginId: string) => {
+  try {
+    uninstallPlugin(pluginId)
+    await loadAllPlugins()
+    return { ok: true }
+  } catch (error) {
+    logger.error('Plugin uninstall failed', {
+      event: 'plugin.uninstall.ipc.error',
+      pluginId,
+      error
+    })
+    throw new Error(getPluginUninstallErrorCode(error))
+  }
+})
+
+ipcMain.handle('plugins.reload', async () => {
+  await loadAllPlugins()
+  return { ok: true }
+})
+
+ipcMain.handle('plugins:get-install-hint', (_event, pluginId: string) => {
+  return getInstallHint(pluginId)
+})
+
+ipcMain.handle('plugins.listUi', async () => {
+  const registry = listPlugins()
+  const uiItems: any[] = []
+  const language = await getUserLanguage()
+
+  for (const p of registry) {
+    const manifestPath = path.join(p.path, 'plugin.json')
+    if (!fsSync.existsSync(manifestPath)) continue
+
+    const manifest = JSON.parse(fsSync.readFileSync(manifestPath, 'utf8')) as PluginManifest
+
+    let iconUrl: string | null = null
+    if (manifest.icon) {
+      const iconFsPath = path.join(p.path, manifest.icon)
+      if (fsSync.existsSync(iconFsPath)) {
+        iconUrl = pathToFileURL(iconFsPath).toString()
+      }
+    }
+
+    // Get localized name and description
+    const { name, description } = getLocalizedStrings(manifest, language)
+
+    uiItems.push({
+      id: p.id,
+      version: p.version,
+      enabled: p.enabled,
+      required: p.required === true,
+      source: p.source || 'local',
+      name,
+      description,
+      iconUrl,
+      tabName: p.id
+    })
+  }
+
+  return uiItems
+})
+ipcMain.handle('plugins.getPluginsVersion', async () => {
+  return await getAllPluginVersions()
+})
+ipcMain.handle('plugins.details', async (_event, pluginName: string) => {
+  return await getPluginDetailsByName(pluginName)
+})
+
+// Get registered bastion types from capability registry
+// Returns plugin-registered bastion types (not including built-in JumpServer)
+ipcMain.handle('plugin:getRegisteredBastionTypes', () => {
+  return capabilityRegistry.listBastions()
+})
+
+// Get all registered bastion definitions (plugin metadata)
+// Returns BastionDefinition[] for UI rendering and routing decisions
+ipcMain.handle('plugin:getBastionDefinitions', () => {
+  return capabilityRegistry.listBastionDefinitions()
+})
+
+// Get a specific bastion definition by type
+ipcMain.handle('plugin:getBastionDefinition', (_event, type: string) => {
+  return capabilityRegistry.getBastionDefinition(type)
+})
+
+// Check if a specific bastion type is available
+ipcMain.handle('plugin:hasBastionCapability', (_event, type: string) => {
+  return capabilityRegistry.hasBastion(type)
+})
+
+// Get Qizhi plugin enabled state (now based on capability registry)
+ipcMain.handle('plugin:isQizhiPluginEnabled', () => {
+  return capabilityRegistry.hasBastion('qizhi')
+})
+
+// Set Qizhi plugin enabled state - no longer supported (plugins auto-register)
+ipcMain.handle('plugin:setQizhiPluginEnabled', () => {
+  logger.warn('[Plugin] setQizhiPluginEnabled is deprecated - plugins auto-register capabilities')
+  return { success: false, message: 'Deprecated - plugins auto-register capabilities' }
+})
+
+// Register the agreement before the app is ready
+const protocolName = getProtocolName()
+if (!app.isDefaultProtocolClient(protocolName)) {
+  app.setAsDefaultProtocolClient(protocolName)
+}
+
+// Handle protocol parameters on Linux
+if (process.platform === 'linux') {
+  // Implement single instance lock for Linux platform to ensure only one app instance runs
+  const gotTheLock = app.requestSingleInstanceLock()
+  const protocolPrefix = getProtocolPrefix()
+
+  if (!gotTheLock) {
+    // If lock cannot be acquired, another instance is already running, exit current instance
+    app.quit()
+  } else {
+    // Listen for second instance startup
+    app.on('second-instance', (_event, commandLine, _workingDirectory) => {
+      // Someone is trying to run a second instance, we should focus on our window
+      const targetWindow = getPrimaryWindow()
+      if (targetWindow) {
+        if (targetWindow.isMinimized()) targetWindow.restore()
+        targetWindow.focus()
+      }
+
+      // Handle protocol URL
+      const protocolUrl = commandLine.find((arg) => arg.startsWith(protocolPrefix))
+      if (protocolUrl) {
+        handleProtocolRedirect(protocolUrl)
+      }
+    })
+  }
+
+  // Handle protocol parameters when app starts
+  const protocolArg = process.argv.find((arg) => arg.startsWith(protocolPrefix))
+  if (protocolArg) {
+    app.whenReady().then(() => {
+      handleProtocolRedirect(protocolArg)
+    })
+  }
+
+  // Add additional IPC handler for Linux to handle protocol calls during app runtime
+  ipcMain.handle('handle-protocol-url', async (_, url) => {
+    if (url && url.startsWith(protocolPrefix)) {
+      handleProtocolRedirect(url)
+      return { success: true }
+    }
+    return { success: false, error: 'Invalid protocol URL' }
+  })
+}
+
+// Process protocol redirection
+const handleProtocolRedirect = async (url: string) => {
+  const pendingState = (await loadPendingExternalLoginStateFromCookie()) ?? pendingExternalLoginState
+
+  // Get main window
+  let targetWindow = getPrimaryWindow()
+  if (pendingState) {
+    const originalWindow = BrowserWindow.fromId(pendingState.windowId)
+    if (originalWindow && !originalWindow.isDestroyed()) {
+      targetWindow = originalWindow
+      logger.info('Found original window for external login callback', { windowId: pendingState.windowId })
+    }
+  }
+
+  if (!targetWindow) {
+    logger.error('No available window found to handle protocol redirection')
+    return
+  }
+
+  // Parse token and user info from URL
+  const urlObj = new URL(url)
+  const userInfo = urlObj.searchParams.get('userInfo')
+  const method = urlObj.searchParams.get('method')
+  const state = urlObj.searchParams.get('state')
+  const timestamp = urlObj.searchParams.get('timestamp')
+  const sign = urlObj.searchParams.get('sign')
+
+  if (userInfo) {
+    logger.info('Received external login callback', {
+      hasPendingState: Boolean(pendingState),
+      hasMethod: Boolean(method),
+      hasState: Boolean(state),
+      hasTimestamp: Boolean(timestamp),
+      hasSign: Boolean(sign),
+      signatureEnabled: oauthDeepLinkSignatureEnabled,
+      targetWindowId: targetWindow.id
+    })
+
+    if (!pendingState) {
+      logger.warn('Rejected external login callback without pending auth state')
+      await clearPendingExternalLoginState()
+      return
+    }
+
+    if (!state || state !== pendingState.state) {
+      logger.warn('Rejected external login callback due to invalid state', {
+        hasState: Boolean(state),
+        stateMatches: state === pendingState.state,
+        callbackStateSuffix: state ? state.slice(-8) : '',
+        pendingStateSuffix: pendingState.state.slice(-8),
+        windowId: pendingState.windowId
+      })
+      await clearPendingExternalLoginState()
+      return
+    }
+
+    if (pendingState.expiresAt <= Date.now()) {
+      logger.warn('Rejected external login callback because auth state expired', {
+        createdAt: pendingState.createdAt,
+        expiresAt: pendingState.expiresAt
+      })
+      await clearPendingExternalLoginState()
+      return
+    }
+
+    try {
+      const parsedUserInfo = JSON.parse(userInfo) as Record<string, unknown>
+      logger.info('Parsed external login callback payload', {
+        method: method,
+        uid: parsedUserInfo.uid,
+        email: parsedUserInfo.email,
+        signatureEnabled: oauthDeepLinkSignatureEnabled
+      })
+
+      if (oauthDeepLinkSignatureEnabled) {
+        if (!method || !timestamp || !sign) {
+          logger.warn('Rejected external login callback because signature payload is incomplete', {
+            hasMethod: Boolean(method),
+            hasTimestamp: Boolean(timestamp),
+            hasSign: Boolean(sign)
+          })
+          await clearPendingExternalLoginState()
+          return
+        }
+
+        const signatureValid = verifyOAuthDeepLinkSignature({
+          userInfo: parsedUserInfo,
+          method,
+          state,
+          timestamp,
+          sign
+        })
+
+        if (!signatureValid) {
+          logger.warn('Rejected external login callback because signature verification failed', {
+            method: method,
+            uid: parsedUserInfo.uid,
+            email: parsedUserInfo.email
+          })
+          await clearPendingExternalLoginState()
+          return
+        }
+
+        logger.info('External login callback signature verification passed', {
+          method: method,
+          uid: parsedUserInfo.uid
+        })
+      }
+
+      await clearPendingExternalLoginState()
+
+      // Send data to renderer process
+      targetWindow.webContents.send('external-login-success', {
+        userInfo: parsedUserInfo,
+        userInfoRaw: userInfo,
+        method: method,
+        state: state,
+        timestamp: timestamp,
+        sign: sign
+      })
+      logger.info('Dispatched external login callback to renderer', {
+        method: method,
+        uid: parsedUserInfo.uid,
+        targetWindowId: targetWindow.id
+      })
+
+      // Ensure window is visible and focused
+      if (targetWindow.isMinimized()) {
+        targetWindow.restore()
+      }
+      targetWindow.focus()
+
+      // After external login succeeds, check if data sync service needs to be restarted
+      // Note: We cannot directly get user ID here because renderer process hasn't finished login logic
+      // So we handle data sync restart through init-user-database after renderer process finishes login
+      logger.info('External login succeeded, waiting for renderer process to handle user initialization...')
+    } catch (error) {
+      logger.error('Failed to process external login data', {
+        error: error,
+        hasMethod: Boolean(method),
+        hasState: Boolean(state),
+        hasTimestamp: Boolean(timestamp),
+        hasSign: Boolean(sign)
+      })
+    }
+  }
+}
+
+const dispatchXshellWakeupToRenderer = (payload: XshellWakeupPayload) => {
+  const targetWindow = getPrimaryWindow()
+  if (!targetWindow || targetWindow.isDestroyed()) {
+    return
+  }
+
+  if (targetWindow.isMinimized()) {
+    targetWindow.restore()
+  }
+  targetWindow.focus()
+  targetWindow.webContents.send('external-xshell-wakeup', payload)
+}
+
+const buildWakeupArgvFromAppSwitches = (): string[] => {
+  const fromSwitches: string[] = []
+  const encoded = app.commandLine.getSwitchValue('xshell-wakeup')
+  if (encoded) {
+    return ['--xshell-wakeup', encoded]
+  }
+
+  const url = app.commandLine.getSwitchValue('url')
+  if (url) {
+    fromSwitches.push('--url', url)
+  }
+
+  const newtab = app.commandLine.getSwitchValue('newtab')
+  if (newtab) {
+    fromSwitches.push('--newtab', newtab)
+  }
+
+  return fromSwitches
+}
+
+const handleXshellWakeupArgv = (
+  argv: string[],
+  options?: {
+    fallbackToAppSwitches?: boolean
+  }
+) => {
+  let payload = parseXshellWakeupFromArgv(argv)
+  if (!payload && options?.fallbackToAppSwitches) {
+    const switchArgv = buildWakeupArgvFromAppSwitches()
+    if (switchArgv.length > 0) {
+      payload = parseXshellWakeupFromArgv(switchArgv)
+    }
+  }
+  if (!payload) return false
+
+  logger.info('Received Xshell wakeup payload', {
+    payload: redactXshellWakeupForLog(payload)
+  })
+  pendingXshellWakeups.push(payload)
+  dispatchXshellWakeupToRenderer(payload)
+  return true
+}
+
+// Activation of Processing Protocol in Windows
+if (process.platform === 'win32') {
+  const gotTheLock = app.requestSingleInstanceLock()
+  const protocolPrefix = getProtocolPrefix()
+
+  if (!gotTheLock) {
+    app.quit()
+  } else {
+    app.on('second-instance', (_event, commandLine) => {
+      // Someone is trying to run the second instance, we should focus on our window
+      const targetWindow = getPrimaryWindow()
+      if (targetWindow) {
+        if (targetWindow.isMinimized()) targetWindow.restore()
+        targetWindow.focus()
+      }
+
+      // Handle fake xshell wakeup arguments first
+      if (handleXshellWakeupArgv(commandLine)) {
+        return
+      }
+
+      // Processing Protocol URL
+      const url = commandLine.find((arg) => arg.startsWith(protocolPrefix))
+      if (url && url.startsWith(protocolPrefix)) {
+        handleProtocolRedirect(url)
+      }
+    })
+  }
+
+  // Handle fake xshell wakeup parameters when app starts
+  if (handleXshellWakeupArgv(process.argv, { fallbackToAppSwitches: true })) {
+    app.whenReady().then(() => {
+      // Re-dispatch once the renderer is ready enough to consume IPC events.
+      // Payload is already queued and can also be fetched via consume API.
+      const queued = pendingXshellWakeups[pendingXshellWakeups.length - 1]
+      if (queued) {
+        dispatchXshellWakeupToRenderer(queued)
+      }
+    })
+  }
+}
+
+// Protocol Activation in macOS Processing
+app.on('open-url', (_event, url) => {
+  const protocolPrefix = getProtocolPrefix()
+  if (url.startsWith(protocolPrefix)) {
+    handleProtocolRedirect(url)
+  }
+})
+
+// Add IPC handler to get protocol prefix
+ipcMain.handle('get-protocol-prefix', async () => {
+  return getProtocolPrefix()
+})
+
+ipcMain.handle('xshell-wakeup:consume-pending', async () => {
+  const queue = [...pendingXshellWakeups]
+  pendingXshellWakeups = []
+  return queue
+})
+
+// Add IPC handler after creating Window function
+ipcMain.handle('open-external-login', async (event) => {
+  try {
+    const sourceWindow = getWindowFromSender(event.sender)
+    if (!sourceWindow) {
+      throw new Error('No available window for external login')
+    }
+
+    // Generate a random state value for security verification
+    const state = randomUUID()
+    const now = Date.now()
+    const nextPendingState: PendingExternalLoginState = {
+      state,
+      createdAt: now,
+      expiresAt: now + EXTERNAL_LOGIN_STATE_TTL_MS,
+      windowId: sourceWindow.id
+    }
+    pendingExternalLoginState = nextPendingState
+
+    // Get MAC address
+    const macAddress = getMacAddress()
+
+    // Get local plugin versions
+    let localPluginsEncoded = ''
+    try {
+      const localPlugins = await getAllPluginVersions()
+      const localPluginsJson = JSON.stringify(localPlugins)
+      localPluginsEncoded = encodeURIComponent(localPluginsJson)
+    } catch (error) {
+      logger.error('Failed to get plugin versions', { error: error })
+      localPluginsEncoded = encodeURIComponent(JSON.stringify({}))
+    }
+
+    // Build login URL based on edition configuration (no IP detection)
+    const loginBaseUrl = getLoginBaseUrl()
+    const protocolPrefix = getProtocolPrefix()
+    const protocolName = getProtocolName()
+    const externalLoginUrl = `${loginBaseUrl}/login?client_id=${protocolName}&state=${state}&redirect_uri=${protocolPrefix}auth/callback&mac_address=${encodeURIComponent(macAddress)}&local_plugins=${localPluginsEncoded}`
+
+    logger.info('[Login] Opening external login', { event: 'login.external.open', edition: getEdition(), loginBaseUrl })
+
+    // On Linux platform, save state to local storage for new instances to access
+    if (process.platform === 'linux') {
+      try {
+        await session.defaultSession.cookies.set({
+          url: COOKIE_URL,
+          name: 'chaterm_auth_state',
+          value: JSON.stringify(nextPendingState),
+          expirationDate: nextPendingState.expiresAt / 1000
+        })
+      } catch (error) {
+        logger.error('Failed to save auth state', { error: error })
+      }
+    }
+
+    // Open external login page
+    await shell.openExternal(externalLoginUrl)
+    return { success: true }
+  } catch (error) {
+    logger.error('Failed to open external login page', { error: error })
+    return { success: false, error: error instanceof Error ? error.message : String(error) }
+  }
+})

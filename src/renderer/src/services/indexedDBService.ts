@@ -1,0 +1,120 @@
+const logger = createRendererLogger('service.indexedDB')
+
+interface StoreConfig {
+  name: string
+  keyPath: string
+  indexes?: Array<{
+    name: string
+    keyPath: string
+    options?: IDBIndexParameters
+  }>
+}
+
+interface DBConfig {
+  name: string
+  version: number
+  stores: StoreConfig[]
+}
+
+class IndexedDBService {
+  private static instance: IndexedDBService
+  private dbConnections: Map<string, IDBDatabase> = new Map()
+
+  // private constructor() {}
+
+  static getInstance(): IndexedDBService {
+    if (!IndexedDBService.instance) {
+      IndexedDBService.instance = new IndexedDBService()
+    }
+    return IndexedDBService.instance
+  }
+
+  async initDatabase(config: DBConfig): Promise<IDBDatabase> {
+    // If connection already exists, return directly
+    const existingConnection = this.dbConnections.get(config.name)
+    if (existingConnection) {
+      return existingConnection
+    }
+
+    return new Promise((resolve, reject) => {
+      try {
+        const request = indexedDB.open(config.name, config.version)
+
+        request.onerror = (event) => {
+          logger.error('IndexedDB error', { error: event })
+          reject('Failed to open IndexedDB')
+        }
+
+        request.onsuccess = (event) => {
+          const db = (event.target as IDBOpenDBRequest).result
+          this.dbConnections.set(config.name, db)
+          logger.info('Database opened successfully', { name: config.name })
+          resolve(db)
+        }
+
+        request.onupgradeneeded = (event: IDBVersionChangeEvent) => {
+          const db = (event.target as IDBOpenDBRequest).result
+
+          // Handle creation of all stores
+          config.stores.forEach((store) => {
+            if (!db.objectStoreNames.contains(store.name)) {
+              logger.info('Creating store', { name: store.name })
+              const objectStore = db.createObjectStore(store.name, { keyPath: store.keyPath })
+
+              // Create indexes
+              store.indexes?.forEach((index) => {
+                objectStore.createIndex(index.name, index.keyPath, index.options)
+              })
+            }
+          })
+        }
+      } catch (error) {
+        logger.error('Error initializing IndexedDB', { error: error })
+        reject(error)
+      }
+    })
+  }
+
+  async getDatabase(dbName: string): Promise<IDBDatabase | null> {
+    return this.dbConnections.get(dbName) || null
+  }
+
+  closeDatabase(dbName: string): void {
+    const db = this.dbConnections.get(dbName)
+    if (db) {
+      db.close()
+      this.dbConnections.delete(dbName)
+    }
+  }
+}
+
+// Export singleton instance
+export const indexedDBService = IndexedDBService.getInstance()
+
+// Export common database config
+export const DB_CONFIG: DBConfig = {
+  name: 'chatermDB',
+  version: 2,
+  stores: [
+    {
+      name: 'userConfig',
+      keyPath: 'id'
+    },
+    {
+      name: 'aliases',
+      keyPath: 'alias',
+      indexes: [
+        {
+          name: 'id',
+          keyPath: 'id',
+          options: { unique: true }
+        },
+        {
+          name: 'createdAt',
+          keyPath: 'createdAt',
+          options: { unique: false }
+        }
+      ]
+    }
+  ]
+}

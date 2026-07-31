@@ -1,0 +1,6346 @@
+<template>
+  <div
+    ref="terminalContainer"
+    class="terminal-container"
+    :class="{ 'transparent-bg': isTransparent }"
+    :data-ssh-connect-id="currentConnectionId"
+  >
+    <SearchComp
+      v-if="showSearch"
+      :search-addon="searchAddon"
+      :terminal="terminal"
+      @close-search="closeSearch"
+    />
+    <div
+      ref="terminalElement"
+      class="terminal"
+      @contextmenu="handleRightClick"
+      @mousedown="handleMouseDown"
+    >
+    </div>
+    <ZmodemProgress
+      v-model:visible="progressModalVisible"
+      :get-container="getContainerFunc"
+      :type="progressType"
+      :progress="currentProgress"
+      :file-name="currentFileName"
+      :is-canceling="isSzCanceling"
+      :total-size="totalSize"
+      :transfer-size="transferSize"
+      :transfer-speed="transferSpeed"
+      :status="progressStatus"
+      @cancel="handleProgressCancel"
+      @close="handleProgressClose"
+    />
+    <a-button
+      v-show="showAiButton"
+      :id="`${connectionId}Button`"
+      class="select-button"
+      @mousedown.prevent
+      @click="onChatToAiClick"
+    >
+      <span class="main-text">Chat to AI</span>
+      <span class="shortcut-text">{{ shortcutKey }}</span>
+    </a-button>
+    <SuggComp
+      v-bind="{ ref: (el) => setRef(el, connectionId) }"
+      :unique-key="connectionId"
+      :suggestions="displaySuggestions"
+      :active-suggestion="activeSuggestion"
+      :selection-mode="suggestionSelectionMode"
+      :ai-loading="aiSuggestLoading"
+      :ai-enabled="queryCommandFlag"
+      :has-ai-suggestion="!!aiSuggestion"
+      @trigger-ai="onAiTriggerHover"
+      @click-item="onSuggestionClickItem"
+    />
+    <v-contextmenu ref="contextmenu">
+      <Context
+        :is-connect="isConnected"
+        :term-instance="terminal as any"
+        :copy-text="copyText"
+        :terminal-id="connectionId"
+        :tab-info="props.serverInfo"
+        @context-act="contextAct"
+      />
+    </v-contextmenu>
+
+    <!-- Command Dialog: Now positioned absolutely within terminal container -->
+    <CommandDialog
+      v-model:visible="isCommandDialogVisible"
+      :connection-id="currentConnectionId"
+      :terminal-container="terminalContainer"
+    />
+  </div>
+
+  <div
+    v-for="editor in openEditors"
+    v-show="editor?.visible"
+    :key="editor?.filePath"
+  >
+    <EditorCode
+      :editor="editor"
+      :is-active="editor.key === activeEditorKey"
+      :boundary-el="terminalElement"
+      @close-vim-editor="closeVimEditor"
+      @handle-save="handleSave"
+      @focus-editor="() => handleFocusEditor(editor)"
+    />
+  </div>
+
+  <!-- MFA dialog has been moved to global component -->
+
+  <TransferPanel />
+</template>
+
+<script lang="ts" setup>
+const copyText = ref('')
+
+import TransferPanel from '@views/components/Files/fileTransferProgress.vue'
+import { ensureTransferListener } from '@views/components/Files/fileTransfer'
+
+import SearchComp from './components/searchComp.vue'
+
+import type { IBufferLine, ILink, ILinkProvider } from '@xterm/xterm'
+import { IDisposable, Terminal } from '@xterm/xterm'
+import ZmodemProgress from './utils/zmodemProgress.vue'
+import Context from './components/contextComp.vue'
+import SuggComp from './components/suggestion.vue'
+import eventBus from '@/utils/eventBus'
+import { getActualTheme } from '@/utils/themeUtils'
+import { getResolvedTerminalTheme } from '@/themes/terminalTheme'
+import type { ThemeId, ThemeChangePayload } from '../../../../../shared/themes/types'
+import { computed, markRaw, nextTick, onBeforeUnmount, onMounted, PropType, reactive, ref, watch } from 'vue'
+import { shortcutService } from '@/services/shortcutService'
+import { useI18n } from 'vue-i18n'
+import CommandDialog from '@/components/global/CommandDialog.vue'
+import { FitAddon } from '@xterm/addon-fit'
+import { SearchAddon } from '@xterm/addon-search'
+import '@xterm/xterm/css/xterm.css'
+import EditorCode, { editorData } from './editors/dragEditor.vue'
+import { LanguageMap } from '../Editors/base/languageMap'
+import { message, Modal } from 'ant-design-vue'
+import { aliasConfigStore } from '@/store/aliasConfigStore'
+import { useMacroRecorderStore } from '@/store/macroRecorderStore'
+import { userConfigStore } from '../../../store/userConfigStore'
+import { userConfigStore as serviceUserConfig } from '@/services/userConfigStoreService'
+import { v4 as uuidv4 } from 'uuid'
+import { Base64Util } from '@/utils/base64'
+import { userInfoStore } from '@/store/index'
+import stripAnsi from 'strip-ansi'
+import { commandBarHeight, inputManager } from './utils/termInputManager'
+import { shellCommands } from './utils/shellCmd'
+import {
+  createJumpServerStatusHandler,
+  formatStatusMessage,
+  type JumpServerStatusData,
+  shouldUseBastionStatusChannel
+} from './utils/jumpServerStatusHandler'
+import { shouldSkipAssetLookup } from './utils/wakeupConnection'
+import { registerSshConnection, unregisterSshConnection } from './utils/sshConnectionRegistry'
+import { getLastNonEmptyLine, isTerminalPromptLine } from './utils/terminalPrompt'
+import { stripAnsiBasic, stripAnsiExtended } from './utils/ansiUtils'
+import { useDeviceStore } from '@/store/useDeviceStore'
+import { isFocusInAiTab } from '@/utils/domUtils'
+import { checkUserDevice } from '@api/user/user'
+import { keywordHighlightService } from '@/services/keywordHighlightService'
+import { useZmodem } from './utils/chatermZmodem'
+import { shouldAutoScrollAfterTerminalStateUpdate, shouldAutoScrollAfterTerminalWrite } from './utils/terminalScroll'
+import { LocalEchoController } from './utils/localEcho'
+import { resolveAliasExpansion, shouldSuppressCtrlVAfterNativePaste } from './utils/terminalInput'
+import { applyTerminalRuntimeConfig, TERMINAL_RUNTIME_CONFIG_CHANGED_EVENT, type TerminalRuntimeConfig } from '@/utils/terminalRuntimeConfig'
+import { createTerminalWriteQueue, type TerminalWriteQueue } from '@/utils/terminalWriteQueue'
+import { cancelConnectionOnUnmount, createConnectionCancellationGuard } from './utils/connectionCancellation'
+
+// Pre-compiled regex constants for checkFullScreenClear / checkHeavyUiStyle (avoid re-creation per call)
+const CLEAR_SCREEN_PATTERNS = [
+  /\x1b\[H\x1b\[J/,
+  /\x1b\[2J\x1b\[H/,
+  /\x1b\[H.*?\x1b\[J/s,
+  /\x1b\[J.*?\x1b\[H/s,
+  /\x1b\[\d+;\d+H.*?\x1b\[J/s,
+  /\x1b\[2J(?:\x1b\[H)?/
+]
+const HEAVY_UI_MOVE_RE = /\x1b\[\d+;\d+H/g
+const HEAVY_UI_CLEAR_RE = /\x1b\[\d*K/g
+const HEAVY_UI_TABLE_RE = /NUM\s+NAME\s+IP:PORT/
+const HEAVY_UI_SEPARATOR_RE = /=+/
+
+const logger = createRendererLogger('ssh.connect')
+const { t } = useI18n()
+type ShellCloseInfo = {
+  reason: 'manual' | 'network' | 'unknown'
+  isNetworkDisconnect: boolean
+  errorCode?: string
+  errorMessage?: string
+}
+const selectFlag = ref(false)
+const configStore = userConfigStore()
+const isTransparent = computed(() => !!configStore.getUserConfig.background.image)
+const hasCustomBg = (): boolean => isTransparent.value === true
+let viewportScrollbarHideTimer: number | null = null
+
+// Coalesced scrollToBottom: uses requestAnimationFrame for smooth alignment with browser repaint
+let scrollToBottomScheduled = false
+let scrollToBottomNeedsFocus = false
+const scheduleScrollToBottom = (options?: { force?: boolean }) => {
+  if (options?.force === true || scrollToBottomNeedsFocus) {
+    terminalWriteQueue?.setPaused(false)
+  }
+  if (scrollToBottomScheduled) return
+  scrollToBottomScheduled = true
+  requestAnimationFrame(() => {
+    const force = options?.force === true || scrollToBottomNeedsFocus
+    if (force || shouldAutoScrollAfterTerminalWrite(terminal.value)) {
+      terminal.value?.scrollToBottom()
+      if (scrollToBottomNeedsFocus) {
+        terminal.value?.focus()
+      }
+    }
+    scrollToBottomNeedsFocus = false
+    scrollToBottomScheduled = false
+  })
+}
+const scheduleScrollToBottomAndFocus = () => {
+  scrollToBottomNeedsFocus = true
+  scheduleScrollToBottom({ force: true })
+}
+
+const showTerminalScrollbarTemporarily = () => {
+  const container = terminalContainer.value
+  if (!container) return
+
+  container.classList.add('scrollbar-visible')
+
+  if (viewportScrollbarHideTimer) {
+    window.clearTimeout(viewportScrollbarHideTimer)
+  }
+
+  viewportScrollbarHideTimer = window.setTimeout(() => {
+    container.classList.remove('scrollbar-visible')
+    viewportScrollbarHideTimer = null
+  }, 2000)
+}
+
+const handleViewportScroll = () => {
+  terminalWriteQueue?.setPaused(!shouldAutoScrollAfterTerminalWrite(terminal.value))
+  updateSelectionButtonPosition()
+  showTerminalScrollbarTemporarily()
+}
+
+const getContainerFunc = () => {
+  return (terminalContainer.value as HTMLElement) || document.body
+}
+
+import type { CommandSuggestion } from './types/suggestion'
+
+const suggestions = ref<CommandSuggestion[]>([])
+const activeSuggestion = ref(-1)
+const suggestionSelectionMode = ref(false) // Whether suggestion box is in selection mode
+
+// AI suggestion state
+const aiSuggestion = ref<CommandSuggestion | null>(null)
+const aiSuggestTimer = ref<ReturnType<typeof setTimeout> | null>(null)
+const aiSuggestRequestId = ref(0)
+const aiSuggestLoading = ref(false)
+const cachedOsInfo = ref<string | undefined>(undefined)
+const cachedOsInfoLoaded = ref(false)
+const AI_SUGGEST_MIN_LENGTH = 3
+const props = defineProps({
+  connectData: {
+    type: Object as PropType<sshConnectData>,
+    default: () => ({})
+  },
+  serverInfo: {
+    type: Object,
+    default: () => {
+      return {}
+    }
+  },
+  activeTabId: { type: String, required: true },
+  currentConnectionId: { type: String, required: true },
+  isActive: { type: Boolean, default: false }
+})
+const queryCommandFlag = ref(false)
+
+// Merged suggestion list: local autocomplete + AI suggestion
+const displaySuggestions = computed(() => {
+  const result = [...suggestions.value]
+  if (aiSuggestion.value) {
+    const isDuplicate = result.some((s) => s.command === aiSuggestion.value?.command)
+    if (!isDuplicate) {
+      result.unshift(aiSuggestion.value)
+    }
+  }
+  return result
+})
+
+// Helper to clear all suggestion state at once
+const clearAllSuggestions = (options: { resetActive?: boolean } = {}) => {
+  const { resetActive = true } = options
+  suggestions.value = []
+  aiSuggestion.value = null
+  aiSuggestLoading.value = false
+  aiSuggestRequestId.value++
+  // Cancel pending debounce timer to prevent stale AI requests after clear
+  if (aiSuggestTimer.value) {
+    clearTimeout(aiSuggestTimer.value)
+    aiSuggestTimer.value = null
+  }
+  // Cancel pending local query debounce timer to prevent stale suggestions after clear
+  if (queryCommandDebounceTimer) {
+    clearTimeout(queryCommandDebounceTimer)
+    queryCommandDebounceTimer = null
+  }
+  suggestionSelectionMode.value = false
+  if (resetActive) {
+    activeSuggestion.value = -1
+  }
+}
+
+export interface sshConnectData {
+  uuid: string
+  ip: string
+  port: number
+  username: string
+  password: string
+  privateKey: string
+  authType: string
+  passphrase: string
+  asset_type?: string
+  proxyCommand?: string
+  hostname?: string
+  host?: string
+  comment?: string
+  source?: string
+  wakeupSource?: string
+  wakeupNewTab?: boolean
+  disablePoolReuse?: boolean
+  skipAssetLookup?: boolean
+  forkFromConnectionId?: string
+  // Serial (UART) connection parameters
+  baudRate?: number
+  dataBits?: number
+  stopBits?: number
+  parity?: string
+  flowControl?: string
+}
+
+const handleRightClick = (event) => {
+  event.preventDefault()
+
+  switch (config.rightMouseEvent) {
+    case 'paste':
+      if (startStr.value == '') {
+        startStr.value = beginStr.value
+      }
+      pasteFlag.value = true
+      navigator.clipboard
+        .readText()
+        .then((text) => {
+          sendDataAutoSwitchTerminal(text)
+          terminal.value?.focus()
+        })
+        .catch(() => {
+          logger.warn('Clipboard read failed')
+        })
+      break
+    case 'contextMenu':
+      if (contextmenu.value && contextmenu.value.show) {
+        contextmenu.value.show(event)
+      }
+      break
+    default:
+      break
+  }
+}
+
+const handleMouseDown = (event) => {
+  if (event.button !== 1) return
+  event.preventDefault()
+  if (event.button === 1) {
+    switch (config.middleMouseEvent) {
+      case 'paste':
+        if (startStr.value == '') {
+          startStr.value = beginStr.value
+        }
+        pasteFlag.value = true
+        navigator.clipboard
+          .readText()
+          .then((text) => {
+            sendDataAutoSwitchTerminal(text)
+            terminal.value?.focus()
+          })
+          .catch(() => {
+            logger.warn('Clipboard read failed')
+          })
+        break
+      case 'contextMenu':
+        if (contextmenu.value && contextmenu.value.show) {
+          contextmenu.value.show(event)
+        }
+        break
+      case 'closeTab':
+        emit('closeTabInTerm', props.activeTabId || props.currentConnectionId)
+        break
+      case 'none':
+        break
+    }
+  }
+}
+const componentRefs = ref({})
+const setRef = (el, key) => {
+  if (el) {
+    componentRefs.value[key] = el
+  }
+}
+const isConnected = ref(false)
+// Auto reconnect state used when a session is interrupted by network failure.
+const manualDisconnectRequested = ref(false)
+const disconnectedByNetwork = ref(false)
+const waitingForNetworkRestore = ref(false)
+const autoReconnectAttempts = ref(0)
+const autoReconnectInProgress = ref(false)
+const connectInProgress = ref(false)
+const AUTO_RECONNECT_MAX_ATTEMPTS = 3
+const AUTO_RECONNECT_BASE_DELAY_MS = 2000
+let autoReconnectTimer: ReturnType<typeof setTimeout> | null = null
+
+const terminal = ref<Terminal | null>(null)
+const fitAddon = ref<FitAddon | null>(null)
+const connectionId = ref('')
+const traceAiSuggest = (message: string, meta?: Record<string, unknown>) => {
+  logger.debug(message, {
+    event: 'ssh.aiSuggest.trace',
+    connectionId: connectionId.value || undefined,
+    ...(meta || {})
+  })
+}
+const connectionHasSudo = ref(false)
+const connectionSftpAvailable = ref(false)
+const cleanupListeners = ref<Array<() => void>>([])
+const terminalElement = ref<HTMLDivElement | undefined>(undefined)
+const terminalContainer = ref<HTMLDivElement | null>(null)
+const contextmenu = ref()
+const cursorStartX = ref(0)
+const api = window.api as any
+const connectionCancellationGuard = createConnectionCancellationGuard()
+const cancelCurrentConnection = (connected = isConnected.value, stage = 'component_unmount') => {
+  const id = connectionId.value
+  logger.info('SSH connection cancellation requested', {
+    event: 'ssh.disconnect.renderer.requested',
+    connectionId: id || undefined,
+    stage,
+    hasConnectionId: Boolean(id),
+    isConnected: connected,
+    isConnecting: connectInProgress.value
+  })
+  cancelConnectionOnUnmount({
+    api,
+    id,
+    isConnected: connected,
+    isConnecting: connectInProgress.value,
+    onDisconnectResult: (result) => {
+      const status = typeof result?.status === 'string' ? result.status : 'unknown'
+      const meta = {
+        event: 'ssh.disconnect.renderer.result',
+        connectionId: id,
+        stage,
+        status
+      }
+      if (status === 'error') {
+        logger.warn('SSH connection cancellation returned an error', meta)
+      } else {
+        logger.info('SSH connection cancellation completed', meta)
+      }
+    },
+    onDisconnectError: (error) => {
+      logger.warn('Failed to cancel SSH connection during terminal cleanup', {
+        event: 'ssh.disconnect.renderer.failed',
+        connectionId: id,
+        stage,
+        errorName: error instanceof Error ? error.name : typeof error
+      })
+    }
+  })
+}
+const encoder = new TextEncoder()
+type TerminalWriteOptions = { isUserCall?: boolean; updateStateAfterWrite?: boolean; allowHighlightAfterWrite?: boolean }
+let cusWrite: ((data: string, options?: TerminalWriteOptions) => void) | null = null
+let terminalWriteQueue: TerminalWriteQueue | null = null
+const localEcho = new LocalEchoController()
+let resizeObserver: ResizeObserver | null = null
+const showSearch = ref(false)
+const searchAddon = ref<SearchAddon | null>(null)
+const showAiButton = ref(false)
+let jumpServerStatusHandler: ReturnType<typeof createJumpServerStatusHandler> | null = null
+const translateJumpServerStatus = (data: JumpServerStatusData) => {
+  if (data.messageKey) {
+    return t(data.messageKey, data.messageParams || {})
+  }
+  return data.message
+}
+const isCommandDialogVisible = ref(false)
+const wasDialogVisibleBeforeDeactivation = ref(false)
+
+// Calculate shortcut key display text
+const shortcutKey = computed(() => {
+  const shortcuts = shortcutService.getShortcuts()
+  if (shortcuts && shortcuts['sendOrToggleAi']) {
+    return shortcutService.formatShortcut(shortcuts['sendOrToggleAi'])
+  }
+  const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0
+  return isMac ? '⌘L' : 'Ctrl+L'
+})
+const activeEditorKey = ref(null)
+const handleFocusEditor = (editor) => {
+  activeEditorKey.value = editor.key
+}
+const dataBuffer = ref<number[]>([])
+const EDITOR_SEQUENCES = {
+  enter: [
+    { pattern: [0x1b, 0x5b, 0x3f, 0x31, 0x30, 0x34, 0x39, 0x68], editor: 'vim' },
+    { pattern: [0x1b, 0x5b, 0x3f, 0x34, 0x37, 0x68], editor: 'vim' },
+    { pattern: [0x1b, 0x5b, 0x3f, 0x31, 0x68, 0x1b, 0x3d], editor: 'nano' },
+    // Add more vim detection patterns
+    { pattern: [0x1b, 0x5b, 0x3f, 0x32, 0x35, 0x68], editor: 'vim' }, // \x1b[?25h
+    { pattern: [0x1b, 0x5b, 0x3f, 0x32, 0x35, 0x6c], editor: 'vim' }, // \x1b[?25l
+    { pattern: [0x1b, 0x5b, 0x3f, 0x31, 0x30, 0x34, 0x39, 0x6c], editor: 'vim' },
+    { pattern: [0x1b, 0x5b, 0x3f, 0x34, 0x37, 0x6c], editor: 'vim' }
+  ],
+  exit: [
+    { pattern: [0x1b, 0x5b, 0x3f, 0x31, 0x30, 0x34, 0x39, 0x6c], editor: 'vim' },
+    { pattern: [0x1b, 0x5b, 0x3f, 0x34, 0x37, 0x6c], editor: 'vim' },
+    { pattern: [0x1b, 0x5b, 0x3f, 0x31, 0x6c, 0x1b, 0x3e], editor: 'nano' },
+    // Add more vim exit detection patterns
+    { pattern: [0x1b, 0x5b, 0x3f, 0x32, 0x35, 0x68], editor: 'vim' }, // \x1b[?25h
+    { pattern: [0x1b, 0x5b, 0x3f, 0x32, 0x35, 0x6c], editor: 'vim' } // \x1b[?25l
+  ]
+}
+const userInputFlag = ref(false)
+
+// Global debounce state to prevent rapid consecutive closing of multiple windows
+const CLOSE_DEBOUNCE_TIME = 100 // 100ms debounce time
+
+// Use window object to store global debounce state
+if (!(window as any).lastCloseTime) {
+  ;(window as any).lastCloseTime = 0
+}
+let termOndata: IDisposable | null = null
+let termOnBinary: IDisposable | null = null
+let handleInput
+let textareaCompositionListener: ((e: CompositionEvent) => void) | null = null
+let textareaPasteListener: ((e: ClipboardEvent) => void) | null = null
+const pasteFlag = ref(false)
+let lastNativePasteAt = 0
+let dbConfigStash: {
+  aliasStatus?: number
+  autoCompleteStatus?: number
+  scrollBack?: number
+  highlightStatus?: number
+  [key: string]: any
+} = {}
+let config
+
+const deviceStore = useDeviceStore()
+const isOfficeDevice = ref(false)
+const isLocalConnect = ref(false)
+
+const getUserInfo = async () => {
+  try {
+    const res = (await checkUserDevice({ ip: deviceStore.getDeviceIp, macAddress: deviceStore.getMacAddress })) as any
+    if (res && res.code === 200) {
+      isOfficeDevice.value = res.data.isOfficeDevice
+    }
+  } catch (error) {
+    logger.error('Failed to get user info', { error: error })
+  }
+}
+const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0
+const preserveSelectionOnCtrlLinkRelease = ref(false)
+
+const isSelectAllShortcut = (e: KeyboardEvent): boolean => {
+  if (e.key.toLowerCase() !== 'a') return false
+  if (isMac) return e.metaKey
+  return e.ctrlKey && !e.metaKey
+}
+
+const handleSelectAllShortcut = (e: KeyboardEvent): boolean => {
+  if (!isSelectAllShortcut(e)) return false
+  if (!canLinkify() || !isTerminalKeyboardTarget(e)) return false
+  e.preventDefault()
+  e.stopPropagation()
+  preserveSelectionOnCtrlLinkRelease.value = true
+  selectTerminalContent()
+  return true
+}
+
+const isTerminalKeyboardTarget = (e: KeyboardEvent): boolean => {
+  const target = e.target as Node | null
+  const activeElement = document.activeElement
+  const container = terminalContainer.value || terminalElement.value?.closest('.terminal-container')
+
+  if (!container) return false
+  return (!!target && container.contains(target)) || (!!activeElement && container.contains(activeElement))
+}
+
+const getLastContentColumn = (line: IBufferLine, cols: number): number => {
+  const maxColumn = Math.min(line.length, cols)
+  for (let column = maxColumn - 1; column >= 0; column--) {
+    const cell = line.getCell(column)
+    const chars = cell?.getChars() ?? ''
+    if (chars.trim().length > 0) {
+      return Math.min(column + Math.max(cell?.getWidth() || 1, 1), cols)
+    }
+  }
+  return 0
+}
+
+const selectTerminalContent = () => {
+  const termInstance = terminal.value
+  if (!termInstance) return
+
+  const buffer = termInstance.buffer.active
+  let firstContentLine = -1
+  let lastContentLine = -1
+  let lastContentColumn = 0
+
+  for (let lineIndex = 0; lineIndex < buffer.length; lineIndex++) {
+    const line = buffer.getLine(lineIndex)
+    if (!line) continue
+
+    const contentColumn = getLastContentColumn(line, termInstance.cols)
+    if (contentColumn === 0) continue
+
+    if (firstContentLine === -1) {
+      firstContentLine = lineIndex
+    }
+    lastContentLine = lineIndex
+    lastContentColumn = contentColumn
+  }
+
+  if (firstContentLine === -1 || lastContentLine === -1 || lastContentColumn === 0) {
+    termInstance.clearSelection()
+    showAiButton.value = false
+    return
+  }
+
+  const selectionLength = (lastContentLine - firstContentLine) * termInstance.cols + lastContentColumn
+  termInstance.select(0, firstContentLine, selectionLength)
+}
+
+const handleMetaKeyDown = (e: KeyboardEvent) => {
+  if (handleSelectAllShortcut(e)) return
+  if (e.key !== 'Meta') return
+  if (!canLinkify()) return
+  setCtrlLinkPressed(true)
+}
+
+const handleMetaKeyUp = (e: KeyboardEvent) => {
+  if (e.key !== 'Meta') return
+  if (!ctrlLinkPressed.value) {
+    preserveSelectionOnCtrlLinkRelease.value = false
+    return
+  }
+  setCtrlLinkPressed(false, { preserveSelection: preserveSelectionOnCtrlLinkRelease.value })
+  preserveSelectionOnCtrlLinkRelease.value = false
+}
+
+onMounted(async () => {
+  const isLocalShellConnection = props.connectData.asset_type === 'shell'
+  const userInfoReady = isLocalShellConnection ? Promise.resolve() : getUserInfo()
+  config = await serviceUserConfig.getConfig()
+  dbConfigStash = config
+  queryCommandFlag.value = config.autoCompleteStatus == 1
+
+  // Load keyword highlight configuration
+  try {
+    await keywordHighlightService.loadConfig()
+  } catch (error) {
+    logger.error('Failed to load keyword highlight config', { error: error })
+  }
+
+  const { mark: perfMark } = await import('@/utils/perf')
+  perfMark('chaterm/terminal/willCreate')
+  const termInstance = markRaw(
+    new Terminal({
+      scrollback: config.scrollBack,
+      cursorBlink: config.cursorBlink !== false,
+      cursorStyle: config.cursorStyle,
+      fontSize: config.fontSize || 12,
+      fontFamily: config.fontFamily || 'Menlo, Monaco, "Courier New", Consolas, Courier, monospace',
+      lineHeight: typeof config.lineHeight === 'number' ? config.lineHeight : 1,
+      allowTransparency: true,
+      theme: getResolvedTerminalTheme(config.theme as ThemeId, { hasCustomBg: hasCustomBg() })
+    })
+  )
+  terminal.value = termInstance
+  localEcho.setEnabled(config.localEchoEnabled === true)
+  localEcho.setTerminal({
+    write: (data: string) => {
+      cusWrite?.(data, { isUserCall: true, updateStateAfterWrite: true, allowHighlightAfterWrite: true })
+    }
+  })
+  perfMark('chaterm/terminal/didCreate')
+  termInstance?.onKey(handleKeyInput)
+  termInstance?.onSelectionChange(() => {
+    if (termInstance.hasSelection()) {
+      copyText.value = termInstance.getSelection()
+      if (copyText.value.trim()) {
+        navigator.clipboard.writeText(copyText.value.trim()).catch(() => {
+          logger.warn('Failed to copy to clipboard')
+        })
+      }
+    }
+    updateSelectionButtonPosition()
+  })
+  nextTick(() => {
+    const viewport = terminalElement.value?.querySelector('.xterm-viewport')
+    if (viewport) {
+      viewport.addEventListener('scroll', handleViewportScroll, { passive: true })
+    }
+  })
+
+  perfMark('chaterm/terminal/willLoadAddons')
+  fitAddon.value = new FitAddon()
+  termInstance.loadAddon(fitAddon.value)
+  if (terminalElement.value) {
+    perfMark('chaterm/terminal/willOpen')
+    termInstance.open(terminalElement!.value)
+    perfMark('chaterm/terminal/didOpen')
+  }
+  fitAddon?.value.fit()
+  searchAddon.value = new SearchAddon()
+  termInstance.loadAddon(searchAddon.value)
+  perfMark('chaterm/terminal/didLoadAddons')
+  termInstance.scrollToBottom()
+  termInstance.focus()
+
+  termInstance.registerLinkProvider(createCtrlLinkProvider(termInstance))
+
+  // Ctrl key monitoring
+  if (isMac) {
+    window.addEventListener('keydown', handleMetaKeyDown, true)
+    window.addEventListener('keyup', handleMetaKeyUp, true)
+  } else {
+    window.addEventListener('keydown', handleCtrlKeyDown, true)
+    window.addEventListener('keyup', handleCtrlKeyUp, true)
+  }
+
+  window.addEventListener('blur', () => setCtrlLinkPressed(false))
+  cleanupListeners.value.push(() => {
+    if (isMac) {
+      window.removeEventListener('keydown', handleMetaKeyDown, true)
+      window.removeEventListener('keyup', handleMetaKeyUp, true)
+    } else {
+      window.removeEventListener('keydown', handleCtrlKeyDown, true)
+      window.removeEventListener('keyup', handleCtrlKeyUp, true)
+    }
+  })
+
+  ensureTransferListener()
+  // Enable GPU-accelerated rendering for better performance with large output
+  if (!config.background?.image && getActualTheme(config.theme) !== 'light') {
+    try {
+      const { WebglAddon } = await import('@xterm/addon-webgl')
+      const webglAddon = new WebglAddon()
+      webglAddon.onContextLoss(() => {
+        webglAddon.dispose()
+      })
+      termInstance.loadAddon(webglAddon)
+    } catch {
+      // WebGL not available, fall back to default canvas renderer
+    }
+  }
+  termInstance.onResize((size) => {
+    resizeSSH(size.cols, size.rows)
+  })
+  const textarea = termInstance?.element?.querySelector('.xterm-helper-textarea') as HTMLTextAreaElement | null
+  if (textarea) {
+    textareaCompositionListener = (e) => {
+      handleKeyInput({
+        domEvent: {
+          keyCode: encoder.encode(e.data),
+          code: e.data,
+          altKey: false,
+          metaKey: false,
+          ctrlKey: false,
+          ...e
+        },
+        key: e.data
+      })
+    }
+    textareaPasteListener = (e: ClipboardEvent) => {
+      pasteFlag.value = true
+      const text = e.clipboardData?.getData('text/plain') ?? ''
+      if (!text) {
+        return
+      }
+
+      e.preventDefault()
+      lastNativePasteAt = Date.now()
+      sendDataAutoSwitchTerminal(text)
+      scheduleScrollToBottomAndFocus()
+    }
+    textarea.addEventListener('compositionend', textareaCompositionListener)
+    textarea.addEventListener('paste', textareaPasteListener)
+  }
+  const originalWrite = termInstance.write.bind(termInstance)
+  terminalWriteQueue = createTerminalWriteQueue({
+    write: originalWrite,
+    maxBatchBytes: 64 * 1024,
+    maxPendingBytes: 2 * 1024 * 1024
+  })
+  cleanupListeners.value.push(() => {
+    terminalWriteQueue?.dispose()
+    terminalWriteQueue = null
+  })
+
+  // High-throughput detection: bypass expensive processing during bulk output (e.g., cat large file)
+  const HIGH_THROUGHPUT_THRESHOLD = 20 // writes per second to trigger
+  const HIGH_THROUGHPUT_COOLDOWN = 500 // ms of low activity to exit
+  const HIGH_THROUGHPUT_PENDING_BYTES = 256 * 1024
+  const HIGH_THROUGHPUT_BYTES_THRESHOLD = 256 * 1024
+  const HIGH_THROUGHPUT_CHUNK_BYTES = 32 * 1024
+  let highThroughputMode = false
+  let htWriteCount = 0
+  let htWriteBytes = 0
+  let htWindowTimer: ReturnType<typeof setTimeout> | null = null
+  let htCooldownTimer: ReturnType<typeof setTimeout> | null = null
+
+  const exitHighThroughputMode = () => {
+    highThroughputMode = false
+    // Do one final state update after bulk output settles
+    debouncedUpdateTerminalState('', false, shouldAutoScrollAfterTerminalWrite(terminal.value))
+  }
+
+  const scheduleHighThroughputExit = () => {
+    if (htCooldownTimer) {
+      clearTimeout(htCooldownTimer)
+    }
+    htCooldownTimer = setTimeout(exitHighThroughputMode, HIGH_THROUGHPUT_COOLDOWN)
+  }
+
+  const debouncedUpdateTerminalState = (data, currentIsUserCall, shouldAutoScrollAfterWrite = true, options?: { allowHighlight?: boolean }) => {
+    if (updateTimeout) {
+      clearTimeout(updateTimeout)
+    }
+    if (currentIsUserCall || terminalMode.value === 'none') {
+      updateTerminalState(typeof data === 'string' && data.endsWith(startStr.value), enterPress.value, tagPress.value, shouldAutoScrollAfterWrite)
+    }
+    let highLightFlag: boolean = true
+    if (enterPress.value || specialCode.value) {
+      highLightFlag = false
+    }
+    if (terminalMode.value !== 'none') {
+      highLightFlag = false
+    }
+    if (currentIsUserCall && options?.allowHighlight !== true) {
+      highLightFlag = false
+    }
+    if (pasteFlag.value && !enterPress.value) {
+      highLightFlag = true
+    }
+    if (highLightFlag) {
+      if (config.highlightStatus == 1) {
+        highlightSyntax(terminalState.value)
+        pasteFlag.value = false
+      }
+      if (!selectFlag.value) {
+        aiSuggestion.value = null
+        debouncedQueryCommand()
+      }
+    }
+    updateTimeout = null
+  }
+
+  cusWrite = function (data: string, options?: TerminalWriteOptions): void {
+    const currentIsUserCall = options?.isUserCall ?? false
+    const updateStateAfterWrite = options?.updateStateAfterWrite === true
+    userInputFlag.value = currentIsUserCall
+
+    // Track write frequency to detect high-throughput scenarios (e.g., cat large file)
+    if (!currentIsUserCall) {
+      htWriteCount++
+      htWriteBytes += data.length
+      if (data.length >= HIGH_THROUGHPUT_CHUNK_BYTES || htWriteBytes >= HIGH_THROUGHPUT_BYTES_THRESHOLD) {
+        highThroughputMode = true
+      }
+      if (!htWindowTimer) {
+        htWindowTimer = setTimeout(() => {
+          if (htWriteCount >= HIGH_THROUGHPUT_THRESHOLD || htWriteBytes >= HIGH_THROUGHPUT_BYTES_THRESHOLD) {
+            highThroughputMode = true
+            scheduleHighThroughputExit()
+          }
+          htWriteCount = 0
+          htWriteBytes = 0
+          htWindowTimer = null
+        }, 1000)
+      }
+    }
+
+    // High-throughput mode: bypass keyword highlight, render patching, and state updates
+    const pendingBytes = terminalWriteQueue?.getPendingBytes() ?? 0
+    if ((highThroughputMode || pendingBytes >= HIGH_THROUGHPUT_PENDING_BYTES) && !currentIsUserCall) {
+      const shouldAutoScroll = shouldAutoScrollAfterTerminalWrite(terminal.value)
+      terminalWriteQueue?.enqueue(data, {
+        droppable: terminalMode.value === 'none',
+        callback: () => {
+          if (shouldAutoScroll) {
+            scheduleScrollToBottom()
+          }
+        }
+      })
+      highThroughputMode = true
+      scheduleHighThroughputExit()
+      return
+    }
+
+    if (currentIsUserCall) {
+      originalWrite(data, () => {
+        if (updateStateAfterWrite) {
+          debouncedUpdateTerminalState(data, currentIsUserCall, false, { allowHighlight: options?.allowHighlightAfterWrite === true })
+        }
+      })
+      return
+    }
+
+    // Normal mode: full processing
+    let processedData = data
+    // Only apply keyword highlight when not in alternate/UI modes to avoid corrupting
+    // complex terminal UIs or high-frequency redraw output.
+    if (!currentIsUserCall && terminalMode.value === 'none' && keywordHighlightService.isEnabled()) {
+      processedData = keywordHighlightService.applyHighlight(data)
+    }
+
+    const shouldAutoScroll = !currentIsUserCall && shouldAutoScrollAfterTerminalWrite(terminal.value)
+    terminalWriteQueue?.enqueue(processedData, {
+      droppable: terminalMode.value === 'none',
+      callback: () => {
+        if (!currentIsUserCall || updateStateAfterWrite) {
+          debouncedUpdateTerminalState(data, currentIsUserCall, shouldAutoScroll, { allowHighlight: options?.allowHighlightAfterWrite === true })
+        }
+        if (shouldAutoScroll) {
+          scheduleScrollToBottom()
+        }
+      }
+    })
+  }
+  termInstance.write = cusWrite as any
+  if (terminalContainer.value) {
+    resizeObserver = new ResizeObserver(
+      debounce(
+        () => {
+          handleResize()
+        },
+        30,
+        true
+      )
+    )
+    resizeObserver.observe(terminalContainer.value)
+  }
+  window.addEventListener('resize', handleResize)
+  // Register wheel event only if pinch zoom is enabled
+  if (config.pinchZoomStatus === 1) {
+    window.addEventListener('wheel', handleWheel)
+  }
+  window.addEventListener('online', handleBrowserOnline)
+  window.addEventListener('offline', handleBrowserOffline)
+  window.addEventListener('keydown', handleGlobalKeyDown)
+  window.addEventListener('click', () => {
+    if (contextmenu.value && typeof contextmenu.value.hide === 'function') {
+      contextmenu.value.hide()
+    }
+  })
+
+  nextTick(() => {
+    setTimeout(() => {
+      handleResize()
+      inputManager.registerInstances(
+        {
+          termOndata: handleExternalInput
+        },
+        connectionId.value
+      )
+    }, 100)
+    terminalContainerResize()
+  })
+
+  const handleSendOrToggleAi = () => {
+    if (props.activeTabId !== props.currentConnectionId) {
+      logger.debug('Not active tab, ignoring event')
+      return
+    }
+
+    const activeElement = document.activeElement
+    const terminalContainer = terminalElement.value?.closest('.terminal-container')
+    const isTerminalFocused =
+      activeElement === terminal.value?.textarea ||
+      terminalContainer?.contains(activeElement) ||
+      activeElement?.classList.contains('xterm-helper-textarea')
+
+    if (termInstance && termInstance.hasSelection() && isTerminalFocused) {
+      const selectedText = termInstance.getSelection().trim()
+      if (selectedText) {
+        eventBus.emit('openAiRight')
+        setTimeout(() => {
+          const formattedText = `Terminal output:\n\`\`\`\n${selectedText}\n\`\`\``
+          eventBus.emit('chatToAi', formattedText)
+        }, 100)
+        return
+      }
+    }
+    eventBus.emit('toggleSideBar', 'right')
+  }
+
+  const handleSendOrToggleAiForTab = (targetTabId: string) => {
+    if (targetTabId !== props.currentConnectionId) {
+      return
+    }
+
+    handleSendOrToggleAi()
+  }
+
+  const isSerialConnection = props.connectData.asset_type === 'person-serial'
+  if (isLocalShellConnection) {
+    config.highlightStatus = 2
+    config.autoCompleteStatus = 2
+    isLocalConnect.value = true
+    connectLocalSSH()
+  } else if (isSerialConnection) {
+    config.highlightStatus = 2
+    config.autoCompleteStatus = 2
+    connectSerialSSH()
+  } else {
+    await userInfoReady
+    connectSSH()
+  }
+
+  const handleExecuteCommand = (payload: { command: string; tabId?: string }) => {
+    if (props.activeTabId !== props.currentConnectionId || !props.isActive) return
+
+    if (!payload?.command) {
+      logger.warn('handleExecuteCommand: command is empty')
+      return
+    }
+
+    const tabId = typeof payload === 'string' ? undefined : payload?.tabId
+
+    const uniqueMarker = `Chaterm:command:${connectionId.value}:${Date.now()}:${Math.random().toString(36).substr(2, 9)}`
+
+    commandMarkerToTabId.value.set(uniqueMarker, tabId)
+    commandMarkerToCommand.value.set(uniqueMarker, payload.command)
+
+    sendMarkedData(payload.command, uniqueMarker)
+    termInstance.focus()
+  }
+
+  const handleUpdateTheme = (payload: string | ThemeChangePayload) => {
+    const themeId = (typeof payload === 'string' ? payload : payload.themeId) as ThemeId
+    if (terminal.value) {
+      terminal.value.options.theme = getResolvedTerminalTheme(themeId, { hasCustomBg: hasCustomBg() })
+    }
+  }
+
+  const handleLocalEchoSettingChanged = (enabled: boolean) => {
+    if (config) {
+      config.localEchoEnabled = enabled
+    }
+    localEcho.setEnabled(enabled)
+  }
+
+  const handleTerminalRuntimeConfigChanged = (updatedConfig: Partial<TerminalRuntimeConfig>) => {
+    if (!updatedConfig || typeof updatedConfig !== 'object') return
+
+    config = {
+      ...(config || {}),
+      ...updatedConfig
+    }
+
+    const { requiresResize } = applyTerminalRuntimeConfig(terminal.value, updatedConfig)
+    if (requiresResize) {
+      nextTick(() => {
+        handleResize()
+      })
+    }
+  }
+
+  const handleGetCursorPosition = (payload: { connectionId?: string; callback: (position: any) => void }) => {
+    const { connectionId: targetId, callback } = payload
+    if (targetId && targetId !== props.currentConnectionId) return
+
+    const position = getCursorLinePosition()
+    callback(position)
+  }
+
+  initZmodemHooks({
+    checkEditorMode: checkEditorMode,
+    handleServerOutput: handleServerOutput,
+    sendBinaryData: sendBinaryData
+  })
+
+  eventBus.on('executeTerminalCommand', handleExecuteCommand)
+  eventBus.on('autoExecuteCode', autoExecuteCode)
+  eventBus.on('getCursorPosition', handleGetCursorPosition)
+  eventBus.on('sendOrToggleAiFromTerminalForTab', handleSendOrToggleAiForTab)
+  eventBus.on('updateTheme', handleUpdateTheme)
+  eventBus.on('localEchoSettingChanged', handleLocalEchoSettingChanged)
+  eventBus.on(TERMINAL_RUNTIME_CONFIG_CHANGED_EVENT, handleTerminalRuntimeConfigChanged)
+  eventBus.on('openSearch', openSearch)
+  eventBus.on('pinchZoomStatusChanged', handlePinchZoomStatusChanged)
+
+  // Listen for search trigger events from preload (Windows system specific)
+  const handlePostMessage = (event: MessageEvent) => {
+    if (event.data?.type === 'TRIGGER_SEARCH') {
+      // Only the currently active terminal responds to search events
+      const activeTerm = inputManager.getActiveTerm()
+      if (activeTerm.id && connectionId.value && activeTerm.id === connectionId.value) {
+        openSearch()
+      }
+    }
+  }
+  window.addEventListener('message', handlePostMessage)
+
+  eventBus.on('clearCurrentTerminal', () => {
+    const activeTerm = inputManager.getActiveTerm()
+    if (activeTerm.id && connectionId.value && activeTerm.id === connectionId.value) {
+      contextAct('clearTerm')
+    }
+  })
+
+  // Listen for font size change events
+  eventBus.on('fontSizeIncrease', () => {
+    const activeTerm = inputManager.getActiveTerm()
+    if (activeTerm.id && connectionId.value && activeTerm.id === connectionId.value) {
+      contextAct('fontsizeLargen')
+    }
+  })
+
+  eventBus.on('fontSizeDecrease', () => {
+    const activeTerm = inputManager.getActiveTerm()
+    if (activeTerm.id && connectionId.value && activeTerm.id === connectionId.value) {
+      contextAct('fontsizeSmaller')
+    }
+  })
+
+  eventBus.on('triggerAiSuggest', () => {
+    const activeTerm = inputManager.getActiveTerm()
+    if (activeTerm.id && connectionId.value && activeTerm.id === connectionId.value) {
+      triggerAiSuggestByShortcut()
+    }
+  })
+
+  cleanupListeners.value.push(() => {
+    eventBus.off('updateTheme', handleUpdateTheme)
+    eventBus.off('executeTerminalCommand', handleExecuteCommand)
+    eventBus.off('autoExecuteCode', autoExecuteCode)
+    eventBus.off('getCursorPosition', handleGetCursorPosition)
+    eventBus.off('sendOrToggleAiFromTerminalForTab', handleSendOrToggleAiForTab)
+    eventBus.off('openSearch', openSearch)
+    eventBus.off('pinchZoomStatusChanged', handlePinchZoomStatusChanged)
+    eventBus.off('localEchoSettingChanged', handleLocalEchoSettingChanged)
+    eventBus.off(TERMINAL_RUNTIME_CONFIG_CHANGED_EVENT, handleTerminalRuntimeConfigChanged)
+    eventBus.off('clearCurrentTerminal')
+    eventBus.off('fontSizeIncrease')
+    eventBus.off('fontSizeDecrease')
+    eventBus.off('triggerAiSuggest')
+    window.removeEventListener('keydown', handleGlobalKeyDown)
+    window.removeEventListener('message', handlePostMessage)
+  })
+
+  if (terminal.value?.textarea) {
+    const handleTextareaFocus = () => {
+      inputManager.setActiveTerm(connectionId.value)
+      window.electron?.ipcRenderer?.send('terminal:focus-changed', true)
+    }
+    const handleTextareaBlur = () => {
+      hideSelectionButton()
+      clearAllSuggestions()
+      window.electron?.ipcRenderer?.send('terminal:focus-changed', false)
+    }
+    terminal.value.textarea.addEventListener('focus', handleTextareaFocus)
+    terminal.value.textarea.addEventListener('blur', handleTextareaBlur)
+    cleanupListeners.value.push(() => {
+      if (terminal.value?.textarea) {
+        terminal.value.textarea.removeEventListener('focus', handleTextareaFocus)
+        terminal.value.textarea.removeEventListener('blur', handleTextareaBlur)
+      }
+    })
+  }
+
+  // Watch for background image changes to update terminal transparency
+  watch(
+    () => configStore.getUserConfig.background.image,
+    () => {
+      if (terminal.value) {
+        handleUpdateTheme(configStore.getUserConfig.theme as ThemeId)
+      }
+    }
+  )
+})
+
+const getCmdList = async (systemCommands) => {
+  const allCommands = [...systemCommands, ...shellCommands]
+  commands.value = [...new Set(allCommands)].sort()
+
+  if (config.highlightStatus !== 1) {
+    logger.warn('Highlight feature is disabled')
+  }
+
+  if (!queryCommandFlag.value) {
+    logger.warn('Auto-completion feature is disabled')
+  }
+}
+
+// Handle pinch zoom status change
+const handlePinchZoomStatusChanged = async (enabled: boolean) => {
+  if (enabled) {
+    window.addEventListener('wheel', handleWheel)
+  } else {
+    window.removeEventListener('wheel', handleWheel)
+  }
+  // Update local config
+  config = await serviceUserConfig.getConfig()
+}
+
+onBeforeUnmount(() => {
+  connectionCancellationGuard.cancel()
+  manualDisconnectRequested.value = true
+  localEcho.reset()
+  localEcho.setTerminal(null)
+  resetAutoReconnectState()
+  cachedSelectionButton = null
+  if (sendTerminalStateTimer) {
+    clearTimeout(sendTerminalStateTimer)
+    sendTerminalStateTimer = null
+  }
+  if (queryCommandDebounceTimer) {
+    clearTimeout(queryCommandDebounceTimer)
+    queryCommandDebounceTimer = null
+  }
+  window.removeEventListener('resize', handleResize)
+  window.removeEventListener('wheel', handleWheel)
+  window.removeEventListener('online', handleBrowserOnline)
+  window.removeEventListener('offline', handleBrowserOffline)
+  inputManager.unregisterInstances(connectionId.value)
+  if (resizeObserver) {
+    resizeObserver.disconnect()
+    resizeObserver = null
+  }
+
+  commandMarkerToTabId.value.clear()
+  commandMarkerToCommand.value.clear()
+  currentCommandMarker.value = null
+  currentCommandTabId.value = undefined
+
+  cleanupListeners.value.forEach((cleanup) => cleanup())
+  cleanupListeners.value = []
+
+  if (terminal.value) {
+    const textarea = terminal.value.element?.querySelector('.xterm-helper-textarea') as HTMLTextAreaElement | null
+    if (textarea) {
+      if (textareaCompositionListener) {
+        textarea.removeEventListener('compositionend', textareaCompositionListener)
+        textareaCompositionListener = null
+      }
+      if (textareaPasteListener) {
+        textarea.removeEventListener('paste', textareaPasteListener)
+        textareaPasteListener = null
+      }
+    }
+  }
+
+  unregisterSshConnection(props.currentConnectionId)
+
+  // Close serial connection on tab close to prevent COM port leak
+  if (props.connectData.asset_type === 'person-serial' && connectionId.value) {
+    try {
+      api.closeSerial(connectionId.value)
+    } catch (e) {
+      // Best-effort: tab is closing, don't block
+    }
+  }
+
+  cancelCurrentConnection()
+
+  const viewport = terminalElement.value?.querySelector('.xterm-viewport')
+  if (viewport) {
+    viewport.removeEventListener('scroll', handleViewportScroll)
+  }
+
+  if (viewportScrollbarHideTimer) {
+    window.clearTimeout(viewportScrollbarHideTimer)
+    viewportScrollbarHideTimer = null
+  }
+
+  // Cleanup AI suggestion state
+  if (aiSuggestTimer.value) {
+    clearTimeout(aiSuggestTimer.value)
+    aiSuggestTimer.value = null
+  }
+  aiSuggestRequestId.value++
+  aiSuggestion.value = null
+})
+const getFileExt = (fileName: string): string => {
+  const match = fileName.match(/\.[^.\/\\]+$/)
+  return match ? match[0] : ''
+}
+
+const isOnlyAnsiCodes = (str: string): boolean => {
+  const cleaned = stripAnsi(str)
+    .replace(/[\x00-\x1F\x7F]/g, '')
+    .trim()
+  return cleaned.length === 0
+}
+
+const cleanForFileName = (str: string): string => {
+  return stripAnsi(str)
+    .replace(/[\x00-\x1F\x7F]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+const normalizeControl = (str: string): string => {
+  str = str.replace(/\x08\x1B\[K/g, '')
+  const chars: string[] = []
+  for (const ch of str) {
+    if (ch === '\b') {
+      chars.pop()
+    } else {
+      chars.push(ch)
+    }
+  }
+  return chars.join('')
+}
+
+const parseVimLine = (raw: string) => {
+  const originalLines = raw.split(/\r?\n/)
+  const cleaned = normalizeControl(raw)
+    .replace(/\x1B\][0-9]*;[^\x07]*\x07/g, '')
+    .replace(/\x1BP.*?\x1B\\/g, '')
+    .replace(/\x1B\[\?[0-9;]*[hl]/g, '')
+    .replace(/\x1B\[[0-9;]*[ABCDEFGJKST]/g, '')
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+    .replace(/[ \t]+/g, ' ')
+    .trim()
+
+  const lines = cleaned.split(/\r?\n/)
+  let filePath = ''
+  if (lines.length > 1) {
+    filePath = stripAnsi(lines[1])
+      .replace(/[\x00-\x1F\x7F]/g, '')
+      .trim()
+  }
+
+  const ext = getFileExt(filePath)
+  const contentType = LanguageMap[ext] || 'python'
+
+  let lastLine = ''
+  for (let i = originalLines.length - 1; i >= 0; i--) {
+    const line = originalLines[i].trim()
+    if (line && !isOnlyAnsiCodes(line)) {
+      lastLine = '\r\n' + originalLines[i]
+      break
+    }
+  }
+
+  if (filePath.includes('No such file or directory')) {
+    filePath = cleanForFileName(filePath.replace('No such file or directory', ''))
+  }
+
+  return {
+    lastLine,
+    filePath,
+    contentType
+  }
+}
+
+const openEditors = reactive<editorData[]>([])
+const closeVimEditor = (data) => {
+  const { key } = data
+  const editor = openEditors.find((editor) => editor?.key === key)
+  if (editor?.fileChange) {
+    if (!editor?.saved) {
+      Modal.confirm({
+        title: t('common.saveConfirmTitle'),
+        content: t('common.saveConfirmContent', { filePath: editor?.filePath }),
+        okText: t('common.confirm'),
+        cancelText: t('common.cancel'),
+        onOk() {
+          handleSave({ key: editor?.key, needClose: true })
+        },
+        onCancel() {
+          const index = openEditors.indexOf(editor)
+          if (index !== -1) {
+            openEditors.splice(index, 1)
+          }
+        }
+      })
+    }
+  } else {
+    const index = editor ? openEditors.indexOf(editor) : -1
+    if (index !== -1) {
+      openEditors.splice(index, 1)
+    }
+  }
+}
+
+const handleSave = async (data) => {
+  const { key, needClose } = data
+  let errMsg = ''
+  const editor = openEditors.find((editor) => editor?.key === key)
+  const newContent = editor?.vimText.replace(/\r\n/g, '\n') || ''
+  if (editor?.fileChange) {
+    let cmd = `cat <<'EOFChaterm:save' > ${editor.filePath}\n${newContent}\nEOFChaterm:save\n`
+    if (connectionHasSudo.value) {
+      cmd = `cat <<'EOFChaterm:save' | sudo tee  ${editor.filePath} > /dev/null \n${newContent}\nEOFChaterm:save\n`
+    }
+    const { stderr } = await api.sshConnExec({
+      cmd: cmd,
+      id: connectionId.value
+    })
+    errMsg = stderr
+  }
+  if (errMsg !== '') {
+    message.error(`${t('common.saveFailed')}: ${errMsg}`)
+  } else {
+    message.success(t('common.saveSuccess'))
+    if (editor) {
+      if (needClose) {
+        const index = openEditors.indexOf(editor)
+        if (index !== -1) {
+          openEditors.splice(index, 1)
+        }
+      } else {
+        editor.loading = false
+        editor.originVimText = newContent
+        editor.vimText = newContent
+        editor.saved = true
+        editor.fileChange = false
+      }
+    }
+  }
+}
+
+const createEditor = async (filePath, contentType) => {
+  const { stdout, stderr } = await api.sshConnExec({
+    cmd: `cat ${filePath}`,
+    id: connectionId.value
+  })
+  let action = 'editor'
+  if (stderr.indexOf('No such file or directory') !== -1) {
+    action = 'create'
+  }
+  if (stderr.indexOf('Permission denied') !== -1) {
+    message.error('Permission denied')
+  } else {
+    const existingEditor = openEditors.find((editor) => editor.filePath === filePath)
+    const rect = terminalContainer.value?.getBoundingClientRect()
+    if (!existingEditor && rect && rect.width > 0 && rect.height > 0) {
+      const w = Math.round(rect.width * 0.7)
+      const h = Math.round(rect.height * 0.7)
+      openEditors.push({
+        filePath: filePath,
+        visible: true,
+        vimText: stdout,
+        originVimText: stdout,
+        action: action,
+        vimEditorX: Math.round(rect.width * 0.5 - w * 0.5),
+        vimEditorY: Math.round(rect.height * 0.5 - h * 0.5),
+        contentType: contentType,
+        vimEditorHeight: h,
+        vimEditorWidth: w,
+        loading: false,
+        fileChange: false,
+        saved: false,
+        key: connectionId.value + '-' + filePath,
+        terminalId: connectionId.value,
+        userResized: false
+      } as editorData)
+    } else if (existingEditor) {
+      existingEditor.visible = true
+      existingEditor.vimText = stdout
+      existingEditor.originVimText = stdout
+    }
+  }
+}
+
+const debounce = (func, wait, immediate = false) => {
+  let timeout
+  let isFirstCall = true
+  let isDragging = false
+  let lastCallTime = 0
+
+  return function executedFunction(...args) {
+    const now = Date.now()
+    const timeSinceLastCall = now - lastCallTime
+    lastCallTime = now
+    isDragging = timeSinceLastCall < 50
+    const later = () => {
+      clearTimeout(timeout)
+      timeout = null
+      if (!immediate) func(...args)
+      isDragging = false
+    }
+    const callNow = immediate && !timeout
+    clearTimeout(timeout)
+    let dynamicWait
+    if (isDragging) {
+      dynamicWait = 5
+    } else if (isFirstCall) {
+      dynamicWait = 0
+    } else {
+      dynamicWait = wait
+    }
+
+    timeout = setTimeout(later, dynamicWait)
+
+    if (callNow) {
+      func(...args)
+      isFirstCall = false
+    }
+  }
+}
+
+const clamp = (v: number, min: number, max: number) => Math.min(Math.max(v, min), max)
+
+const resizeEditor = (ed: editorData, rect: DOMRect) => {
+  if (!ed.userResized) {
+    ed.vimEditorWidth = Math.round(rect.width * 0.7)
+    ed.vimEditorHeight = Math.round(rect.height * 0.7)
+  } else {
+    const scale = Math.min(1, rect.width / Math.max(ed.vimEditorWidth, 1), rect.height / Math.max(ed.vimEditorHeight, 1))
+    if (scale < 1) {
+      // Passively reduced clearing user adjustment status
+      ed.userResized = false
+      ed.vimEditorWidth = Math.floor(ed.vimEditorWidth * scale)
+      ed.vimEditorHeight = Math.floor(ed.vimEditorHeight * scale)
+    }
+  }
+
+  // boundary clamping
+  ed.vimEditorX = clamp(ed.vimEditorX, 0, Math.max(0, rect.width - ed.vimEditorWidth))
+  ed.vimEditorY = clamp(ed.vimEditorY, 0, Math.max(0, rect.height - ed.vimEditorHeight))
+}
+
+const autoExecuteCode = (payload: { command: string; tabId: string }) => {
+  if (payload.tabId !== props.currentConnectionId) return
+  sendDataAutoSwitchTerminal(payload.command)
+}
+const handleResize = debounce(() => {
+  if (fitAddon.value && terminal.value && terminalElement.value) {
+    try {
+      const rect = terminalElement.value.getBoundingClientRect()
+      if (rect.width > 0 && rect.height > 0) {
+        fitAddon.value.fit()
+        const { cols, rows } = terminal.value
+        if (isLocalConnect.value) {
+          resizeLocalSSH(cols, rows)
+        } else if (props.connectData.asset_type === 'person-serial') {
+          resizeSerialSSH(cols, rows)
+        } else {
+          resizeSSH(cols, rows)
+        }
+        openEditors.forEach((ed) => resizeEditor(ed, rect))
+      }
+    } catch (error) {
+      logger.error('Failed to resize terminal', { error: error })
+    }
+  }
+}, 100)
+
+const emit = defineEmits(['connectSSH', 'disconnectSSH', 'closeTabInTerm', 'createNewTerm'])
+
+// Keep reconnect prompts fully i18n-based.
+const getAutoReconnectMessage = (key: string, params?: Record<string, unknown>) => {
+  return t(`ssh.autoReconnect.${key}`, params || {})
+}
+
+// Mirror reconnect progress to app logger and terminal output.
+const writeAutoReconnectLog = (text: string) => {
+  const tag = getAutoReconnectMessage('tag')
+  logger.info('Auto reconnect trace', {
+    event: 'ssh.auto-reconnect.trace',
+    connectionId: connectionId.value,
+    message: text
+  })
+  cusWrite?.(`\r\n[${tag}] ${text}\r\n`, { isUserCall: true })
+}
+
+// Ensure only one reconnect timer is active at any time.
+const clearAutoReconnectTimer = () => {
+  if (autoReconnectTimer) {
+    clearTimeout(autoReconnectTimer)
+    autoReconnectTimer = null
+  }
+}
+
+// Reset reconnect state after success or when reconnect flow is cancelled.
+const resetAutoReconnectState = () => {
+  clearAutoReconnectTimer()
+  autoReconnectInProgress.value = false
+  autoReconnectAttempts.value = 0
+  waitingForNetworkRestore.value = false
+  disconnectedByNetwork.value = false
+}
+
+// Manual reconnect should interrupt pending automatic retry loops.
+const prepareManualReconnectAttempt = () => {
+  clearAutoReconnectTimer()
+  autoReconnectInProgress.value = false
+  autoReconnectAttempts.value = 0
+}
+
+// Central retry scheduler: gate by state, retry with backoff, stop after max attempts.
+const scheduleAutoReconnect = (delayMs = 0) => {
+  if (!disconnectedByNetwork.value || manualDisconnectRequested.value || isConnected.value) {
+    logger.info('Skip auto reconnect scheduling', {
+      event: 'ssh.auto-reconnect.schedule.skip',
+      connectionId: connectionId.value,
+      disconnectedByNetwork: disconnectedByNetwork.value,
+      manualDisconnectRequested: manualDisconnectRequested.value,
+      isConnected: isConnected.value
+    })
+    return
+  }
+  clearAutoReconnectTimer()
+
+  autoReconnectTimer = setTimeout(async () => {
+    if (!disconnectedByNetwork.value || manualDisconnectRequested.value || isConnected.value) {
+      logger.info('Cancel auto reconnect tick', {
+        event: 'ssh.auto-reconnect.tick.cancel',
+        connectionId: connectionId.value,
+        disconnectedByNetwork: disconnectedByNetwork.value,
+        manualDisconnectRequested: manualDisconnectRequested.value,
+        isConnected: isConnected.value
+      })
+      return
+    }
+    if (autoReconnectInProgress.value) {
+      logger.info('Auto reconnect already in progress', {
+        event: 'ssh.auto-reconnect.in_progress',
+        connectionId: connectionId.value
+      })
+      return
+    }
+
+    if (!navigator.onLine) {
+      waitingForNetworkRestore.value = true
+      writeAutoReconnectLog(getAutoReconnectMessage('networkOfflineWaitingRestoration'))
+      return
+    }
+
+    if (autoReconnectAttempts.value >= AUTO_RECONNECT_MAX_ATTEMPTS) {
+      writeAutoReconnectLog(
+        getAutoReconnectMessage('stoppedAfterMaxAttempts', {
+          max: AUTO_RECONNECT_MAX_ATTEMPTS
+        })
+      )
+      disconnectedByNetwork.value = false
+      autoReconnectInProgress.value = false
+      waitingForNetworkRestore.value = false
+      return
+    }
+
+    autoReconnectInProgress.value = true
+    autoReconnectAttempts.value += 1
+    const currentAttempt = autoReconnectAttempts.value
+    writeAutoReconnectLog(
+      getAutoReconnectMessage('attemptProgress', {
+        current: currentAttempt,
+        max: AUTO_RECONNECT_MAX_ATTEMPTS
+      })
+    )
+
+    const success = await connectSSH({ isAutoReconnect: true })
+    autoReconnectInProgress.value = false
+
+    if (success) {
+      writeAutoReconnectLog(
+        getAutoReconnectMessage('connectedOnAttempt', {
+          current: currentAttempt,
+          max: AUTO_RECONNECT_MAX_ATTEMPTS
+        })
+      )
+      resetAutoReconnectState()
+      return
+    }
+
+    writeAutoReconnectLog(
+      getAutoReconnectMessage('attemptFailed', {
+        current: currentAttempt,
+        max: AUTO_RECONNECT_MAX_ATTEMPTS
+      })
+    )
+
+    if (currentAttempt >= AUTO_RECONNECT_MAX_ATTEMPTS) {
+      writeAutoReconnectLog(
+        getAutoReconnectMessage('stoppedAfterMaxAttempts', {
+          max: AUTO_RECONNECT_MAX_ATTEMPTS
+        })
+      )
+      disconnectedByNetwork.value = false
+      waitingForNetworkRestore.value = false
+      return
+    }
+
+    const nextDelay = AUTO_RECONNECT_BASE_DELAY_MS * currentAttempt
+    writeAutoReconnectLog(
+      getAutoReconnectMessage('retryingInSeconds', {
+        seconds: Math.ceil(nextDelay / 1000)
+      })
+    )
+    scheduleAutoReconnect(nextDelay)
+  }, delayMs)
+}
+
+// Browser offline/online events are used to pause and resume reconnect attempts.
+const handleBrowserOffline = () => {
+  waitingForNetworkRestore.value = true
+  logger.info('Browser network offline event', {
+    event: 'ssh.auto-reconnect.browser.offline',
+    connectionId: connectionId.value
+  })
+}
+
+const handleBrowserOnline = () => {
+  waitingForNetworkRestore.value = false
+  logger.info('Browser network online event', {
+    event: 'ssh.auto-reconnect.browser.online',
+    connectionId: connectionId.value,
+    disconnectedByNetwork: disconnectedByNetwork.value,
+    manualDisconnectRequested: manualDisconnectRequested.value,
+    isConnected: isConnected.value
+  })
+
+  if (disconnectedByNetwork.value && !manualDisconnectRequested.value && !isConnected.value) {
+    writeAutoReconnectLog(getAutoReconnectMessage('networkRestoredStartReconnect'))
+    scheduleAutoReconnect(0)
+  }
+}
+
+const connectSSH = async (_opts?: { isAutoReconnect?: boolean }) => {
+  // Prevent concurrent connect calls (auto reconnect + manual reconnect).
+  if (connectInProgress.value) {
+    logger.info('Skip SSH connect because another connect is in progress', {
+      event: 'ssh.connect.skip.in_progress',
+      connectionId: connectionId.value,
+      isAutoReconnect: _opts?.isAutoReconnect === true
+    })
+    return false
+  }
+
+  connectInProgress.value = true
+  try {
+    manualDisconnectRequested.value = false
+    localEcho.reset()
+    clearAutoReconnectTimer()
+    let connectSuccess = false
+    logger.info('Start SSH connect', {
+      event: 'ssh.connect.start.renderer',
+      connectionId: connectionId.value,
+      isAutoReconnect: _opts?.isAutoReconnect === true
+    })
+
+    if (terminal.value) {
+      const textarea = terminal.value.element?.querySelector('.xterm-helper-textarea') as HTMLTextAreaElement | null
+      if (textarea) {
+        if (textareaCompositionListener) {
+          textarea.removeEventListener('compositionend', textareaCompositionListener)
+          textareaCompositionListener = null
+        }
+        if (textareaPasteListener) {
+          textarea.removeEventListener('paste', textareaPasteListener)
+          textareaPasteListener = null
+        }
+      }
+    }
+
+    try {
+      const skipAssetLookup = shouldSkipAssetLookup(props.connectData)
+      const orgId = props.serverInfo?.organizationId
+      const fallbackOrgUuid = orgId && orgId !== 'personal' ? orgId : undefined
+      const assetInfo = skipAssetLookup
+        ? null
+        : await api.connectAssetInfo({
+            uuid: props.connectData.uuid,
+            organizationUuid: fallbackOrgUuid,
+            ip: props.connectData.ip || props.connectData.host
+          })
+      if (connectionCancellationGuard.isCancelled()) {
+        return false
+      }
+      const password = ref('')
+      const privateKey = ref('')
+      const passphrase = ref('')
+      if (assetInfo) {
+        password.value = assetInfo.auth_type !== 'keyBased' ? assetInfo.password : ''
+        privateKey.value = assetInfo.auth_type === 'keyBased' ? assetInfo.privateKey : ''
+        passphrase.value = assetInfo.auth_type === 'keyBased' ? assetInfo.passphrase : ''
+      } else {
+        password.value = props.connectData.authType !== 'privateKey' ? props.connectData.password : ''
+        privateKey.value = props.connectData.authType === 'privateKey' ? props.connectData.privateKey : ''
+        passphrase.value = props.connectData.passphrase || ''
+      }
+
+      const email = userInfoStore().userInfo.email
+      const isAutoReconnect = _opts?.isAutoReconnect === true
+      const shouldFocusAfterConnect = !isAutoReconnect && props.isActive && props.activeTabId === props.currentConnectionId
+
+      const connOrgType = props.serverInfo.organizationId === 'personal' ? 'local' : 'local-team'
+      const connConnectHost = assetInfo?.asset_ip || props.connectData.host || props.connectData.ip
+      const connUsername = assetInfo?.username || props.connectData.username
+      const connAssetIp = assetInfo?.asset_ip || props.connectData.host
+      const connHostname = assetInfo?.hostname || props.connectData.hostname
+      const connPort = assetInfo?.port || props.connectData.port
+      const connHost = assetInfo?.host || props.connectData.host
+      const connPassword = assetInfo?.password || props.connectData.password
+      const connComment = assetInfo?.comment || props.connectData.comment
+      const connSshType = assetInfo?.sshType || 'ssh'
+      const connAssetType = assetInfo?.asset_type || props.connectData.asset_type || ''
+
+      const hostnameBase64 = props.serverInfo.organizationId === 'personal' ? Base64Util.encode(connAssetIp) : Base64Util.encode(connHostname)
+
+      const sessionId = uuidv4() // Different for each tab
+      const jumpserverUuid = assetInfo?.organization_uuid || props.connectData.uuid
+
+      connectionId.value = `${connUsername}@${props.connectData.ip}:${connOrgType}:${hostnameBase64}:${sessionId}`
+
+      // Fork path: reuse an existing authenticated SSH connection
+      if (props.connectData.forkFromConnectionId) {
+        logger.info('Fork SSH session from existing connection', {
+          sourceConnectionId: props.connectData.forkFromConnectionId,
+          newConnectionId: connectionId.value,
+          isAutoReconnect
+        })
+        const forkResult = await api.forkSession({
+          sourceConnectionId: props.connectData.forkFromConnectionId,
+          newConnectionId: connectionId.value,
+          host: connConnectHost,
+          port: connPort,
+          username: connUsername
+        })
+        if (connectionCancellationGuard.isCancelled()) {
+          cancelCurrentConnection(forkResult.status === 'connected', 'fork_connect_completed')
+          return false
+        }
+        if (forkResult.status === 'connected') {
+          disconnectedByNetwork.value = false
+          waitingForNetworkRestore.value = false
+          autoReconnectAttempts.value = 0
+          if (!isAutoReconnect) {
+            const welcomeName = email.split('@')[0] || userInfoStore().userInfo.name
+            const welcome = '\x1b[38;2;22;119;255m' + t('ssh.welcomeMessage', { username: welcomeName }) + ' \x1b[m\r\n'
+            terminal.value?.writeln('')
+            terminal.value?.writeln(welcome)
+            terminal.value?.writeln(t('ssh.connectingTo', { ip: props.connectData.ip }))
+          }
+          await startShell()
+          if (connectionCancellationGuard.isCancelled()) {
+            cancelCurrentConnection(true, 'fork_shell_opened')
+            return false
+          }
+          shellOpenedAt = Date.now()
+          setupTerminalInput()
+          // Single deferred resize after guard window to avoid rapid setWindow killing
+          setTimeout(() => {
+            handleResize()
+            terminal.value?.scrollToBottom()
+            if (shouldFocusAfterConnect) {
+              terminal.value?.focus()
+            }
+          }, RESIZE_GUARD_MS + 100)
+          registerSshConnection(props.currentConnectionId, connectionId.value)
+          connectSuccess = true
+          logger.info('SSH connect succeeded (fork)', {
+            event: 'ssh.connect.success.renderer',
+            connectionId: connectionId.value,
+            isAutoReconnect
+          })
+        } else {
+          const resolvedForkMessage = forkResult?.message || 'Fork failed'
+          const errorMsg = formatStatusMessage(t('ssh.connectionFailed', { message: resolvedForkMessage }), 'error')
+          terminal.value?.writeln(errorMsg)
+          logger.info('SSH connect failed (fork)', {
+            event: 'ssh.connect.failed.renderer',
+            connectionId: connectionId.value,
+            isAutoReconnect,
+            status: forkResult?.status,
+            message: resolvedForkMessage
+          })
+        }
+      } else {
+        // Setup status listener for bastion host connections
+        // All plugin bastions reuse the jumpserver:status-update channel
+        if (shouldUseBastionStatusChannel(connSshType) && terminal.value) {
+          jumpServerStatusHandler = createJumpServerStatusHandler(terminal.value, connectionId.value, translateJumpServerStatus)
+          jumpServerStatusHandler.setupStatusListener(api)
+        }
+
+        const jmsToken = ref(localStorage.getItem('jms-token'))
+        const isWakeupSession = Boolean(
+          props.connectData.wakeupSource ||
+          String(props.connectData.source || '')
+            .toLowerCase()
+            .startsWith('xshell')
+        )
+
+        const connData: any = {
+          id: connectionId.value, // Session ID (unique for each tab)
+          assetUuid: jumpserverUuid, // JumpServer UUID (for connection pool reuse)
+          organizationUuid: fallbackOrgUuid,
+          host: connConnectHost,
+          port: connPort,
+          username: connUsername,
+          password: connPassword,
+          privateKey: privateKey.value,
+          passphrase: passphrase.value,
+          targetIp: connHost,
+          targetHostname: connHostname,
+          targetAsset: connComment || connHost,
+          comment: connComment,
+          sshType: connSshType,
+          terminalType: config.terminalType,
+          agentForward: config.sshAgentsStatus === 1,
+          isOfficeDevice: isOfficeDevice.value,
+          connIdentToken: jmsToken.value || '',
+          asset_type: connAssetType, // Pass asset_type to main process for switch handling
+          proxyCommand: props.connectData.proxyCommand || '',
+          source: props.connectData.source || '',
+          wakeupSource: props.connectData.wakeupSource || props.connectData.source || '',
+          wakeupNewTab: props.connectData.wakeupNewTab === true,
+          wakeupTabId: props.connectData.wakeupSource ? props.connectData.uuid : '',
+          disablePoolReuse: props.connectData.disablePoolReuse === true || props.connectData.wakeupNewTab === true || isWakeupSession,
+          disablePostConnectProbe: skipAssetLookup
+        }
+        connData.needProxy = assetInfo?.need_proxy === 1 || false
+        if (connData.needProxy) {
+          connData.proxyConfig = config.sshProxyConfigs.find((item) => item.name === assetInfo?.proxy_name)
+        }
+        if (assetInfo?.jump_host_uuid) {
+          connData.jumpHostUuid = assetInfo.jump_host_uuid
+        }
+
+        const { mark: perfMark } = await import('@/utils/perf')
+        if (connectionCancellationGuard.isCancelled()) {
+          return false
+        }
+        perfMark('chaterm/terminal/willConnect')
+        const result = await api.connect(connData)
+        perfMark('chaterm/terminal/didConnect')
+
+        if (jumpServerStatusHandler) {
+          jumpServerStatusHandler.cleanup()
+          jumpServerStatusHandler = null
+        }
+        if (connectionCancellationGuard.isCancelled()) {
+          cancelCurrentConnection(result.status === 'connected', 'connect_completed')
+          return false
+        }
+
+        const isSwitchDevice = connAssetType?.startsWith('person-switch-') ?? false
+        if (isSwitchDevice) {
+          connectionHasSudo.value = false
+          getCmdList([])
+        } else {
+          api
+            .connectReadyData(connectionId.value)
+            .then((connectReadyData) => {
+              connectionHasSudo.value = connectReadyData?.hasSudo
+              getCmdList(connectReadyData?.commandList)
+            })
+            .catch((error) => {
+              logger.error('Failed to receive command list', { error: error })
+              connectionHasSudo.value = false
+              getCmdList([])
+            })
+        }
+
+        if (result.status === 'connected') {
+          perfMark('chaterm/terminal/connected')
+          disconnectedByNetwork.value = false
+          waitingForNetworkRestore.value = false
+          autoReconnectAttempts.value = 0
+          // Record connection for "Recent Connections" feature (skip auto-reconnects)
+          if (!isAutoReconnect) {
+            try {
+              api.recordConnection({
+                assetUuid: props.connectData.uuid || '',
+                assetIp: props.connectData.ip || connConnectHost || '',
+                assetLabel: props.serverInfo?.title || props.serverInfo?.label || props.connectData.hostname || connHostname || '',
+                assetPort: connPort || 22,
+                assetUsername: connUsername || '',
+                assetType: connAssetType || 'person',
+                organizationId: props.serverInfo?.organizationId || 'personal'
+              })
+            } catch {
+              // Non-critical: do not block connection flow
+            }
+            const welcomeName = email.split('@')[0] || userInfoStore().userInfo.name
+            const welcome = '\x1b[38;2;22;119;255m' + t('ssh.welcomeMessage', { username: welcomeName }) + ' \x1b[m\r\n'
+            terminal.value?.writeln('') // Add empty line separator
+            terminal.value?.writeln(welcome)
+            terminal.value?.writeln(t('ssh.connectingTo', { ip: props.connectData.ip }))
+          }
+          await startShell()
+          if (connectionCancellationGuard.isCancelled()) {
+            cancelCurrentConnection(true, 'shell_opened')
+            return false
+          }
+          shellOpenedAt = Date.now()
+          setupTerminalInput()
+          // Single deferred resize after guard window to avoid rapid setWindow killing the shell
+          setTimeout(() => {
+            handleResize()
+            terminal.value?.scrollToBottom()
+            if (shouldFocusAfterConnect) {
+              terminal.value?.focus()
+              terminal.value?.focus()
+            }
+          }, RESIZE_GUARD_MS + 100)
+          if (shouldSkipAssetLookup(props.connectData)) {
+            logger.info('Skip shell PID probe for xshell wakeup session', {
+              connectionId: connectionId.value,
+              source: props.connectData?.wakeupSource || props.connectData?.source || 'unknown'
+            })
+          } else {
+            api.setShellPid(connectionId.value)
+          }
+          registerSshConnection(props.currentConnectionId, connectionId.value)
+          connectSuccess = true
+          logger.info('SSH connect succeeded', {
+            event: 'ssh.connect.success.renderer',
+            connectionId: connectionId.value,
+            isAutoReconnect
+          })
+        } else {
+          const resolvedMessage = result?.messageKey ? t(result.messageKey, result.messageParams || {}) : (result?.message as string)
+          const errorMsg = formatStatusMessage(t('ssh.connectionFailed', { message: resolvedMessage }), 'error')
+          terminal.value?.writeln(errorMsg)
+          logger.info('SSH connect failed (status)', {
+            event: 'ssh.connect.failed.renderer',
+            connectionId: connectionId.value,
+            isAutoReconnect,
+            status: result.status,
+            message: resolvedMessage
+          })
+        }
+      }
+    } catch (error: any) {
+      if (jumpServerStatusHandler) {
+        jumpServerStatusHandler.cleanup()
+        jumpServerStatusHandler = null
+      }
+
+      const errorMsg = formatStatusMessage(t('ssh.connectionError', { message: error.message || t('ssh.unknownError') }), 'error')
+      terminal.value?.writeln(errorMsg)
+      logger.info('SSH connect failed (exception)', {
+        event: 'ssh.connect.error.renderer',
+        connectionId: connectionId.value,
+        isAutoReconnect: _opts?.isAutoReconnect === true,
+        error: error?.message || String(error)
+      })
+    }
+    try {
+      connectionSftpAvailable.value = connectSuccess ? await api.checkSftpConnAvailable(connectionId.value) : false
+    } catch (error) {
+      connectionSftpAvailable.value = false
+      logger.warn('Check SFTP availability failed after SSH connect', {
+        event: 'ssh.connect.sftp.check_failed',
+        connectionId: connectionId.value,
+        error: error instanceof Error ? error.message : String(error)
+      })
+    }
+    emit('connectSSH', { isConnected: isConnected })
+    return isConnected.value
+  } finally {
+    connectInProgress.value = false
+  }
+}
+
+const {
+  progressModalVisible,
+  progressType,
+  currentProgress,
+  currentFileName,
+  transferSpeed,
+  totalSize,
+  isSzCanceling,
+  transferSize,
+  progressStatus,
+  initZmodemHooks,
+  initZmodem,
+  consumeZmodemIncoming,
+  handleProgressCancel,
+  handleProgressClose
+} = useZmodem()
+
+const startShell = async () => {
+  try {
+    const result = await api.shell({
+      id: connectionId.value,
+      terminalType: config.terminalType,
+      cols: terminal.value?.cols || 80,
+      rows: terminal.value?.rows || 24
+    })
+    initZmodem()
+    if (result.status === 'success') {
+      isConnected.value = true
+      void loadOsInfoOnce()
+      const removeDataListener = api.onShellData(connectionId.value, (response: MarkedResponse) => {
+        const preparedResponse = prepareIncomingShellResponse(response)
+        if (preparedResponse) {
+          consumeZmodemIncoming(preparedResponse)
+        }
+      })
+      const removeErrorListener = api.onShellError(connectionId.value, (data) => {
+        localEcho.reset()
+        cusWrite?.(data)
+      })
+      const removeCloseListener = api.onShellClose(connectionId.value, (closeInfo?: ShellCloseInfo) => {
+        isConnected.value = false
+        localEcho.reset()
+        logger.info('Shell close received', {
+          event: 'ssh.shell.close.renderer',
+          connectionId: connectionId.value,
+          closeInfo
+        })
+        cusWrite?.('\r\n' + t('ssh.connectionClosed') + '\r\n')
+        cusWrite?.(
+          t('ssh.disconnectedFromHost', {
+            host: props.serverInfo.title,
+            date: new Date().toDateString()
+          }) + '\r\n'
+        )
+        cusWrite?.('\r\n' + t('ssh.pressEnterToReconnect') + '\r\n', { isUserCall: true })
+
+        // Manual disconnect should not trigger automatic reconnect.
+        if (manualDisconnectRequested.value) {
+          disconnectedByNetwork.value = false
+          waitingForNetworkRestore.value = false
+          return
+        }
+
+        const isNetworkDisconnect = closeInfo?.isNetworkDisconnect === true || closeInfo?.reason === 'network' || (!closeInfo && !navigator.onLine)
+        logger.info('Shell close classification', {
+          event: 'ssh.shell.close.classify.renderer',
+          connectionId: connectionId.value,
+          isNetworkDisconnect,
+          closeInfo,
+          navigatorOnLine: navigator.onLine
+        })
+        if (!isNetworkDisconnect) {
+          disconnectedByNetwork.value = false
+          waitingForNetworkRestore.value = false
+          return
+        }
+
+        // Start reconnect flow only for network-related disconnects.
+        disconnectedByNetwork.value = true
+        waitingForNetworkRestore.value = !navigator.onLine
+        autoReconnectAttempts.value = 0
+        const reasonText = closeInfo?.errorMessage || closeInfo?.errorCode || getAutoReconnectMessage('networkIssue')
+        writeAutoReconnectLog(
+          getAutoReconnectMessage('detectedNetworkDisconnect', {
+            reason: reasonText
+          })
+        )
+
+        if (navigator.onLine) {
+          scheduleAutoReconnect(0)
+        } else {
+          writeAutoReconnectLog(getAutoReconnectMessage('networkOfflineWaitingReconnect'))
+        }
+      })
+
+      cleanupListeners.value.push(removeDataListener, removeErrorListener, removeCloseListener)
+    } else {
+      terminal.value?.writeln(
+        JSON.stringify({
+          cmd: t('ssh.shellStartFailed', { message: result.message }),
+          isUserCall: true
+        })
+      )
+    }
+  } catch (error: any) {
+    logger.error('Shell start error', { error: error })
+    terminal.value?.writeln(
+      JSON.stringify({
+        cmd: t('ssh.shellError', { message: error.message || t('ssh.unknownError') }),
+        isUserCall: true
+      })
+    )
+  }
+  emit('connectSSH', { isConnected: isConnected })
+}
+
+// Guard: suppress rapid setWindow calls right after shell opens.
+// Multiple setWindow calls within ~200ms can cause the server to close the shell.
+let shellOpenedAt = 0
+const RESIZE_GUARD_MS = 500
+let pendingResizeTimer: ReturnType<typeof setTimeout> | null = null
+
+const resizeSSH = async (cols, rows) => {
+  const elapsed = Date.now() - shellOpenedAt
+  if (shellOpenedAt > 0 && elapsed < RESIZE_GUARD_MS) {
+    // Inside guard window: schedule a single deferred resize at end of guard period
+    if (pendingResizeTimer) clearTimeout(pendingResizeTimer)
+    pendingResizeTimer = setTimeout(
+      () => {
+        pendingResizeTimer = null
+        resizeSSH(cols, rows)
+      },
+      RESIZE_GUARD_MS - elapsed + 50
+    )
+    return
+  }
+  try {
+    const result = await api.resizeShell(connectionId.value, cols, rows)
+    if (result.status === 'error') {
+      logger.error('Resize failed', { message: result.message })
+    }
+  } catch (error) {
+    logger.error('Failed to resize terminal', { error: error })
+  }
+}
+
+const connectLocalSSH = async () => {
+  if (termOndata) {
+    termOndata.dispose()
+    termOndata = null
+  }
+  if (termOnBinary) {
+    termOnBinary?.dispose()
+    termOnBinary = null
+  }
+  if (terminal.value) {
+    const textarea = terminal.value.element?.querySelector('.xterm-helper-textarea') as HTMLTextAreaElement | null
+    if (textarea) {
+      if (textareaCompositionListener) {
+        textarea.removeEventListener('compositionend', textareaCompositionListener)
+        textareaCompositionListener = null
+      }
+      if (textareaPasteListener) {
+        textarea.removeEventListener('paste', textareaPasteListener)
+        textareaPasteListener = null
+      }
+    }
+  }
+
+  connectionId.value = `localhost@127.0.0.1:local:${props.currentConnectionId}`
+
+  try {
+    const email = userInfoStore().userInfo.email
+
+    const localConfig = {
+      id: connectionId.value,
+      shell: props.serverInfo.data.uuid,
+      termType: config.terminalType
+    }
+
+    const result = await api.connectLocal(localConfig)
+    if (result.success) {
+      // Record local connection for "Recent Connections" feature
+      try {
+        api.recordConnection({
+          assetUuid: props.connectData.uuid || props.serverInfo?.key || '',
+          assetIp: '127.0.0.1',
+          assetLabel: props.serverInfo?.title || props.connectData.hostname || 'localhost',
+          assetPort: 0,
+          assetUsername: '',
+          assetType: 'shell',
+          organizationId: 'personal'
+        })
+      } catch {
+        // Non-critical: do not block connection flow
+      }
+      const welcomeName = email.split('@')[0] || userInfoStore().userInfo.name
+      const welcome = '\x1b[38;2;22;119;255m' + t('ssh.welcomeMessage', { username: welcomeName }) + ' \x1b[m\r\n'
+      terminal.value?.writeln('') // Add empty line separator
+      terminal.value?.writeln(welcome)
+
+      await startLocalShell()
+
+      // Assign handleInput so that external callers (e.g. snippet execution via
+      // inputManager.sendToActiveTerm) can write into the local terminal.
+      handleInput = (data) => {
+        if (data === '\x16' && shouldSuppressCtrlVAfterNativePaste(lastNativePasteAt)) {
+          return
+        }
+        if (data === '\x1b[1;3D' || data === '\x1b[1;5D') {
+          api.sendDataLocal(connectionId.value, '\x1bb')
+          return
+        }
+        if (data === '\x1b[1;3C' || data === '\x1b[1;5C') {
+          api.sendDataLocal(connectionId.value, '\x1bf')
+          return
+        }
+        if (data === '\r') {
+          const command = terminalState.value.content
+          const aliasStore = aliasConfigStore()
+          const newCommand = resolveAliasExpansion(command, dbConfigStash.aliasStatus, aliasStore.getCommand)
+          if (newCommand) {
+            const delData = String.fromCharCode(127)
+            api.sendDataLocal(connectionId.value, delData.repeat(command.length) + newCommand + '\r')
+            return
+          }
+        }
+        api.sendDataLocal(connectionId.value, data)
+      }
+
+      // Handle input — delegate to handleInput which also serves external callers
+      terminal.value?.onData((data) => {
+        handleInput && handleInput(data)
+      })
+
+      handleResize()
+      setTimeout(() => {
+        handleResize()
+      }, 200)
+    } else {
+      const errorMsg = formatStatusMessage(`Connection failed: ${result.message}`, 'error')
+      terminal.value?.writeln(errorMsg)
+    }
+  } catch (error: any) {
+    const errorMsg = formatStatusMessage(`Connection error: ${error.message || 'Unknown error'}`, 'error')
+    terminal.value?.writeln(errorMsg)
+  }
+  emit('connectSSH', { isConnected: isConnected })
+}
+
+const startLocalShell = async () => {
+  isConnected.value = true
+  const removeDataListener = api.onDataLocal(connectionId.value, (data: string) => {
+    // For local connections, handle command output collection if needed
+    if (isCollectingOutput.value) {
+      handleCommandOutput(data, false)
+    } else {
+      // Also check if this data contains a command marker (for initial command)
+      // This handles the case where the command itself is echoed back
+      if (
+        currentCommandMarker.value &&
+        (currentCommandMarker.value === 'Chaterm:command' || currentCommandMarker.value?.startsWith('Chaterm:command:'))
+      ) {
+        // Command was just sent, start collecting output
+        isCollectingOutput.value = true
+        handleCommandOutput(data, true)
+      } else {
+        // Normal data output, just write to terminal
+        if (cusWrite) {
+          cusWrite(data)
+        } else if (terminal.value) {
+          terminal.value.write(data)
+        }
+      }
+    }
+  })
+  const removeErrorListener = api.onErrorLocal?.(connectionId.value, (error: any) => {
+    if (terminal.value) {
+      terminal.value.write(`\r\n[Error]: ${error.message || error}\r\n`)
+    }
+  })
+
+  const removeCloseListener = api.onExitLocal(connectionId.value, (exitCode: any) => {
+    isConnected.value = false
+    if (terminal.value) {
+      terminal.value.write('\r\nConnection closed.\r\n\r\n')
+      terminal.value.write(`Disconnected from local shell at ${new Date().toDateString()}\r\n`)
+      terminal.value.write(`Exit code: ${exitCode?.code || 'unknown'}\r\n`)
+    }
+  })
+
+  if (removeErrorListener) {
+    cleanupListeners.value.push(removeDataListener, removeErrorListener, removeCloseListener)
+  } else {
+    cleanupListeners.value.push(removeDataListener, removeCloseListener)
+  }
+}
+
+const resizeLocalSSH = async (cols, rows) => {
+  try {
+    const result = await api.resizeLocal(connectionId.value, cols, rows)
+    if (result.status === 'error') {
+      logger.error('Resize failed', { message: result.message })
+    } else {
+    }
+  } catch (error) {
+    logger.error('Failed to resize terminal', { error: error })
+  }
+}
+
+// Serial (UART) connection — mirrors connectLocalSSH / startLocalShell but talks to a
+// physical or virtual serial port instead of a local pty.
+const connectSerialSSH = async () => {
+  if (termOndata) {
+    termOndata.dispose()
+    termOndata = null
+  }
+  if (termOnBinary) {
+    termOnBinary?.dispose()
+    termOnBinary = null
+  }
+  if (terminal.value) {
+    const textarea = terminal.value.element?.querySelector('.xterm-helper-textarea') as HTMLTextAreaElement | null
+    if (textarea) {
+      if (textareaCompositionListener) {
+        textarea.removeEventListener('compositionend', textareaCompositionListener)
+        textareaCompositionListener = null
+      }
+      if (textareaPasteListener) {
+        textarea.removeEventListener('paste', textareaPasteListener)
+        textareaPasteListener = null
+      }
+    }
+  }
+
+  connectionId.value = `serial@${props.connectData.ip || props.serverInfo?.ip || 'device'}:serial:${props.currentConnectionId}`
+
+  try {
+    const assetInfo = await api.connectAssetInfo({
+      uuid: props.connectData.uuid,
+      organizationUuid: undefined,
+      ip: props.connectData.ip || props.connectData.host
+    })
+
+    const serialConfig = {
+      id: connectionId.value,
+      path: (assetInfo?.asset_ip as string) || props.connectData.ip || props.connectData.host || '',
+      baudRate: Number(assetInfo?.baud_rate ?? props.connectData.baudRate ?? 9600),
+      dataBits: Number(assetInfo?.data_bits ?? props.connectData.dataBits ?? 8),
+      stopBits: Number(assetInfo?.stop_bits ?? props.connectData.stopBits ?? 1),
+      parity: (assetInfo?.parity as string) ?? props.connectData.parity ?? 'none',
+      flowControl: (assetInfo?.flow_control as string) ?? props.connectData.flowControl ?? 'none',
+      cols: terminal.value?.cols || 80,
+      rows: terminal.value?.rows || 24
+    }
+
+    const result = await api.connectSerial(serialConfig)
+    if (result.success) {
+      // Record serial connection for "Recent Connections" feature
+      try {
+        api.recordConnection({
+          assetUuid: props.connectData.uuid || props.serverInfo?.key || '',
+          assetIp: serialConfig.path,
+          assetLabel: props.serverInfo?.title || props.connectData.hostname || serialConfig.path,
+          assetPort: 0,
+          assetUsername: '',
+          assetType: 'person-serial',
+          organizationId: 'personal'
+        })
+      } catch {
+        // Non-critical: do not block connection flow
+      }
+
+      const email = userInfoStore().userInfo?.email || ''
+      const welcomeName = email.split('@')[0] || userInfoStore().userInfo?.name || 'user'
+      const welcome = '\x1b[38;2;22;119;255m' + t('ssh.welcomeMessage', { username: welcomeName }) + ' \x1b[m\r\n'
+      terminal.value?.writeln('')
+      terminal.value?.writeln(welcome)
+      terminal.value?.writeln(t('ssh.connectingTo', { ip: serialConfig.path }))
+
+      await startSerialShell()
+
+      // Assign handleInput so that external callers (e.g. snippet execution via
+      // inputManager.sendToActiveTerm) can write into the serial terminal.
+      handleInput = (data) => {
+        if (data === '\x16' && shouldSuppressCtrlVAfterNativePaste(lastNativePasteAt)) {
+          return
+        }
+        api.sendDataSerial(connectionId.value, data)
+      }
+
+      // Handle input — delegate to handleInput which also serves external callers
+      terminal.value?.onData((data) => {
+        handleInput && handleInput(data)
+      })
+
+      handleResize()
+      setTimeout(() => {
+        handleResize()
+      }, 200)
+    } else {
+      const errorMsg = formatStatusMessage(`Connection failed: ${result.message}`, 'error')
+      terminal.value?.writeln(errorMsg)
+    }
+  } catch (error: any) {
+    const errorMsg = formatStatusMessage(`Connection error: ${error.message || 'Unknown error'}`, 'error')
+    terminal.value?.writeln(errorMsg)
+  }
+  emit('connectSSH', { isConnected: isConnected })
+}
+
+const startSerialShell = async () => {
+  isConnected.value = true
+  const removeDataListener = api.onDataSerial(connectionId.value, (data: string) => {
+    if (cusWrite) {
+      cusWrite(data)
+    } else if (terminal.value) {
+      terminal.value.write(data)
+    }
+  })
+  const removeErrorListener = api.onErrorSerial?.(connectionId.value, (error: any) => {
+    if (terminal.value) {
+      terminal.value.write(`\r\n[Error]: ${error?.message || error}\r\n`)
+    }
+  })
+
+  const removeCloseListener = api.onExitSerial(connectionId.value, (exitCode: any) => {
+    isConnected.value = false
+    if (terminal.value) {
+      terminal.value.write('\r\nSerial connection closed.\r\n\r\n')
+      terminal.value.write(`Disconnected from serial device at ${new Date().toDateString()}\r\n`)
+      terminal.value.write(`Exit code: ${exitCode?.code || 'unknown'}\r\n`)
+    }
+  })
+
+  if (removeErrorListener) {
+    cleanupListeners.value.push(removeDataListener, removeErrorListener, removeCloseListener)
+  } else {
+    cleanupListeners.value.push(removeDataListener, removeCloseListener)
+  }
+}
+
+const resizeSerialSSH = async (cols, rows) => {
+  try {
+    const result = await api.resizeSerial(connectionId.value, cols, rows)
+    if (result.success === false) {
+      logger.error('Serial resize failed', { message: result.message })
+    }
+  } catch (error) {
+    logger.error('Failed to resize serial terminal', { error: error })
+  }
+}
+const terminalState = ref({
+  content: '',
+  cursorPosition: {
+    row: 0,
+    col: 0
+  },
+  beforeCursor: '',
+  contentCrossRowStatus: false,
+  contentCrossRowLines: 0,
+  contentCrossStartLine: 0,
+  contentCurrentCursorCrossRowLines: 0
+})
+
+const substrWidth = (str: string, startWidth: number, endWidth?: number): string => {
+  let currentWidth = 0
+  let startIndex = 0
+  let endIndex = str.length
+  for (let i = 0; i < str.length; i++) {
+    const code = str.codePointAt(i) || 0
+    const charWidth =
+      (code >= 0x3000 && code <= 0x9fff) ||
+      (code >= 0xac00 && code <= 0xd7af) ||
+      (code >= 0xf900 && code <= 0xfaff) ||
+      (code >= 0xff00 && code <= 0xffef) ||
+      (code >= 0x20000 && code <= 0x2fa1f)
+        ? 2
+        : 1
+
+    if (currentWidth < startWidth) {
+      currentWidth += charWidth
+      if (currentWidth > startWidth) {
+        startIndex = i + 1
+        break
+      } else if (currentWidth === startWidth) {
+        startIndex = i + 1
+        break
+      }
+    } else {
+      startIndex = i
+      break
+    }
+    if (code > 0xffff) {
+      i++
+    }
+  }
+  if (endWidth === undefined) {
+    return str.substring(startIndex)
+  }
+
+  currentWidth = 0
+  for (let i = 0; i < str.length; i++) {
+    const code = str.codePointAt(i) || 0
+    const charWidth =
+      (code >= 0x3000 && code <= 0x9fff) ||
+      (code >= 0xac00 && code <= 0xd7af) ||
+      (code >= 0xf900 && code <= 0xfaff) ||
+      (code >= 0xff00 && code <= 0xffef) ||
+      (code >= 0x20000 && code <= 0x2fa1f)
+        ? 2
+        : 1
+
+    currentWidth += charWidth
+
+    if (currentWidth > endWidth) {
+      endIndex = i
+      break
+    }
+    if (code > 0xffff) {
+      i++
+    }
+  }
+
+  return str.substring(startIndex, endIndex)
+}
+
+const cursorLastY = ref(0)
+const cursorLastX = ref(0)
+const cursorEndY = ref(0)
+const cursorMaxY = ref(0)
+const cursorMaxX = ref(0)
+let updateTimeout: NodeJS.Timeout | null = null
+const getLogicalInputStartLine = () => {
+  const bufferService = (terminal as any).value._core._bufferService
+  const buffer = bufferService.buffer
+  let y = terminal.value?.buffer.active.baseY + buffer.y
+  while (y > 0 && buffer.lines.get(y)?.isWrapped) {
+    y--
+  }
+  return y
+}
+const getWrappedContentLastLineY = () => {
+  const bufferService = (terminal as any).value._core._bufferService
+  const buffer = bufferService.buffer
+  let lastY = terminal.value?.buffer.active.baseY + buffer.y
+  const maxLineIndex = buffer.lines.length - 1
+  while (lastY < maxLineIndex) {
+    const nextLine = buffer.lines.get(lastY + 1)
+    if (!nextLine || !nextLine.isWrapped) {
+      break
+    }
+    lastY++
+  }
+  return lastY
+}
+
+const updateTerminalState = (quickInit: boolean, enterPress, tagPress: boolean, shouldAutoScrollAfterWrite = true) => {
+  if (!terminal.value) return
+
+  try {
+    const terminalCore = (terminal as any).value._core
+    const buffer = terminalCore._bufferService.buffer
+    const { x: cursorX, y: cursorY } = buffer
+    const { cols: maxCols, rows: maxRows } = terminalCore
+    const maxX = maxCols - 1
+    const maxY = maxRows - 1
+    let contentCursorX = cursorX
+    let parseStrTag = true
+    const isResizeTriggered = shouldSkipParseOnResize(maxX, maxY)
+    if (isResizeTriggered) {
+      parseStrTag = false
+    }
+    const currentCursorEndY = getWrappedContentLastLineY() - terminal.value?.buffer.active.baseY
+    const refreshCrossRow = shouldRefreshCrossRow(currentCursorEndY, cursorX)
+    cursorEndY.value = currentCursorEndY
+    const currentLine = buffer.lines.get(terminal.value?.buffer.active.baseY + cursorY)
+    let isCrossRow = determineCrossRowStatus(currentLine, cursorY, currentCursorEndY)
+    if (!tagPress) {
+      updateCursorStartPosition(cursorX, quickInit)
+    }
+    if (enterPress) {
+      isCrossRow = false
+    }
+    const { lineContent, finalContentCursorX } = processLineContent(
+      currentLine,
+      isCrossRow,
+      refreshCrossRow,
+      parseStrTag,
+      cursorX,
+      cursorY,
+      buffer,
+      contentCursorX
+    )
+    updateCursorHistory(cursorX, cursorY, maxX, maxY)
+    if (parseStrTag) {
+      if (!tagPress) {
+        updateContentStrings(lineContent, cursorX)
+      }
+      updateTerminalContent(lineContent, finalContentCursorX)
+    }
+    updateTerminalStateObject(cursorX, cursorY, isCrossRow)
+    sendTerminalStateToServer()
+
+    if (
+      shouldAutoScrollAfterTerminalStateUpdate({
+        isUserCall: userInputFlag.value,
+        shouldAutoScrollAfterWrite
+      })
+    ) {
+      scheduleScrollToBottom()
+    }
+
+    if (quickInit && pendingLs.value) {
+      const promptLine = getAbsLine1Based()
+      const block: LsBlock = {
+        startLine: pendingLs.value.startLine + 1,
+        endLine: Math.max(pendingLs.value.startLine + 1, promptLine - 1),
+        cwd: pendingLs.value.cwd,
+        cmd: pendingLs.value.cmd,
+        ts: pendingLs.value.ts
+      }
+      lsBlocks.value.push(block)
+      // memory control
+      if (lsBlocks.value.length > 200) lsBlocks.value.splice(0, lsBlocks.value.length - 200)
+      pendingLs.value = null
+    }
+  } catch (error) {
+    logger.error('Update terminal state error', { error: error })
+  }
+}
+
+const shouldSkipParseOnResize = (maxX: number, maxY: number): boolean => {
+  return cursorMaxX.value !== 0 && cursorMaxY.value !== 0 && (cursorMaxX.value !== maxX || cursorMaxY.value !== maxY)
+}
+
+const shouldRefreshCrossRow = (currentCursorEndY: number, cursorX: number): boolean => {
+  return currentCursorEndY < cursorEndY.value && currentCursorEndY !== 0 && cursorLastX.value === cursorX
+}
+
+const determineCrossRowStatus = (currentLine: any, cursorY: number, currentCursorEndY: number): boolean => {
+  if (currentLine.isWrapped) return true
+  if (!currentLine.isWrapped && cursorY !== currentCursorEndY) return true
+  if (terminalState.value.contentCrossRowStatus && cursorY === currentCursorEndY) return true
+  return false
+}
+
+const updateCursorStartPosition = (cursorX: number, quickInit: boolean): void => {
+  if (cursorStartX.value === 0 || quickInit) {
+    cursorStartX.value = cursorX
+  } else {
+    cursorStartX.value = Math.min(cursorStartX.value, cursorX)
+  }
+}
+
+const processLineContent = (
+  currentLine: any,
+  isCrossRow: boolean,
+  refreshCrossRow: boolean,
+  parseStrTag: boolean,
+  cursorX: number,
+  cursorY: number,
+  buffer: any,
+  contentCursorX: number
+) => {
+  let lineContent = currentLine.translateToString(true)
+  let finalContentCursorX = contentCursorX
+
+  if (isCrossRow) {
+    const crossRowData = processCrossRowContent(parseStrTag, refreshCrossRow, cursorX, cursorY, buffer)
+    lineContent = crossRowData.fullContent
+    finalContentCursorX = crossRowData.totalCharacterPosition
+    terminalState.value.contentCrossRowLines = crossRowData.crossRowLines
+    terminalState.value.contentCrossStartLine = crossRowData.crossStartLine
+    terminalState.value.contentCurrentCursorCrossRowLines = crossRowData.currentCursorCrossRowLines
+    cursorStartX.value = startStr.value.length
+  }
+
+  return { lineContent, finalContentCursorX }
+}
+
+const processCrossRowContent = (parseStrTag: boolean, refreshCrossRow: boolean, cursorX: number, cursorY: number, buffer: any) => {
+  const currentBufferLine = terminal.value?.buffer.active.baseY || 0
+  let { contentCrossRowLines: crossRowLines, contentCrossStartLine: crossStartLine } = terminalState.value
+  let { contentCurrentCursorCrossRowLines: currentCursorCrossRowLines } = terminalState.value
+  if ((crossStartLine === 0 && crossRowLines === 0) || (!parseStrTag && cursorY !== cursorLastY.value)) {
+    crossStartLine = getLogicalInputStartLine() - currentBufferLine
+  }
+  if (refreshCrossRow) {
+    crossStartLine = cursorY - currentCursorCrossRowLines + 1
+  }
+  if (crossRowLines === 0 || cursorY > cursorLastY.value || (!parseStrTag && cursorY !== cursorLastY.value)) {
+    crossRowLines = cursorEndY.value - crossStartLine + 1
+  }
+  currentCursorCrossRowLines = cursorY - crossStartLine + 1
+  let totalCharacterPosition = 0
+  let fullContent = ''
+  for (let i = 0; i < currentCursorCrossRowLines; i++) {
+    const lineIndex = currentBufferLine + crossStartLine + i
+    const lineContent = buffer.lines.get(lineIndex).translateToString(true)
+    if (i === currentCursorCrossRowLines - 1) {
+      totalCharacterPosition += cursorX
+    } else {
+      totalCharacterPosition += lineContent.length
+    }
+  }
+  for (let i = 0; i < crossRowLines; i++) {
+    const lineIndex = currentBufferLine + crossStartLine + i
+    const lineContent = buffer.lines.get(lineIndex).translateToString(true)
+    fullContent += lineContent
+  }
+  return {
+    fullContent,
+    totalCharacterPosition,
+    crossRowLines,
+    crossStartLine,
+    currentCursorCrossRowLines
+  }
+}
+
+const updateCursorHistory = (cursorX: number, cursorY: number, maxX: number, maxY: number): void => {
+  cursorLastY.value = cursorY
+  cursorLastX.value = cursorX
+  cursorMaxX.value = maxX
+  cursorMaxY.value = maxY
+}
+
+const updateContentStrings = (lineContent: string, cursorX: number): void => {
+  if (startStr.value !== '') {
+    const newStartStr = lineContent.substring(0, cursorStartX.value)
+    if (newStartStr !== startStr.value) {
+      cursorStartX.value = cursorX
+      startStr.value = lineContent.substring(0, cursorX)
+    }
+  } else {
+    beginStr.value = lineContent.substring(0, cursorStartX.value)
+  }
+}
+
+const updateTerminalContent = (lineContent: string, contentCursorX: number): void => {
+  terminalState.value.content = substrWidth(lineContent, cursorStartX.value)
+  terminalState.value.beforeCursor = substrWidth(lineContent, cursorStartX.value, contentCursorX)
+}
+
+const updateTerminalStateObject = (cursorX: number, cursorY: number, isCrossRow: boolean): void => {
+  terminalState.value.cursorPosition = { col: cursorX, row: cursorY }
+  terminalState.value.contentCrossRowStatus = isCrossRow
+}
+
+let sendTerminalStateTimer: ReturnType<typeof setTimeout> | null = null
+const sendTerminalStateToServer = (): void => {
+  if (sendTerminalStateTimer) return
+  sendTerminalStateTimer = setTimeout(async () => {
+    sendTerminalStateTimer = null
+    try {
+      await api.recordTerminalState({
+        id: connectionId.value,
+        state: {
+          cursorPosition: {
+            row: terminalState.value.cursorPosition.row,
+            col: terminalState.value.cursorPosition.col
+          },
+          beforeCursor: terminalState.value.beforeCursor,
+          content: terminalState.value.content
+        }
+      })
+    } catch (err) {
+      logger.error('Send terminal state error', { error: err })
+    }
+  }, 150)
+}
+
+function handleExternalInput(data) {
+  handleInput && handleInput(data)
+}
+
+const setupTerminalInput = () => {
+  if (!terminal.value) return
+
+  if (termOndata) {
+    termOndata.dispose()
+    termOndata = null
+  }
+  if (termOnBinary) {
+    termOnBinary?.dispose()
+    termOnBinary = null
+  }
+
+  handleInput = async (data) => {
+    if (startStr.value == '') {
+      startStr.value = beginStr.value
+    }
+
+    // Macro recording: capture input for macro recorder
+    const macroRecorder = useMacroRecorderStore()
+    if (macroRecorder.isRecording && macroRecorder.terminalId === props.currentConnectionId) {
+      macroRecorder.appendInput(props.currentConnectionId, data)
+      // Check if recording should auto-stop due to limits
+      const limitCheck = macroRecorder.checkLimits()
+      if (limitCheck.shouldStop) {
+        // Emit event to notify UI about auto-stop
+        eventBus.emit('macroRecordingLimitReached', { reason: limitCheck.reason })
+      }
+    }
+
+    // Intercept Delete/Backspace when suggestions are visible: clear and forward once to actually delete char
+    if (isDeleteKeyData(data) && displaySuggestions.value.length > 0) {
+      clearAllSuggestions()
+      // Avoid immediate re-query; user will continue typing
+      selectFlag.value = true
+      // Forward the delete/backspace to remote to actually remove character
+      sendData(data)
+      return
+    }
+    if (data === '\t') {
+      const cmd = JSON.parse(JSON.stringify(terminalState.value.content))
+      selectFlag.value = true
+      clearAllSuggestions()
+      setTimeout(() => {
+        queryCommand(cmd)
+      }, 100)
+    }
+    if (data === '\x03') {
+      if (displaySuggestions.value.length) {
+        clearAllSuggestions()
+      }
+      selectFlag.value = true
+      sendData(data)
+    } else if (data === '\x0c') {
+      if (displaySuggestions.value.length) {
+        clearAllSuggestions()
+      }
+      selectFlag.value = true
+      sendData(data)
+    } else if (data === '\x1b') {
+      selectFlag.value = true
+      if (contextmenu.value && typeof contextmenu.value.hide === 'function') {
+        contextmenu.value.hide()
+      }
+      if (displaySuggestions.value.length) {
+        clearAllSuggestions()
+        return
+      } else {
+        sendData(data)
+      }
+    } else if (data === '\x16') {
+      if (shouldSuppressCtrlVAfterNativePaste(lastNativePasteAt)) {
+        return
+      }
+      // Check if we're in vim mode (alternate mode)
+      if (terminalMode.value === 'alternate') {
+        // In vim mode, pass Ctrl+V to remote terminal for visual block mode
+        sendData(data)
+      } else {
+        // In normal mode, perform paste operation
+        navigator.clipboard
+          .readText()
+          .then((text) => {
+            sendData(text)
+            // Ensure scroll to bottom after paste
+            scheduleScrollToBottomAndFocus()
+          })
+          .catch(() => {})
+      }
+    } else if (data == '\r') {
+      if (!isConnected.value) {
+        prepareManualReconnectAttempt()
+        cusWrite?.('\r\n' + t('ssh.reconnecting') + '\r\n', { isUserCall: true })
+        connectSSH()
+        return
+      }
+      const cmd = terminalState.value.content
+      if (cmd && isListingCmd(cmd)) {
+        const ts = Date.now()
+        pendingLs.value = {
+          startLine: getAbsLine1Based(),
+          cmd: cmd.trim(),
+          ts,
+          cwd: null
+        }
+
+        api
+          .getCwd?.({ id: connectionId.value })
+          .then((res: any) => {
+            const cwd = res?.success ? (res.cwd ?? null) : null
+            // priority update pending
+            if (pendingLs.value && pendingLs.value.ts === ts) {
+              pendingLs.value.cwd = cwd
+              return
+            }
+
+            // Otherwise, update the already pushed lsBlocks to find the corresponding block based on ts
+            for (let i = lsBlocks.value.length - 1; i >= 0; i--) {
+              if (lsBlocks.value[i].ts === ts) {
+                lsBlocks.value[i].cwd = cwd
+                break
+              }
+            }
+          })
+          .catch(() => {
+            if (pendingLs.value && pendingLs.value.ts === ts) pendingLs.value.cwd = null
+          })
+      }
+      const command = terminalState.value.content
+      if (displaySuggestions.value.length && activeSuggestion.value >= 0) {
+        selectSuggestion(displaySuggestions.value[activeSuggestion.value])
+        // Ensure scroll to bottom
+        scheduleScrollToBottomAndFocus()
+        return
+      } else {
+        const delData = String.fromCharCode(127)
+        const aliasStore = aliasConfigStore()
+        const newCommand = resolveAliasExpansion(command, dbConfigStash.aliasStatus, aliasStore.getCommand)
+        if (newCommand) {
+          sendData(delData.repeat(command.length) + newCommand + '\r')
+        } else if (config.quickVimStatus === 1) {
+          // connectionSftpAvailable.value = await api.checkSftpConnAvailable(connectionId.value)
+          const vimMatch = command.match(/^\s*vim\s+(.+)$/i)
+          // Trigger condition: Applies to non-local connections.
+          // SFTP check reserved — vim editing will be implemented via SFTP.
+          if (vimMatch && connectionSftpAvailable.value && !connectionId.value.includes('local-team')) {
+            let vimData = data
+            if (vimMatch[1].startsWith('/')) {
+              vimData = delData.repeat(command.length) + 'echo "' + vimMatch[1] + '"  #Chaterm:vim  \r'
+            } else {
+              vimData = delData.repeat(command.length) + 'echo "$(pwd)/' + vimMatch[1] + '"  #Chaterm:vim  \r'
+            }
+            sendMarkedData(vimData, 'Chaterm:vim')
+          } else {
+            sendData(data)
+          }
+        } else {
+          sendData(data)
+        }
+      }
+      if (command && command.trim()) {
+        insertCommand(command)
+
+        // Detect vim command and set vim mode
+        const trimmedCommand = command.trim()
+        if (trimmedCommand.startsWith('vim ') || trimmedCommand === 'vim') {
+          // Delay setting vim mode, wait for vim to start
+          setTimeout(() => {
+            terminalMode.value = 'alternate'
+            // Clear the auto-completion box immediately when entering the vim mode.
+            clearAllSuggestions()
+          }, 500)
+        }
+      }
+      clearAllSuggestions()
+
+      // Ensure scroll to bottom and maintain focus
+      scheduleScrollToBottomAndFocus()
+    } else if (data === '\u001b[A') {
+      if (displaySuggestions.value.length && suggestionSelectionMode.value) {
+        if (data == '\u001b[A') {
+          // Up arrow key: cycle up navigation - only when in selection mode
+          if (activeSuggestion.value <= 0) {
+            activeSuggestion.value = displaySuggestions.value.length - 1
+          } else {
+            activeSuggestion.value -= 1
+          }
+        }
+      } else {
+        if (config.quickVimStatus === 1 && !connectionSftpAvailable.value && connectionId.value.includes('local-team')) {
+          sendMarkedData(data, 'Chaterm:[A')
+        } else {
+          sendData(data)
+        }
+      }
+    } else if (data === '\u001b[B') {
+      if (displaySuggestions.value.length && suggestionSelectionMode.value) {
+        if (data == '\u001b[B') {
+          // Down arrow key: cycle down navigation - only when in selection mode
+          if (activeSuggestion.value >= displaySuggestions.value.length - 1) {
+            activeSuggestion.value = 0
+          } else {
+            activeSuggestion.value += 1
+          }
+        }
+      } else {
+        if (config.quickVimStatus === 1 && !connectionSftpAvailable.value && connectionId.value.includes('local-team')) {
+          sendMarkedData(data, 'Chaterm:[B')
+        } else {
+          sendData(data)
+        }
+      }
+    } else if (data == '\u001b[C') {
+      // Right arrow key - enter selection mode or select suggestion
+      if (displaySuggestions.value.length) {
+        if (!suggestionSelectionMode.value) {
+          // Enter selection mode and select first item
+          suggestionSelectionMode.value = true
+          activeSuggestion.value = 0
+          // Prevent immediate query refresh which would reset selection mode
+          selectFlag.value = true
+        } else {
+          // Already in selection mode, select current suggestion
+          selectSuggestion(displaySuggestions.value[activeSuggestion.value])
+          selectFlag.value = true
+        }
+      } else {
+        sendData(data)
+      }
+    } else if (data == '\u001b[D') {
+      // Left arrow key - exit selection mode or pass through
+      if (displaySuggestions.value.length && suggestionSelectionMode.value) {
+        suggestionSelectionMode.value = false
+      } else {
+        sendData(data)
+      }
+    } else {
+      sendData(data)
+      selectFlag.value = false
+    }
+    if (!selectFlag.value) {
+      aiSuggestion.value = null
+      debouncedQueryCommand()
+    }
+  }
+  termOndata = terminal.value?.onData(handleInput)
+
+  termOnBinary = terminal.value?.onBinary((data) => {
+    sendBinaryData(data)
+  })
+}
+
+const sendDataAutoSwitchTerminal = (data) => {
+  if (props.connectData.asset_type === 'shell') {
+    api.sendDataLocal(connectionId.value, data)
+  } else if (props.connectData.asset_type === 'person-serial') {
+    api.sendDataSerial(connectionId.value, data)
+  } else {
+    api.writeToShell({
+      id: connectionId.value,
+      data: data.replace(/\r\n/g, '\n'),
+      lineCommand: terminalState.value.content,
+      isBinary: false
+    })
+  }
+}
+const sendData = (data) => {
+  tryPredictLocalEcho(data)
+  api.writeToShell({
+    id: connectionId.value,
+    data: data.replace(/\r\n/g, '\n'),
+    lineCommand: terminalState.value.content,
+    isBinary: false
+  })
+}
+
+const sendBinaryData = (data) => {
+  api.writeToShell({
+    id: connectionId.value,
+    data: data,
+    lineCommand: terminalState.value.content,
+    isBinary: true
+  })
+}
+
+const sendMarkedData = (data, marker) => {
+  // Local terminal doesn't support markers, use sendDataLocal instead
+  if (props.connectData.asset_type === 'shell') {
+    // For local connections, we need to handle markers on the frontend
+    // If this is a command marker, set up output collection
+    if (marker && (marker === 'Chaterm:command' || marker?.startsWith('Chaterm:command:'))) {
+      isCollectingOutput.value = true
+      const tabId = commandMarkerToTabId.value.get(marker) ?? commandMarkerToTabId.value.get('Chaterm:command') ?? undefined
+      currentCommandMarker.value = marker
+      currentCommandTabId.value = tabId
+      commandOutput.value = '' // Reset output buffer
+      // Save command content for local terminal as well
+      if (!commandMarkerToCommand.value.has(marker)) {
+        commandMarkerToCommand.value.set(marker, data)
+      }
+    }
+    api.sendDataLocal(connectionId.value, data)
+  } else if (props.connectData.asset_type === 'person-serial') {
+    // Serial consoles have no marker concept; send raw.
+    api.sendDataSerial(connectionId.value, data)
+  } else {
+    api.writeToShell({
+      id: connectionId.value,
+      data: data,
+      marker: marker,
+      lineCommand: terminalState.value.content,
+      isBinary: false
+    })
+  }
+}
+
+export interface MarkedResponse {
+  data: string
+  raw: Buffer[]
+  marker?: string
+}
+
+const ZMODEM_MAGIC = '**\x18B'
+
+const getCurrentLineForLocalEcho = (): string => {
+  const activeBuffer = terminal.value?.buffer?.active
+  const absoluteCursorLine = (activeBuffer?.baseY ?? 0) + (activeBuffer?.cursorY ?? 0)
+  const line = activeBuffer?.getLine(absoluteCursorLine)
+  return line?.translateToString(true) || ''
+}
+
+const tryPredictLocalEcho = (data: string): void => {
+  if (isLocalConnect.value || props.connectData.asset_type === 'person-serial' || data.includes(ZMODEM_MAGIC)) {
+    return
+  }
+
+  localEcho.predict(data, {
+    isConnected: isConnected.value,
+    terminalMode: terminalMode.value,
+    isPaste: pasteFlag.value,
+    currentLine: getCurrentLineForLocalEcho()
+  })
+}
+
+const prepareIncomingShellResponse = (response: MarkedResponse): MarkedResponse | null => {
+  if (!response?.data || typeof response.data !== 'string' || response.data.includes(ZMODEM_MAGIC)) {
+    return response
+  }
+
+  const data = localEcho.reconcile(response.data)
+  if (!data) {
+    return null
+  }
+
+  return data === response.data ? response : { ...response, data }
+}
+
+const matchPattern = (data: number[], pattern: number[]): boolean => {
+  if (data.length < pattern.length) return false
+  for (let i = data.length - pattern.length; i >= Math.max(0, data.length - 500); i--) {
+    let match = true
+    for (let j = 0; j < pattern.length; j++) {
+      if (data[i + j] !== pattern[j]) {
+        match = false
+        break
+      }
+    }
+    if (match) return true
+  }
+  return false
+}
+
+type TerminalMode = 'none' | 'alternate' | 'ui'
+const terminalMode = ref<TerminalMode>('none')
+
+// Listen for terminalMode changes and notify preload to update vim mode state
+watch(
+  terminalMode,
+  (newMode) => {
+    if (newMode !== 'none') {
+      localEcho.reset()
+    }
+    const isVimMode = newMode === 'alternate'
+    window.postMessage(
+      {
+        type: 'VIM_MODE_UPDATE',
+        isVimMode
+      },
+      '*'
+    )
+  },
+  { immediate: true }
+)
+
+// Reload OS info and re-register inputManager when connectionId changes (e.g., reconnect)
+watch(connectionId, (newId, oldId) => {
+  cachedOsInfoLoaded.value = false
+  cachedOsInfo.value = undefined
+  if (oldId && newId && oldId !== newId) {
+    inputManager.unregisterInstances(oldId)
+    inputManager.registerInstances(
+      {
+        termOndata: handleExternalInput
+      },
+      newId
+    )
+  }
+})
+
+const checkFullScreenClear = (data: string) => {
+  const isSimpleCtrlL = data.includes('\x1b[H\x1b[2J')
+  if (isSimpleCtrlL) return false
+  return CLEAR_SCREEN_PATTERNS.some((pattern) => pattern.test(data))
+}
+
+const checkHeavyUiStyle = (data: string) => {
+  const moveCount = (data.match(HEAVY_UI_MOVE_RE) || []).length
+  const clearCount = (data.match(HEAVY_UI_CLEAR_RE) || []).length
+  const hasTable = HEAVY_UI_TABLE_RE.test(data) || HEAVY_UI_SEPARATOR_RE.test(data)
+
+  return moveCount >= 5 && clearCount >= 5 && hasTable
+}
+
+const BUFFER_SIZE = 1024
+const checkEditorMode = (response: MarkedResponse) => {
+  if (response.marker === 'Chaterm:command') {
+    return
+  }
+  let bytes: number[] = []
+
+  if (response.data) {
+    if (typeof response.data === 'string') bytes = Array.from(new TextEncoder().encode(response.data))
+    else if ((response.data as any) instanceof ArrayBuffer) bytes = Array.from(new Uint8Array(response.data as any))
+    else if ((response.data as any) instanceof Uint8Array) bytes = Array.from(response.data as any)
+    else if (Array.isArray(response.data)) bytes = response.data
+  }
+
+  if (bytes.length === 0) return
+
+  // Keep only the most recent 1024 bytes
+  dataBuffer.value = bytes.length > BUFFER_SIZE ? bytes.slice(-BUFFER_SIZE) : bytes
+
+  const text = new TextDecoder().decode(new Uint8Array(dataBuffer.value))
+
+  if (terminalMode.value === 'none') {
+    if (EDITOR_SEQUENCES.enter.some((seq) => matchPattern(dataBuffer.value, seq.pattern))) {
+      terminalMode.value = 'alternate'
+      // Clear the auto-completion box immediately when entering the vim mode.
+      clearAllSuggestions()
+      nextTick(handleResize)
+      return
+    }
+
+    // More lenient vim detection: check if it contains common vim entry sequences
+    // But exclude systemctl and other system commands that might use similar sequences
+
+    // Don't enter alternate mode if we detect shell prompt or exit sequences
+    // These are typically from system commands returning to shell
+    if (
+      !text.includes('$ ') &&
+      !text.includes('# ') &&
+      !text.includes('~$') &&
+      !text.includes('\x1b[?1l') &&
+      !text.includes('\x1b[?2004h') &&
+      (text.includes('\x1b[?1049h') ||
+        text.includes('\x1b[?47h') ||
+        text.includes('\x1b[?1047h') ||
+        text.includes('\x1b[?25h') ||
+        text.includes('\x1b[?25l') ||
+        text.includes('\x1b[?1h') ||
+        text.includes('\x1b[?1l'))
+    ) {
+      terminalMode.value = 'alternate'
+      // Clear the auto-completion box immediately when entering the vim mode.
+      clearAllSuggestions()
+      nextTick(handleResize)
+      return
+    }
+
+    // Detect vim-specific sequence combinations
+    if (text.includes('\x1b[?25h') && (text.includes('All') || text.includes('H'))) {
+      terminalMode.value = 'alternate'
+      // Clear the auto-completion box immediately when entering the vim mode.
+      clearAllSuggestions()
+      nextTick(handleResize)
+      return
+    }
+  }
+
+  if (terminalMode.value === 'alternate') {
+    // Only exit vim mode when shell prompt is clearly detected
+    const lines = text.split('\n')
+    const lastLine = lines[lines.length - 1] || ''
+    const secondLastLine = lines[lines.length - 2] || ''
+
+    // Check for typical shell prompt patterns using unified prompt detection
+    // Check both last line and second last line (in case prompt appears across boundaries)
+    const hasShellPrompt = isTerminalPromptLine(lastLine) || isTerminalPromptLine(secondLastLine)
+
+    if (hasShellPrompt) {
+      terminalMode.value = 'none'
+      dataBuffer.value = []
+      nextTick(handleResize)
+      return
+    }
+  }
+
+  if (terminalMode.value === 'none') {
+    if (checkFullScreenClear(text) || checkHeavyUiStyle(text)) {
+      terminalMode.value = 'ui'
+      nextTick(handleResize)
+      return
+    }
+  }
+
+  if (terminalMode.value === 'ui') {
+    let score = 0
+    if (text.includes('\x1b[?2004h')) score += 2
+    if (text.includes('\x1b[?1034h')) score += 2
+    if (text.includes('\x1b]0;') && text.includes('\x07')) score += 1
+    const commonJumps = ['\x1b[23;1H', '\x1b[39;1H', '\x1b[11;1H']
+    const cursorGone = !commonJumps.some((seq) => text.includes(seq))
+    if (cursorGone) score += 1
+    if (score >= 3) {
+      terminalMode.value = 'none'
+      dataBuffer.value = []
+      nextTick(handleResize)
+      return
+    }
+  }
+}
+
+const handleServerOutput = (response: MarkedResponse) => {
+  let data = response.data
+
+  if (response.marker === 'Chaterm:vim') {
+    const { lastLine: lastLine, filePath: filePath, contentType: contentType } = parseVimLine(data)
+    createEditor(filePath, contentType)
+    sendMarkedData('history -s "vim ' + filePath + '"' + '\r', 'Chaterm:history')
+    data = lastLine
+    cusWrite?.(data)
+  } else if (response.marker === 'Chaterm:save' || response.marker === 'Chaterm:history' || response.marker === 'Chaterm:pass') {
+  } else if (response.marker === 'Chaterm:[A') {
+    if (data.indexOf('Chaterm:vim') !== -1) {
+      cusWrite?.(data)
+      sendData(String.fromCharCode(21))
+      sendMarkedData(String.fromCharCode(27, 91, 65), 'Chaterm:[A')
+    } else {
+      cusWrite?.(data)
+    }
+  } else if (response.marker === 'Chaterm:[B') {
+    if (data.indexOf('Chaterm:vim') !== -1) {
+      cusWrite?.(data)
+      sendData(String.fromCharCode(21))
+      sendMarkedData(String.fromCharCode(27, 91, 64), 'Chaterm:[B')
+    } else {
+      cusWrite?.(data)
+    }
+  } else if (response.marker === 'Chaterm:command' || response.marker?.startsWith('Chaterm:command:')) {
+    isCollectingOutput.value = true
+
+    const tabId = commandMarkerToTabId.value.get(response.marker) ?? commandMarkerToTabId.value.get('Chaterm:command') ?? undefined
+
+    // Save current command marker and tabId
+    currentCommandMarker.value = response.marker
+    currentCommandTabId.value = tabId
+
+    handleCommandOutput(data, true)
+  } else if (isCollectingOutput.value) {
+    handleCommandOutput(data, false)
+  } else {
+    cusWrite?.(data)
+  }
+}
+
+// Helper function to remove command echo from output lines using exact command matching
+const removeCommandEcho = (outputLines: string[], command: string, isPowerShell: boolean): string[] => {
+  if (!command || outputLines.length === 0) {
+    return outputLines
+  }
+
+  // Split command into lines and filter empty lines
+  const commandLines = command.split(/\r?\n/).filter((l) => l.trim())
+
+  if (commandLines.length === 0) {
+    return outputLines
+  }
+
+  // Clean command lines: remove ANSI sequences
+  const cleanCommandLines = commandLines.map((l) => stripAnsiBasic(l).trim())
+
+  const result: string[] = []
+  let removedCount = 0
+  const maxRemovals = cleanCommandLines.length
+  // Only check the beginning of output (first N lines where N = command line count)
+  const checkLimit = Math.min(outputLines.length, maxRemovals + 5) // Add small buffer for safety
+
+  // Extract actual command from wrapped commands (e.g., "powershell -Command "..."")
+  // This handles cases where the command is wrapped but PowerShell echoes the inner command
+  const extractActualCommand = (cmd: string): string => {
+    // Check for powershell -Command "..." pattern
+    const powershellMatch = cmd.match(/^powershell\s+-Command\s+"(.+)"\s*$/s)
+    if (powershellMatch && powershellMatch[1]) {
+      return powershellMatch[1].trim()
+    }
+
+    // Check for pwsh -Command "..." pattern
+    const pwshMatch = cmd.match(/^pwsh\s+-Command\s+"(.+)"\s*$/s)
+    if (pwshMatch && pwshMatch[1]) {
+      return pwshMatch[1].trim()
+    }
+
+    // Check for cmd /c "..." pattern
+    const cmdMatch = cmd.match(/^cmd\s+\/c\s+"(.+)"\s*$/s)
+    if (cmdMatch && cmdMatch[1]) {
+      return cmdMatch[1].trim()
+    }
+
+    return cmd
+  }
+
+  // Extract actual commands from each line
+  const actualCommandLines = cleanCommandLines.map(extractActualCommand)
+
+  // Normalize command for comparison: join all command lines and normalize whitespace
+  const normalizedCommand = actualCommandLines.join(' ').replace(/\s+/g, ' ').trim()
+  const normalizedOriginalCommand = cleanCommandLines.join(' ').replace(/\s+/g, ' ').trim()
+
+  // Helper function to process backspace characters (simulate terminal behavior)
+  // Backspace (\x08 or \b) should delete the previous character, not just be removed
+  const processBackspaces = (str: string): string => {
+    const result: string[] = []
+    for (let i = 0; i < str.length; i++) {
+      const char = str[i]
+      // Handle both \x08 (backspace) and \b (backspace escape sequence)
+      if (char === '\x08' || char === '\b') {
+        // Backspace: remove last character from result
+        if (result.length > 0) {
+          result.pop()
+        }
+      } else {
+        result.push(char)
+      }
+    }
+    return result.join('')
+  }
+
+  // Strategy: Search for command key parts in output, then remove everything before the command
+  // This handles cases where command has prefixes, typos, or is duplicated
+  let commandEndLineIndex = -1
+
+  // Try to find command in output by searching for key parts
+  // Method 1: Search for command suffix (last 80-100 characters, more reliable)
+  const searchSuffixLength = Math.min(100, Math.max(50, normalizedCommand.length * 0.3))
+  const commandSuffix = normalizedCommand.substring(Math.max(0, normalizedCommand.length - searchSuffixLength))
+
+  // Method 2: Also try original command suffix
+  const originalCommandSuffix = normalizedOriginalCommand.substring(Math.max(0, normalizedOriginalCommand.length - searchSuffixLength))
+
+  // Join all output lines for searching
+  const allOutputText = outputLines
+    .map((line) => {
+      let cleanLine = stripAnsiExtended(line)
+      cleanLine = processBackspaces(cleanLine)
+      return cleanLine.replace(/\s+/g, ' ').trim()
+    })
+    .join(' ')
+
+  // Search for command suffix in output
+  const normalizedOutputText = allOutputText.replace(/\s+/g, ' ')
+  let searchIndex = -1
+
+  // Try searching for normalized command suffix first (more specific)
+  if (commandSuffix.length >= 30) {
+    searchIndex = normalizedOutputText.indexOf(commandSuffix)
+    if (searchIndex >= 0) {
+    }
+  }
+
+  // If not found, try original command suffix
+  if (searchIndex < 0 && originalCommandSuffix.length >= 30) {
+    searchIndex = normalizedOutputText.indexOf(originalCommandSuffix)
+    if (searchIndex >= 0) {
+    }
+  }
+
+  // If found, calculate which line contains the command end
+  if (searchIndex >= 0) {
+    // Find the line that contains the command end
+    let currentPos = 0
+    for (let i = 0; i < outputLines.length; i++) {
+      let cleanLine = stripAnsiExtended(outputLines[i])
+      cleanLine = processBackspaces(cleanLine)
+      const normalizedLine = cleanLine.replace(/\s+/g, ' ').trim()
+
+      // Check if this line contains the command suffix
+      if (normalizedLine.includes(commandSuffix) || normalizedLine.includes(originalCommandSuffix)) {
+        // Find the position of command end in this line
+        const suffixIndex = Math.max(
+          normalizedLine.indexOf(commandSuffix) >= 0 ? normalizedLine.indexOf(commandSuffix) + commandSuffix.length : -1,
+          normalizedLine.indexOf(originalCommandSuffix) >= 0 ? normalizedLine.indexOf(originalCommandSuffix) + originalCommandSuffix.length : -1
+        )
+        if (suffixIndex >= 0) {
+          // Command ends at this position in this line
+          commandEndLineIndex = i
+
+          // Store the position where command ends for later processing
+          // We'll extract the content after command in the processing loop
+          break
+        }
+      }
+
+      currentPos += normalizedLine.length + 1 // +1 for space separator
+      if (currentPos > searchIndex) {
+        // We've passed the search index, command should be in previous or current line
+        commandEndLineIndex = i
+        break
+      }
+    }
+  }
+
+  for (let i = 0; i < outputLines.length; i++) {
+    const line = outputLines[i]
+    // Clean the line for comparison - remove ANSI sequences first, then process backspaces
+    // This ensures backspace only affects visible characters, not ANSI control sequences
+    let cleanLine = stripAnsiExtended(line)
+    // Now process backspaces on the cleaned line (only visible characters remain)
+    cleanLine = processBackspaces(cleanLine)
+    cleanLine = cleanLine.trim()
+
+    // Only attempt to match in the beginning of output
+    if (i < checkLimit && removedCount < maxRemovals) {
+      // Check if this line matches any command line
+      let matchesCommand = false
+
+      // First, try exact line-by-line matching (both original and extracted commands)
+      for (let i = 0; i < cleanCommandLines.length; i++) {
+        const cmdLine = cleanCommandLines[i]
+        const actualCmdLine = actualCommandLines[i]
+
+        // Exact match with original command line
+        if (cleanLine === cmdLine) {
+          matchesCommand = true
+          break
+        }
+
+        // Exact match with extracted actual command line
+        if (actualCmdLine && cleanLine === actualCmdLine) {
+          matchesCommand = true
+          break
+        }
+
+        // For PowerShell, handle prompt prefix
+        if (isPowerShell) {
+          // Remove PowerShell prompt prefix (e.g., "PS C:\Users\test> ")
+          const withoutPrompt = cleanLine.replace(/^PS\s+[A-Za-z]:[\\\/][^>]*>\s*/, '')
+          if (withoutPrompt === cmdLine || (actualCmdLine && withoutPrompt === actualCmdLine)) {
+            matchesCommand = true
+            break
+          }
+          // Also try matching without any leading prompt-like patterns
+          const withoutAnyPrompt = cleanLine.replace(/^[A-Za-z]:[\\\/][^>]*>\s*/, '')
+          if (withoutAnyPrompt === cmdLine || (actualCmdLine && withoutAnyPrompt === actualCmdLine)) {
+            matchesCommand = true
+            break
+          }
+        }
+      }
+
+      // If line-by-line matching failed, try matching against normalized full command
+      // This handles cases where command is displayed as a single line in output
+      if (!matchesCommand && (normalizedCommand.length > 0 || normalizedOriginalCommand.length > 0)) {
+        // Normalize the output line: remove prompt and normalize whitespace
+        let normalizedLine = cleanLine
+        if (isPowerShell) {
+          normalizedLine = normalizedLine.replace(/^PS\s+[A-Za-z]:[\\\/][^>]*>\s*/, '')
+          normalizedLine = normalizedLine.replace(/^[A-Za-z]:[\\\/][^>]*>\s*/, '')
+        }
+        normalizedLine = normalizedLine.replace(/\s+/g, ' ').trim()
+
+        // Remove duplicate patterns that might result from backspace processing issues
+        // Pattern 1: "Get-PSDrive -PSGet-PSDrive" -> "Get-PSDrive"
+        // Match: word, then space, then dash + prefix + same word
+        normalizedLine = normalizedLine.replace(/\b([A-Za-z0-9_-]+)\s+-[A-Z]+(\1)\b/g, '$1')
+        // Pattern 2: "Get-PSGet-PSDrive" -> "Get-PSDrive" (duplicate in the middle)
+        normalizedLine = normalizedLine.replace(/([A-Za-z0-9_-]+)\1([A-Za-z0-9_-]+)/g, '$1$2')
+        // Pattern 3: Simple word-level deduplication for obvious duplicates
+        // "Get-PSDrive -PSGet-PSDrive" -> "Get-PSDrive"
+        const words = normalizedLine.split(/\s+/)
+        const deduplicatedWords: string[] = []
+        for (let j = 0; j < words.length; j++) {
+          const word = words[j]
+          if (j > 0 && deduplicatedWords.length > 0) {
+            const prevWord = deduplicatedWords[deduplicatedWords.length - 1]
+            // Check if current word is like "-PSGet-PSDrive" and previous is "Get-PSDrive"
+            const prefixMatch = word.match(/^-[A-Z]+(.+)$/)
+            if (prefixMatch && prefixMatch[1] === prevWord) {
+              // Skip this duplicate word
+              continue
+            }
+          }
+          deduplicatedWords.push(word)
+        }
+        normalizedLine = deduplicatedWords.join(' ')
+
+        // Try matching against both original and extracted commands
+        const commandsToTry = [normalizedCommand, normalizedOriginalCommand].filter((c) => c.length > 0)
+
+        // Also try to extract command from normalizedLine if it contains wrapper prefixes
+        let extractedLineCommand = normalizedLine
+        const powershellWrapperMatch = normalizedLine.match(/powershell\s+-Command\s+"(.+?)"\s*$/s)
+        if (powershellWrapperMatch && powershellWrapperMatch[1]) {
+          extractedLineCommand = powershellWrapperMatch[1].trim().replace(/\s+/g, ' ')
+        } else {
+          const pwshWrapperMatch = normalizedLine.match(/pwsh\s+-Command\s+"(.+?)"\s*$/s)
+          if (pwshWrapperMatch && pwshWrapperMatch[1]) {
+            extractedLineCommand = pwshWrapperMatch[1].trim().replace(/\s+/g, ' ')
+          } else {
+            const cmdWrapperMatch = normalizedLine.match(/cmd\s+\/c\s+"(.+?)"\s*$/s)
+            if (cmdWrapperMatch && cmdWrapperMatch[1]) {
+              extractedLineCommand = cmdWrapperMatch[1].trim().replace(/\s+/g, ' ')
+            }
+          }
+        }
+
+        // Add extracted command to commands to try
+        if (extractedLineCommand !== normalizedLine && extractedLineCommand.length > 0) {
+          commandsToTry.push(extractedLineCommand)
+        }
+
+        for (const cmdToMatch of commandsToTry) {
+          // Check if normalized line matches normalized command (exact match only)
+          // Also check if line starts with the command (to handle cases where command is at the start)
+          if (normalizedLine === cmdToMatch || normalizedLine.startsWith(cmdToMatch + ' ')) {
+            matchesCommand = true
+            break
+          }
+
+          // Check if normalized line contains the command (for cases where command is embedded)
+          if (!matchesCommand && normalizedLine.includes(cmdToMatch)) {
+            // Only match if the command appears at the start or after a wrapper prefix
+            const cmdIndex = normalizedLine.indexOf(cmdToMatch)
+            const beforeCmd = normalizedLine.substring(0, cmdIndex).trim()
+            // Check if command is at start, or after common wrapper prefixes
+            if (
+              cmdIndex === 0 ||
+              beforeCmd === '' ||
+              beforeCmd.endsWith('powershell -Command "') ||
+              beforeCmd.endsWith('pwsh -Command "') ||
+              beforeCmd.endsWith('cmd /c "') ||
+              /^(powershell|pwsh|cmd)\s+/.test(beforeCmd)
+            ) {
+              matchesCommand = true
+              break
+            }
+          }
+
+          // Additional check: handle cases where output line might have duplicate characters
+          // (e.g., "GGet-WmiObject" should match "Get-WmiObject")
+          // Only apply this if the line is very similar to the command (length difference <= 2)
+          if (!matchesCommand && Math.abs(normalizedLine.length - cmdToMatch.length) <= 2) {
+            // Try to find and remove duplicate characters at the start
+            // Pattern: repeated first character (e.g., "GGet" -> "Get")
+            const deduplicatedLine = normalizedLine.replace(/^([A-Za-z])\1+/, '$1')
+            if (deduplicatedLine === cmdToMatch || deduplicatedLine.startsWith(cmdToMatch + ' ')) {
+              matchesCommand = true
+              break
+            }
+          }
+
+          // Additional check: try partial matching if commands are similar
+          // This handles cases where the command in output might be slightly different
+          if (!matchesCommand && cmdToMatch.length > 20) {
+            // Try matching the first significant part of the command (first 50 chars)
+            const cmdPrefix = cmdToMatch.substring(0, 50)
+            const linePrefix = normalizedLine.substring(0, 50)
+            if (linePrefix === cmdPrefix && normalizedLine.length >= cmdToMatch.length * 0.8) {
+              matchesCommand = true
+              break
+            }
+          }
+        }
+
+        // Also check if extracted command from line matches any of the commands to try
+        if (!matchesCommand && extractedLineCommand !== normalizedLine && extractedLineCommand.length > 0) {
+          for (const cmdToMatch of [normalizedCommand, normalizedOriginalCommand].filter((c) => c.length > 0)) {
+            if (extractedLineCommand === cmdToMatch || extractedLineCommand.startsWith(cmdToMatch + ' ')) {
+              matchesCommand = true
+              break
+            }
+          }
+        }
+      }
+
+      if (matchesCommand) {
+        removedCount++
+        continue // Skip this line
+      }
+    }
+
+    // If we found command via suffix search, handle removal carefully
+    if (commandEndLineIndex >= 0 && i <= commandEndLineIndex) {
+      if (i < commandEndLineIndex) {
+        // Remove lines before the command line completely
+        removedCount++
+        continue // Skip this line
+      } else if (i === commandEndLineIndex) {
+        // This is the line containing the command
+        // Try to extract content after the command
+        const normalizedLine = cleanLine.replace(/\s+/g, ' ').trim()
+        const suffixIndex = Math.max(
+          normalizedLine.indexOf(commandSuffix) >= 0 ? normalizedLine.indexOf(commandSuffix) + commandSuffix.length : -1,
+          normalizedLine.indexOf(originalCommandSuffix) >= 0 ? normalizedLine.indexOf(originalCommandSuffix) + originalCommandSuffix.length : -1
+        )
+
+        if (suffixIndex >= 0) {
+          // Find the position in the original line where command ends
+          // This is approximate - we'll try to find the content after command in the original line
+          const contentAfterCommand = normalizedLine.substring(suffixIndex).trim()
+
+          // Check if there's meaningful output after command
+          // Look for patterns like numbers, colons, or actual text (not just quotes/braces)
+          const hasOutputAfterCommand =
+            contentAfterCommand.length > 0 &&
+            !/^["'}\s]*$/.test(contentAfterCommand) &&
+            (/\d/.test(contentAfterCommand) || /[:：]/.test(contentAfterCommand) || contentAfterCommand.length > 10)
+
+          if (hasOutputAfterCommand) {
+            // Try to extract the output part from the original line
+            // Find the command suffix in the original line and get what comes after
+            const originalCleanLine = stripAnsiExtended(line)
+            const processedOriginalLine = processBackspaces(originalCleanLine)
+            const normalizedOriginalLine = processedOriginalLine.replace(/\s+/g, ' ').trim()
+
+            // Find command suffix in normalized line to get the position
+            const cmdSuffixInLine =
+              normalizedOriginalLine.indexOf(commandSuffix) >= 0
+                ? normalizedOriginalLine.indexOf(commandSuffix) + commandSuffix.length
+                : normalizedOriginalLine.indexOf(originalCommandSuffix) >= 0
+                  ? normalizedOriginalLine.indexOf(originalCommandSuffix) + originalCommandSuffix.length
+                  : -1
+
+            if (cmdSuffixInLine >= 0) {
+              // Extract content after command suffix
+              // Map back to original line position (approximate)
+              // Find the suffix in the processed line and get what comes after
+              const suffixInProcessed =
+                processedOriginalLine.indexOf(commandSuffix) >= 0
+                  ? processedOriginalLine.indexOf(commandSuffix) + commandSuffix.length
+                  : processedOriginalLine.indexOf(originalCommandSuffix) >= 0
+                    ? processedOriginalLine.indexOf(originalCommandSuffix) + originalCommandSuffix.length
+                    : -1
+
+              if (suffixInProcessed >= 0) {
+                // Get content after command suffix, but skip closing quotes/braces
+                let extractedOutput = processedOriginalLine.substring(suffixInProcessed).trim()
+                // Remove leading quotes, closing braces, etc.
+                extractedOutput = extractedOutput.replace(/^["'}\s]+/, '').trim()
+
+                if (extractedOutput.length > 0) {
+                  result.push(extractedOutput)
+                  removedCount++
+                  continue
+                }
+              }
+            }
+          }
+        }
+
+        // If we can't extract output, remove the entire line
+        removedCount++
+        continue // Skip this line
+      }
+    }
+
+    result.push(line)
+  }
+
+  return result
+}
+
+// Helper function to handle command output processing
+const handleCommandOutput = (data: string, isInitialCommand: boolean) => {
+  // Enhanced ANSI sequence cleaning for Windows PowerShell
+  const cleanWindowsOutput = (rawData: string): string => {
+    let cleaned = rawData
+
+    // Remove OSC window title sequences FIRST (before any control-char stripping),
+    // so ESC is not removed and break the sequence. Handle both full and split sequences.
+    cleaned = cleaned
+      // Full OSC 0 (window title): \x1b]0;...\x07
+      .replace(/\x1b\]0;[^\x07]*\x07/g, '')
+      // Full OSC 9 (PowerShell)
+      .replace(/\x1b\]9;[^\x07]*\x07/g, '')
+      // When ]0; or ]9; is followed by single-quote (CMD error format "'cmd' 不是内部或外部命令"), strip only the ]0; prefix so we keep the error message
+      .replace(/\]0;(?=')/g, '')
+      .replace(/\]9;(?=')/g, '')
+      // Orphaned OSC (ESC already stripped or sequence split across chunks): ]0;... or ]9;... up to BEL or newline
+      .replace(/\]0;[^\x07\n\r]*\x07?/g, '')
+      .replace(/\]9;[^\x07\n\r]*\x07?/g, '')
+
+    // Remove PowerShell specific error/command tracking sequences
+    cleaned = cleaned
+      .replace(/\[[^\]]*\]\d+;[^;]*;[^;]*;?/g, '')
+      .replace(/\[[^\]]*\]\d+[;:][^;\n\r]*;?/g, '')
+      .replace(/\b\d+;[^;]*;[^;]*;?\b/g, '')
+
+    // Standard ANSI cleaning (Hf cursor position -> remove only, to avoid double newlines with \r\n)
+    cleaned = cleaned
+      .replace(/\x1b\[[0-9;]*m/g, '')
+      .replace(/\x1b\[[0-9;]*[ABCDEFGJKST]/g, '')
+      .replace(/\x1b\[[0-9]*[XK]/g, '')
+      .replace(/\x1b\[[0-9;]*[Hf]/g, '')
+      .replace(/\x1b\[[?][0-9;]*[hl]/g, '')
+      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .replace(/\r\n/g, '\n')
+      .replace(/\r/g, '\n')
+
+    return cleaned
+  }
+
+  // Apply appropriate cleaning based on the terminal type
+  let cleanOutput = data
+
+  // Strip OSC sequences (e.g. window title \x1b]0;C:\...\x07) before Windows check,
+  // so Linux SSH output with C:\ in terminal title does not trigger cleanWindowsOutput
+  const dataForWindowsCheck = data.replace(/\x1b\]0;[^\x07]*\x07/g, '').replace(/\x1b\]9;[^\x07]*\x07/g, '')
+
+  // Windows path must be at word boundary (e.g. C:\ or PS C:\) so that Linux
+  // patterns like "ubuntu:/home/..." (o:/) are not mistaken for Windows
+  const hasWinPath = /\b[A-Za-z]:[\\\/]/.test(dataForWindowsCheck)
+  const hasPSPrompt = /PS\s+[A-Za-z]:/.test(dataForWindowsCheck)
+  const hasBackslash = dataForWindowsCheck.includes('\\')
+  const looksLikeWindows = hasPSPrompt || hasWinPath || hasBackslash
+
+  if (looksLikeWindows) {
+    cleanOutput = cleanWindowsOutput(data)
+  } else {
+    // For non-Windows, just do basic line ending normalization
+    cleanOutput = data.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  }
+
+  commandOutput.value += cleanOutput
+
+  const accumulatedLen = commandOutput.value.length
+
+  // Detect SSH command prompt to determine if command output has ended
+  const accumulatedOutput = commandOutput.value
+  const lastNonEmptyLine = getLastNonEmptyLine(accumulatedOutput)
+
+  // On Windows local shell: PowerShell/CMD use "PS C:\path>" or "C:\path>", never "$"; Git Bash uses "$".
+  // Lone "$" with very little output is likely PowerShell variable (e.g. $totalMemory) at start of command - ignore.
+  // Lone "$" with substantial output could be Git Bash prompt - allow it.
+  // Git Bash output contains MINGW64/MSYS - if seen, lone "$" is a real prompt, do not ignore.
+  const isWindowsLocalShell = props.connectData?.asset_type === 'shell' && navigator.platform.toLowerCase().includes('win')
+  const isLoneDollarPrompt = /^\s*\$\s*$/.test(lastNonEmptyLine || '')
+  const tooLittleOutput = accumulatedLen < 150
+  const isGitBash = /MINGW(64|32)|MSYS/.test(accumulatedOutput)
+  const shouldIgnorePrompt = isWindowsLocalShell && isLoneDollarPrompt && tooLittleOutput && !isGitBash
+
+  if (lastNonEmptyLine && isTerminalPromptLine(lastNonEmptyLine) && !shouldIgnorePrompt) {
+    const tabId = currentCommandTabId.value
+    const marker = currentCommandMarker.value
+    const sentCommand = marker ? commandMarkerToCommand.value.get(marker) : null
+    const isWindowsLocal =
+      props.connectData?.asset_type === 'shell' && (/^[A-Za-z]:[\\\/].*?>\s*$/.test(lastNonEmptyLine) || /^PS\s+[A-Za-z]:/.test(lastNonEmptyLine))
+
+    const doProcessOutput = () => {
+      const outputText = commandOutput.value
+      const lines = outputText.replace(/\r\n|\r/g, '\n').split('\n')
+
+      // Detect terminal type: Windows (PowerShell/CMD) vs Linux/Git Bash Windows (PowerShell/CMD) vs Linux/Git Bash
+      type TerminalType = 'windows' | 'linux' | 'unknown'
+
+      function detectTerminalType(lines: string[], lastNonEmptyLine: string, sentCommand: string | null): TerminalType {
+        // 1. Check prompt patterns (most reliable)
+        if (lastNonEmptyLine) {
+          const trimmed = lastNonEmptyLine.trim()
+          // Windows PowerShell/CMD prompt
+          if (/^PS\s+[A-Za-z]:[\\\/]/.test(trimmed) || /^[A-Za-z]:[\\\/].*?>\s*$/.test(trimmed)) {
+            return 'windows'
+          }
+          // Linux/Git Bash prompt (including MINGW64/MINGW32/MSYS)
+          if (
+            /^[$#]\s*$/.test(trimmed) ||
+            /^[^@]+@[^:]+:/.test(trimmed) ||
+            /MINGW(64|32)|MSYS/.test(trimmed) ||
+            /^[^@]+@[^@]+\s+(MINGW64|MINGW32|MSYS)/.test(trimmed)
+          ) {
+            return 'linux'
+          }
+        }
+
+        // 2. Check prompt patterns in output lines
+        for (const line of lines) {
+          const trimmed = line.trim()
+          // Windows prompt
+          if (/^PS\s+[A-Za-z]:[\\\/]/.test(trimmed) || /^[A-Za-z]:[\\\/].*?>\s*$/.test(trimmed)) {
+            return 'windows'
+          }
+          // Linux/Git Bash prompt
+          if (/MINGW(64|32)|MSYS/.test(trimmed) || /^[^@]+@[^@]+\s+(MINGW64|MINGW32|MSYS)/.test(trimmed)) {
+            return 'linux'
+          }
+        }
+
+        // 3. Check command content (auxiliary)
+        if (sentCommand) {
+          // PowerShell cmdlets
+          if (/Get-|Select-Object|Format-Table|ForEach-Object|Where-Object/i.test(sentCommand)) {
+            return 'windows'
+          }
+        }
+
+        // 4. Default: if local connection without clear identification, could be Windows PowerShell or Git Bash
+        // For safety, return 'unknown' and use conservative strategy
+        return 'unknown'
+      }
+
+      const terminalType = detectTerminalType(lines, lastNonEmptyLine, sentCommand ?? null)
+
+      let outputStartIndex = 0
+      let outputEndIndex = lines.length
+      let processedLines = lines
+
+      switch (terminalType) {
+        case 'windows': {
+          // Strategy 0: If we have sentCommand, start output right after the command echo line (keeps dir header like "驱动器 C 中的卷是 Windows")
+          let foundCommandLine = false
+          if (sentCommand) {
+            const cmdLines = sentCommand.split(/\r?\n/).filter((l) => l.trim())
+            const normCmd =
+              cmdLines
+                .map((l) => stripAnsiBasic(l).trim())
+                .join(' ')
+                .replace(/\s+/g, ' ')
+                .trim() || ''
+            const cleanLine = (s: string) => stripAnsiBasic(s).trim().replace(/\s+/g, ' ')
+            for (let i = 0; i < Math.min(lines.length, 8); i++) {
+              if (cleanLine(lines[i]) === normCmd) {
+                outputStartIndex = i + 1
+                foundCommandLine = true
+                break
+              }
+            }
+          }
+
+          // Strategy 1: If no command line found, try first empty line as separator (Format-Table etc.)
+          // Long commands (e.g. powershell "Get-PSDrive...") echo across many lines with ANSI cursor codes, so search more lines
+          let foundEmptyLineSeparator = false
+          let emptyLineIndex = -1
+          if (!foundCommandLine) {
+            for (let i = 0; i < Math.min(lines.length, 20); i++) {
+              const line = lines[i]
+              if (!line.trim()) {
+                emptyLineIndex = i
+                foundEmptyLineSeparator = true
+                break
+              }
+            }
+
+            // If we found an empty line, check if there's meaningful content after it (excluding prompts)
+            if (foundEmptyLineSeparator && emptyLineIndex < 20) {
+              let hasContentAfterEmpty = false
+              let contentLineCount = 0
+              for (let i = emptyLineIndex + 1; i < lines.length; i++) {
+                const line = lines[i].trim()
+                if (line && !isTerminalPromptLine(line)) {
+                  hasContentAfterEmpty = true
+                  contentLineCount++
+                  if (contentLineCount >= 3) break
+                }
+              }
+              if (hasContentAfterEmpty && contentLineCount >= 3) {
+                outputStartIndex = emptyLineIndex + 1
+              } else {
+                foundEmptyLineSeparator = false
+              }
+            } else {
+              foundEmptyLineSeparator = false
+            }
+          }
+
+          // If neither command line nor empty line separator found, fall back to removing lines that look like commands
+          if (!foundCommandLine && !foundEmptyLineSeparator) {
+            const isCommandEchoLine = (line: string): boolean => {
+              const trimmed = line.trim()
+              if (!trimmed) return false
+
+              // First, check if this is an error message - these should NOT be treated as commands
+              if (
+                trimmed.includes('不是内部或外部命令') ||
+                trimmed.includes('is not recognized as') ||
+                trimmed.includes('command not found') ||
+                trimmed.includes('批处理文件')
+              ) {
+                return false
+              }
+
+              // Check if this looks like PowerShell output header (e.g., "CookedValue", "Property", "Name", etc.)
+              // Log header detection for debugging
+              const isHeader = (() => {
+                if (/^[A-Z][a-zA-Z0-9]*$/.test(trimmed) && trimmed.length >= 4 && trimmed.length <= 20) {
+                  return 'singlePascalCase'
+                }
+                const words = trimmed.split(/\s+/)
+                if (words.length >= 2 && words.length <= 8) {
+                  const wordsStartingWithUpper = words.filter((word) => /^[A-Z]/.test(word.replace(/[()]/g, '')))
+                  if (wordsStartingWithUpper.length >= 2 && wordsStartingWithUpper.length >= words.length * 0.5) {
+                    const hasTableHeaderPattern =
+                      trimmed.includes('Name') ||
+                      trimmed.includes('Path') ||
+                      trimmed.includes('Used') ||
+                      trimmed.includes('Free') ||
+                      trimmed.includes('Provider') ||
+                      trimmed.includes('Root') ||
+                      trimmed.includes('Value') ||
+                      trimmed.includes('Property') ||
+                      /\(GB\)|\(MB\)|\(KB\)/.test(trimmed)
+                    if (hasTableHeaderPattern) {
+                      return 'multiColumnHeader'
+                    }
+                  }
+                  const allPascalCase = words.every((word) => /^[A-Z][a-zA-Z0-9]*$/.test(word) && word.length >= 3)
+                  if (allPascalCase) {
+                    return 'allPascalCase'
+                  }
+                }
+                return null
+              })()
+
+              if (isHeader) {
+                return false
+              }
+              // PowerShell output headers are typically PascalCase words that appear before separator lines
+              // They should NOT be treated as command echoes
+              // Support both single column headers and multi-column headers (e.g., "Path CookedValue")
+              if (/^[A-Z][a-zA-Z0-9]*$/.test(trimmed) && trimmed.length >= 4 && trimmed.length <= 20) {
+                // Single PascalCase word header (e.g., "CookedValue", "Path")
+                return false
+              }
+
+              // Check for multi-column table headers (e.g., "Path CookedValue", "Name Used (GB) Free (GB)")
+              // Format: multiple words separated by spaces, may contain parentheses and other characters
+              const words = trimmed.split(/\s+/)
+              if (words.length >= 2 && words.length <= 8) {
+                // Check if most words start with uppercase letter (table headers typically do)
+                const wordsStartingWithUpper = words.filter((word) => /^[A-Z]/.test(word.replace(/[()]/g, '')))
+                // At least 50% of words should start with uppercase, and at least 2 words
+                if (wordsStartingWithUpper.length >= 2 && wordsStartingWithUpper.length >= words.length * 0.5) {
+                  // Additional check: if line contains common table header patterns
+                  const hasTableHeaderPattern =
+                    trimmed.includes('Name') ||
+                    trimmed.includes('Path') ||
+                    trimmed.includes('Used') ||
+                    trimmed.includes('Free') ||
+                    trimmed.includes('Provider') ||
+                    trimmed.includes('Root') ||
+                    trimmed.includes('Value') ||
+                    trimmed.includes('Property') ||
+                    /\(GB\)|\(MB\)|\(KB\)/.test(trimmed) // Contains size units in parentheses
+
+                  if (hasTableHeaderPattern) {
+                    // This looks like a table header row (e.g., "Name Used (GB) Free (GB) Provider Root")
+                    return false
+                  }
+                }
+
+                // Also check for simple PascalCase multi-word headers (original logic)
+                const allPascalCase = words.every((word) => /^[A-Z][a-zA-Z0-9]*$/.test(word) && word.length >= 3)
+                if (allPascalCase) {
+                  // This looks like a table header row (e.g., "Path CookedValue")
+                  return false
+                }
+              }
+
+              // PowerShell/CMD command detection using patterns instead of hardcoded lists
+
+              // Note: Removed length-based heuristics (trimmed.length <= 20, <= 15) as they are too aggressive
+              // and can incorrectly identify output (like paths, numbers, short text) as command echoes.
+              // We rely on exact command matching (removeCommandEcho) and specific command patterns instead.
+
+              // 3. Common command patterns with parameters
+              if (/^[a-zA-Z][a-zA-Z0-9_-]+\s+[-\/][a-zA-Z0-9]/.test(trimmed)) {
+                return true
+              }
+
+              // 4. PowerShell cmdlet pattern (Verb-Noun)
+              if (/^[A-Z][a-z]+-[A-Z][a-z]+/.test(trimmed)) {
+                return true
+              }
+
+              // 5. Handle commands with trailing special characters (like pwd]\\\\)
+              // Note: Removed length check (<= 15) to avoid false positives
+              const firstWord = trimmed.split(/\s+/)[0]
+              const cleanFirstWord = firstWord.replace(/[^\w-]/g, '')
+              // Only match if it looks like a command word (not just any short word)
+              if (cleanFirstWord.length > 0 && /^[a-zA-Z][a-zA-Z0-9_-]*$/.test(cleanFirstWord)) {
+                // Check if it's a known command pattern or matches common command words
+                const commonCommandWords = ['pwd', 'ls', 'cd', 'cat', 'echo', 'grep', 'find', 'ps', 'top', 'df', 'du', 'whoami', 'date']
+                if (commonCommandWords.includes(cleanFirstWord.toLowerCase())) {
+                  return true
+                }
+                // For PowerShell, check if it's a cmdlet pattern
+                if (/^[A-Z][a-z]+-[A-Z][a-z]+/.test(cleanFirstWord)) {
+                  return true
+                }
+              }
+
+              // Original patterns for complex commands
+              if (/^[,}]\s*/.test(trimmed)) {
+                return true
+              }
+
+              const commandPatterns = [
+                /\|\s*(head|tail|grep|awk|sed|sort|uniq|wc|cut|xargs)/i,
+                /\b(awk|sed|grep|head|tail|cut|sort|uniq|wc|find|xargs|ifconfig|ls|cat|echo)\b.*\|/,
+                /['"].*['"]\s*\|/,
+                /\$\{/,
+                /\/[^\/]*\/[gimsx]*\s*\{/,
+                /^[^:]*:\s*$/,
+                /^[^a-zA-Z0-9]*['"}]/
+              ]
+
+              for (const pattern of commandPatterns) {
+                if (pattern.test(trimmed)) {
+                  return true
+                }
+              }
+
+              // Check for table separator lines (e.g., "----", "====")
+              // These should NOT be treated as command echoes
+              if (/^[-=]+$/.test(trimmed) && trimmed.length >= 2) {
+                return false
+              }
+
+              if (trimmed.length < 5 && /^[^a-zA-Z0-9:]*$/.test(trimmed.replace(/['"]/g, ''))) {
+                // Exclude separator lines (dashes or equals)
+                if (/^[-=]+$/.test(trimmed)) {
+                  return false
+                }
+                return true
+              }
+
+              return false
+            }
+
+            while (outputStartIndex < lines.length && isCommandEchoLine(lines[outputStartIndex])) {
+              outputStartIndex++
+            }
+          }
+
+          // Remove prompt from the end
+          // First, try to find a line that is entirely a prompt (or "path>" which may be cd output + prompt on same line)
+          for (let i = lines.length - 1; i >= 0; i--) {
+            const rawLine = lines[i]
+            const line = rawLine.trim()
+            if (!line) continue
+            if (!isTerminalPromptLine(line)) continue
+            // Line ends with "path>" (e.g. C:\Users\yin_ding> or output+prompt C:\Users\yin_dingC:\Users\yin_ding>). Keep only content before the last prompt.
+            const outputPart = line.replace(/(.*)(PS\s+[A-Za-z]:[\\\/][^>]*>|[A-Za-z]:[\\\/][^>]*>)\s*$/, '$1').trim()
+            if (outputPart.length > 0) {
+              const prevTrimmed =
+                i > 0
+                  ? lines[i - 1]
+                      .replace(/\x1b\[[0-9;]*m/g, '')
+                      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+                      .trim()
+                  : ''
+              if (prevTrimmed === outputPart) {
+                outputEndIndex = i
+              } else {
+                lines[i] = outputPart
+                outputEndIndex = i + 1
+              }
+            } else {
+              outputEndIndex = i
+            }
+            break
+          }
+
+          // If we didn't find a standalone prompt line, check if the last line ends with a prompt
+          if (outputEndIndex === lines.length && lines.length > 0) {
+            const lastLineIndex = lines.length - 1
+            const lastLine = lines[lastLineIndex]
+            const cleanLastLine = stripAnsiBasic(lastLine)
+
+            // Check if line ends with PowerShell/CMD prompt pattern
+            // Match patterns like "5066PS C:\Users\test>" or "outputC:\path>"
+            const promptMatch = cleanLastLine.match(/(.*?)(PS\s+[A-Za-z]:[\\\/][^>]*>|[A-Za-z]:[\\\/][^>]*>)\s*$/)
+            if (promptMatch && promptMatch[1]) {
+              // Remove the prompt part, keep only the output part
+              const outputPart = promptMatch[1]
+              if (outputPart.length > 0) {
+                // Find the prompt in the original line (may contain ANSI codes)
+                // Use a regex that matches the prompt pattern, accounting for possible ANSI codes
+                const promptPattern = /(PS\s+[A-Za-z]:[\\\/][^>]*>|[A-Za-z]:[\\\/][^>]*>)\s*$/
+                const originalPromptMatch = lastLine.match(promptPattern)
+
+                if (originalPromptMatch) {
+                  // Extract output part from original line by removing the prompt
+                  const promptStart = lastLine.lastIndexOf(originalPromptMatch[1])
+                  if (promptStart >= 0) {
+                    lines[lastLineIndex] = lastLine.substring(0, promptStart).trimEnd()
+                  } else {
+                    // Fallback: use cleaned output part
+                    lines[lastLineIndex] = outputPart.trimEnd()
+                  }
+                } else {
+                  // If we can't find prompt in original line, use cleaned output part
+                  lines[lastLineIndex] = outputPart.trimEnd()
+                }
+                outputEndIndex = lines.length
+              } else {
+                // If there's no output part, exclude this line entirely
+                outputEndIndex = lines.length - 1
+              }
+            }
+          }
+          break
+        }
+
+        case 'linux':
+        case 'unknown': {
+          // Linux/Git Bash terminal processing (Git Bash uses same logic as Linux)
+          const filteredLines = lines.map((line) => stripAnsiExtended(line).trimEnd()).filter((line) => line.trim())
+
+          const isCommandEchoLine = (line: string): boolean => {
+            // First, clean ANSI sequences to ensure command detection works correctly
+            // Git Bash command echo may contain color codes (e.g., colored $ symbol)
+            const cleanedLine = stripAnsiExtended(line)
+
+            const trimmed = cleanedLine.trim()
+            if (!trimmed) return false
+
+            // Fix: Exclude path output (e.g., /c/Users/test) - only change needed for Git Bash
+            // Paths usually start with / or \ or contain path separators
+            if (/^[\/\\]/.test(trimmed) || /[\/\\]/.test(trimmed)) {
+              // This is path output, not command echo
+              return false
+            }
+
+            // Keep original logic unchanged
+            // For Git Bash, the first line is usually the command echo
+            const commonCommands = ['pwd', 'ls', 'cd', 'cat', 'echo', 'grep', 'find', 'ps', 'top', 'df', 'du', 'whoami', 'date']
+            if (commonCommands.includes(trimmed)) {
+              return true
+            }
+
+            if (/^[,}]\s*/.test(trimmed)) {
+              return true
+            }
+
+            const commandPatterns = [
+              /\|\s*(head|tail|grep|awk|sed|sort|uniq|wc|cut|xargs)/i,
+              /\b(awk|sed|grep|head|tail|cut|sort|uniq|wc|find|xargs|ifconfig|ls|cat|echo)\b.*\|/,
+              /['"].*['"]\s*\|/,
+              /\$\{/,
+              /\/[^\/]*\/[gimsx]*\s*\{/,
+              /^[^:]*:\s*$/,
+              /^[^a-zA-Z0-9]*['"}]/
+            ]
+
+            if (commandPatterns.some((pattern) => pattern.test(trimmed))) {
+              return true
+            }
+
+            if (trimmed.length < 5 && /^[^a-zA-Z0-9:]*$/.test(trimmed.replace(/['"]/g, ''))) {
+              return true
+            }
+
+            return false
+          }
+
+          // Remove command echo lines from the beginning
+          while (outputStartIndex < filteredLines.length && isCommandEchoLine(filteredLines[outputStartIndex])) {
+            outputStartIndex++
+          }
+
+          // Remove prompt from the end
+          outputEndIndex = filteredLines.length
+
+          // Helper function to clean ANSI sequences for prompt detection
+          // This ensures prompts with ANSI color codes can be correctly identified
+          const cleanLineForPromptCheck = (line: string): string => {
+            return stripAnsiExtended(line).trim()
+          }
+
+          // Remove all consecutive prompt lines from the end
+          // Git Bash may have multiple prompt lines (full prompt + $ symbol)
+          // We need to remove all of them, not just the last one
+          while (outputEndIndex > 0) {
+            const lastLine = filteredLines[outputEndIndex - 1]
+            const cleanedLine = cleanLineForPromptCheck(lastLine)
+
+            // Check for simple prompt symbols first ($, #, %)
+            if (/^[$#%]\s*$/.test(cleanedLine)) {
+              outputEndIndex--
+              continue
+            }
+
+            // Check for full prompt lines (including Git Bash prompts with ANSI sequences)
+            if (isTerminalPromptLine(cleanedLine)) {
+              outputEndIndex--
+              continue
+            }
+
+            // If this line is not a prompt, stop removing
+            break
+          }
+
+          processedLines = filteredLines
+          break
+        }
+      }
+
+      // Validate indices
+      if (outputStartIndex < 0) outputStartIndex = 0
+      if (outputEndIndex > processedLines.length) outputEndIndex = processedLines.length
+      if (outputStartIndex > outputEndIndex) {
+        const temp = outputStartIndex
+        outputStartIndex = outputEndIndex
+        outputEndIndex = temp
+      }
+
+      // Extract the actual output lines (preserve empty lines for multiple newlines)
+      let outputLines = processedLines.slice(outputStartIndex, outputEndIndex)
+
+      // Remove command echo using exact command matching
+      if (sentCommand && outputLines.length > 0) {
+        if (terminalType === 'windows') {
+          outputLines = removeCommandEcho(outputLines, sentCommand, true)
+        } else if (terminalType === 'linux' || terminalType === 'unknown') {
+          // Linux/Git Bash: remove leading line(s) that exactly match the sent command
+          const normalizedSent = sentCommand
+            .replace(/\r\n|\r/g, '\n')
+            .replace(/\s+/g, ' ')
+            .trim()
+          const cleanForCompare = (s: string) => stripAnsiBasic(s).trim().replace(/\s+/g, ' ')
+          while (outputLines.length > 0 && cleanForCompare(outputLines[0]) === normalizedSent) {
+            outputLines = outputLines.slice(1)
+          }
+        }
+      }
+
+      // Remove OSC window title residue (e.g. C:\windows\System32\cmd.exe or ]0;... when split across chunks)
+      if (terminalType === 'windows') {
+        // Strip OSC from each line first so mixed lines (e.g. "C:\Users\...\u001b]0;C:\...\cmd.exe\u0007") keep the path and are not dropped.
+        // When ]0; or ]9; is followed by single-quote (CMD error "'cmd' 不是内部或外部命令"), strip only the prefix so we keep the message.
+        const stripOscFromLine = (line: string) =>
+          line
+            .replace(/\x1b\]0;[^\x07]*\x07/g, '')
+            .replace(/\x1b\]9;[^\x07]*\x07/g, '')
+            .replace(/\]0;(?=')/g, '')
+            .replace(/\]9;(?=')/g, '')
+            .replace(/\]0;[^\x07\n\r]*\x07?/g, '')
+            .replace(/\]9;[^\x07\n\r]*\x07?/g, '')
+            .replace(/^\]'/g, "'") // leftover "]'" when "0;" was lost across chunks (CMD error line)
+            .replace(/^\]\x07?'/g, "'") // "]\\x07'..." or "]'..." when OSC split: ] + BEL + CMD error on same line
+            .replace(/^\]\.?\x07?$/g, '') // line is only "]\\x07" or "].\\x07" or "]" (OSC residue on its own line)
+            // Strip CSI sequences (ESC [ params letter) - use [0-9;]* not [^\]]* to avoid eating content like "m总内存: 31518 MB"
+            .replace(/\x1b\[[?]?[0-9;]*[a-zA-Z]/g, '')
+            .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+            // Strip trailing prompt when output and next prompt are on same line: keep content before "PS C:\path>" or "C:\path>"
+            .replace(/^(.+?)PS\s+[A-Za-z]:[\\\/][^>]*>\s*$/, '$1')
+            .replace(/^(.+?)[A-Za-z]:[\\\/][^>]*>\s*$/, '$1')
+            // When prompt is split across lines: line is "pathPS " or "pathPS" (no " C:\path>" on same line)
+            .replace(/^(.+?)PS\s*$/, '$1')
+            .trimEnd()
+        outputLines = outputLines.map(stripOscFromLine)
+        outputLines = outputLines.filter((line) => {
+          const t = line
+            .replace(/\x1b\[[0-9;]*m/g, '')
+            .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+            .trim()
+          if (!t) return true // keep blank lines
+          if (/^\]0;.*/.test(t) || /^\]9;.*/.test(t)) return false
+          // Single line that is only a path ending in cmd.exe (OSC window title residue)
+          if (/^[A-Za-z]:\\(?:[^\\]+\\)*cmd\.exe\s*$/i.test(t)) return false
+          if (/^\\(?:[^\\]+\\)*cmd\.exe\s*$/i.test(t)) return false // path without drive
+          // Line that is "path - command" (OSC window title with command, e.g. first line of output)
+          if (/^[A-Za-z]:\\.*cmd\.exe\s+-\s+/i.test(t)) return false
+          if (/^\\[^\\]*\\cmd\.exe\s+-\s+/i.test(t)) return false // path without drive (e.g. \windows\System32\cmd.exe - ...)
+          // Line that is only "PS" (PowerShell prompt prefix residue when prompt is split or stripped)
+          if (/^PS\s*$/.test(t)) return false
+          // Line that is entirely a prompt (e.g. "PS C:\Users\yin_ding> " or "C:\path>")
+          if (isTerminalPromptLine(t)) return false
+          return true
+        })
+      }
+
+      try {
+        let finalOutput = outputLines.join('\n').trim()
+        // Collapse extra newlines on Windows (cursor moves etc. can leave double newlines between lines)
+        if (terminalType === 'windows') {
+          finalOutput = finalOutput.replace(/\n{2,}/g, '\n')
+        }
+
+        const toolResult = {
+          output: finalOutput || 'Command executed successfully, no output returned',
+          toolName: 'execute_command'
+        }
+
+        if (finalOutput) {
+          const formattedOutput = `Terminal output:\n\`\`\`\n${finalOutput}\n\`\`\``
+          eventBus.emit('sendMessageToAi', { content: formattedOutput, tabId, toolResult })
+        } else {
+          const output = 'Command executed successfully, no output returned'
+          const messageToSend = isInitialCommand ? `Terminal output:\n\`\`\`\n${output}\n\`\`\`` : output
+          eventBus.emit('sendMessageToAi', { content: messageToSend, tabId, toolResult })
+        }
+      } catch (error) {
+        logger.error('Error processing command echo output', { error: error })
+      }
+    }
+
+    if (isWindowsLocal) {
+      if (commandOutputProcessTimer.value) clearTimeout(commandOutputProcessTimer.value)
+      commandOutputProcessTimer.value = setTimeout(() => {
+        commandOutputProcessTimer.value = null
+        if (marker) {
+          commandMarkerToTabId.value.delete(marker)
+          commandMarkerToCommand.value.delete(marker)
+          currentCommandMarker.value = null
+        }
+        currentCommandTabId.value = undefined
+        isCollectingOutput.value = false
+        doProcessOutput()
+        commandOutput.value = ''
+      }, 150)
+      cusWrite?.(data)
+      return
+    }
+
+    isCollectingOutput.value = false
+    if (marker) {
+      commandMarkerToTabId.value.delete(marker)
+      commandMarkerToCommand.value.delete(marker)
+      currentCommandMarker.value = null
+    }
+    currentCommandTabId.value = undefined
+    doProcessOutput()
+    commandOutput.value = ''
+  }
+
+  cusWrite?.(data)
+}
+
+const specialCode = ref(false)
+const keyCode = ref('')
+const currentLine = ref('')
+const commands = ref()
+const cursorY = ref(0)
+const cursorX = ref(0)
+const enterPress = ref(false)
+const tagPress = ref(false)
+const beginStr = ref<string>('')
+const startStr = ref<string>('')
+
+// Helper function to calculate display width position
+const calculateDisplayPosition = (str: string, charIndex: number): number => {
+  let displayPos = 0
+  for (let i = 0; i < charIndex && i < str.length; i++) {
+    const code = str.codePointAt(i) || 0
+    const charWidth =
+      (code >= 0x3000 && code <= 0x9fff) ||
+      (code >= 0xac00 && code <= 0xd7af) ||
+      (code >= 0xf900 && code <= 0xfaff) ||
+      (code >= 0xff00 && code <= 0xffef) ||
+      (code >= 0x20000 && code <= 0x2fa1f)
+        ? 2
+        : 1
+    displayPos += charWidth
+    if (code > 0xffff) {
+      i++
+    }
+  }
+  return displayPos
+}
+
+const getRowColByDisplayOffset = (
+  startRow: number, // Row where command starts
+  cursorStartX: number,
+  displayOffset: number // Display offset
+) => {
+  const term = terminal.value as any
+  const cols: number = term?.cols ?? 80
+
+  const firstRowCapacity = cols - cursorStartX
+
+  let row: number
+  let col: number
+
+  if (displayOffset < firstRowCapacity) {
+    row = startRow
+    col = cursorStartX + 1 + displayOffset
+  } else {
+    // Line break
+    const rest = displayOffset - firstRowCapacity
+    const extraRows = Math.floor(rest / cols)
+    const offsetInRow = rest % cols
+    row = startRow + 1 + extraRows
+    col = 1 + offsetInRow
+  }
+
+  return { row, col }
+}
+
+const DEFAULT_ZSH_COLORS = {
+  // Command
+  command: {
+    valid: '32',
+    invalid: '31'
+  },
+
+  // Argument
+  argument: {
+    default: '38;2;135;206;250'
+  },
+
+  // String
+  string: {
+    matched: '33',
+    unmatched: '31',
+    other: '38;2;135;206;250'
+  }
+} as const
+
+// TODO User customization
+type SyntaxHighlightConfig = {
+  command?: {
+    valid?: string
+    invalid?: string
+  }
+  argument?: {
+    default?: string
+  }
+  string?: {
+    matched?: string
+    unmatched?: string
+    other?: string
+  }
+}
+
+const mergeColors = (userConfig: SyntaxHighlightConfig = {}) => {
+  return {
+    command: {
+      valid: userConfig.command?.valid || DEFAULT_ZSH_COLORS.command.valid,
+      invalid: userConfig.command?.invalid || DEFAULT_ZSH_COLORS.command.invalid
+    },
+    argument: {
+      default: userConfig.argument?.default || DEFAULT_ZSH_COLORS.argument.default
+    },
+    string: {
+      matched: userConfig.string?.matched || DEFAULT_ZSH_COLORS.string.matched,
+      unmatched: userConfig.string?.unmatched || DEFAULT_ZSH_COLORS.string.unmatched,
+      other: userConfig.string?.other || DEFAULT_ZSH_COLORS.string.other
+    }
+  }
+}
+
+const highlightSyntax = (allData: any, userConfig?: SyntaxHighlightConfig) => {
+  const colors = mergeColors(userConfig)
+
+  const { content, cursorPosition } = allData
+  let command = ''
+  let arg = ''
+  // Parse command and arguments
+  const firstSpaceIndex = content.indexOf(' ')
+  if (firstSpaceIndex !== -1) {
+    command = content.slice(0, firstSpaceIndex)
+    arg = content.slice(firstSpaceIndex)
+  } else {
+    command = content
+    arg = ''
+  }
+
+  // Current line number
+  let startY = (terminal.value as any)?._core.buffer.y
+  if (allData.contentCrossRowStatus) {
+    startY = allData.contentCrossStartLine
+  }
+
+  const isValidCommand = commands.value?.includes(command)
+
+  // Build a single escape sequence buffer to minimize cusWrite calls
+  let buf = ''
+
+  // Highlight main command
+  if (command) {
+    const cmdRow = startY + 1
+    const cmdCol = cursorStartX.value + 1
+
+    const colorCode = isValidCommand ? colors.command.valid : colors.command.invalid
+    buf += `\x1b[${cmdRow};${cmdCol}H\x1b[${colorCode}m${command}\x1b[0m`
+  }
+
+  if (!arg) {
+    if (buf) {
+      cusWrite?.(buf, { isUserCall: true })
+      setTimeout(() => {
+        const row = cursorPosition.row + 1
+        const col = cursorPosition.col + 1
+        cusWrite?.(`\x1b[${row};${col}H`, { isUserCall: true })
+      })
+    }
+    return
+  }
+
+  // Tokenize
+  type Token = {
+    content: string
+    type: 'matched' | 'unmatched' | 'other' | string
+    startIndex: number
+  }
+
+  // Handle pipe operators - appends to buf
+  const appendPipeCommands = (argStr: string, tokens?: Token[], unmatchedStartIndex?: number | null) => {
+    if (!argStr.includes('|')) return
+
+    const commandDisplayWidth = calculateDisplayPosition(command, command.length)
+    const pipeColorCode = '38;5;33' // Dark blue
+
+    // Record all string ranges
+    const stringRanges: { start: number; end: number }[] = []
+    if (tokens) {
+      for (const t of tokens) {
+        if (t.type === 'matched' || t.type === 'unmatched') {
+          stringRanges.push({
+            start: t.startIndex,
+            end: t.startIndex + t.content.length
+          })
+        }
+      }
+    }
+    // Unclosed state: everything after unmatched is treated as string
+    if (typeof unmatchedStartIndex === 'number') {
+      stringRanges.push({
+        start: unmatchedStartIndex,
+        end: argStr.length
+      })
+    }
+
+    const inStringRange = (idx: number) => stringRanges.some((r) => idx >= r.start && idx < r.end)
+
+    let searchStart = 0
+    while (searchStart < argStr.length) {
+      let pipeIndex = argStr.indexOf('|', searchStart)
+      if (pipeIndex === -1) break
+
+      // Skip | inside strings
+      if (inStringRange(pipeIndex)) {
+        const range = stringRanges.find((r) => pipeIndex >= r.start && pipeIndex < r.end)
+        if (!range) {
+          searchStart = pipeIndex + 1
+        } else {
+          searchStart = range.end
+        }
+        continue
+      }
+
+      const pipeDisplayPos = calculateDisplayPosition(argStr, pipeIndex)
+      const pipeOffset = commandDisplayWidth + pipeDisplayPos
+
+      const { row: pipeRow0, col: pipeCol } = getRowColByDisplayOffset(startY, cursorStartX.value, pipeOffset)
+      const pipeRow = pipeRow0 + 1
+
+      buf += `\x1b[${pipeRow};${pipeCol}H\x1b[${pipeColorCode}m|\x1b[0m`
+
+      // Handle sub-commands
+      let k = pipeIndex + 1
+      while (k < argStr.length) {
+        if (inStringRange(k)) {
+          const range = stringRanges.find((r) => k >= r.start && k < r.end)
+          if (!range) break
+          k = range.end
+          continue
+        }
+        const ch = argStr[k]
+        if (ch === ' ' || ch === '\t') {
+          k++
+          continue
+        }
+        break
+      }
+
+      if (k >= argStr.length) {
+        searchStart = pipeIndex + 1
+        continue
+      }
+
+      const subCmdStart = k
+
+      // Record sub-command end position
+      let m = subCmdStart
+      while (m < argStr.length && !inStringRange(m)) {
+        const ch = argStr[m]
+        if (ch === ' ' || ch === '\t' || ch === '|') break
+        m++
+      }
+
+      if (m <= subCmdStart) {
+        searchStart = pipeIndex + 1
+        continue
+      }
+
+      const subCommand = argStr.slice(subCmdStart, m)
+      const isValidSub = commands.value?.includes(subCommand)
+      const subColor = isValidSub ? colors.command.valid : colors.command.invalid
+
+      const displayPosFromArgStart = calculateDisplayPosition(argStr, subCmdStart)
+      const subOffset = commandDisplayWidth + displayPosFromArgStart
+
+      const { row: subRow0, col: subCol } = getRowColByDisplayOffset(startY, cursorStartX.value, subOffset)
+      const subRow = subRow0 + 1
+
+      buf += `\x1b[${subRow};${subCol}H\x1b[${subColor}m${subCommand}\x1b[0m`
+
+      searchStart = pipeIndex + 1
+    }
+  }
+
+  if (arg.includes("'") || arg.includes('"') || arg.includes('(') || arg.includes('{') || arg.includes('[')) {
+    const tokens: Token[] = processString(arg)
+    const commandDisplayWidth = calculateDisplayPosition(command, command.length)
+
+    // Find the start position of the first unmatched
+    let unmatchedStartIndex: number | null = null
+    for (const t of tokens) {
+      if (t.type === 'unmatched') {
+        if (unmatchedStartIndex === null || t.startIndex < unmatchedStartIndex) {
+          unmatchedStartIndex = t.startIndex
+        }
+      }
+    }
+
+    if (unmatchedStartIndex === null) {
+      // No unmatched
+      for (const token of tokens) {
+        const displayPos = calculateDisplayPosition(arg, token.startIndex)
+        const totalOffset = commandDisplayWidth + displayPos
+        const { row, col } = getRowColByDisplayOffset(startY, cursorStartX.value, totalOffset)
+
+        if (token.content === ' ') {
+          buf += `\x1b[${row + 1};${col}H${token.content}\x1b[0m`
+        } else {
+          let colorCode: string
+          if (token.type === 'matched') {
+            colorCode = colors.string.matched
+          } else if (token.type === 'unmatched') {
+            colorCode = colors.string.unmatched
+          } else {
+            colorCode = colors.string.other
+          }
+          buf += `\x1b[${row + 1};${col}H\x1b[${colorCode}m${token.content}\x1b[0m`
+        }
+      }
+
+      appendPipeCommands(arg, tokens, null)
+
+      // Handle cursor
+      const finalRow = cursorPosition.row + 1
+      const finalCol = cursorPosition.col + 1
+      buf += `\x1b[${finalRow};${finalCol}H`
+    } else {
+      // Has unmatched
+      for (const token of tokens) {
+        if (token.startIndex >= unmatchedStartIndex) continue
+
+        const displayPos = calculateDisplayPosition(arg, token.startIndex)
+        const totalOffset = commandDisplayWidth + displayPos
+
+        const { row, col } = getRowColByDisplayOffset(startY, cursorStartX.value, totalOffset)
+
+        const ansiRow = row + 1
+        if (token.content === ' ') {
+          buf += `\x1b[${ansiRow};${col}H${token.content}\x1b[0m`
+        } else {
+          let colorCode: string
+          if (token.type === 'matched') {
+            colorCode = colors.string.matched
+          } else {
+            colorCode = colors.string.other
+          }
+          buf += `\x1b[${ansiRow};${col}H\x1b[${colorCode}m${token.content}\x1b[0m`
+        }
+      }
+      // Everything after unmatchedStartIndex is unmatched
+      const unmatchedContent = arg.slice(unmatchedStartIndex)
+      const unmatchedDisplayPos = calculateDisplayPosition(arg, unmatchedStartIndex)
+      const totalOffset = commandDisplayWidth + unmatchedDisplayPos
+
+      const { row, col } = getRowColByDisplayOffset(startY, cursorStartX.value, totalOffset)
+
+      buf += `\x1b[${row + 1};${col}H\x1b[${colors.string.unmatched}m${unmatchedContent}\x1b[0m`
+
+      // Everything after unmatched is treated as string, pipes are not specially handled
+      appendPipeCommands(arg, tokens, unmatchedStartIndex)
+
+      const finalRow = cursorPosition.row + 1
+      const finalCol = cursorPosition.col + 1
+      buf += `\x1b[${finalRow};${finalCol}H`
+    }
+  } else {
+    const commandDisplayWidth = calculateDisplayPosition(command, command.length)
+    const row = startY + 1
+    const col = cursorStartX.value + commandDisplayWidth + 1
+
+    buf += `\x1b[${row};${col}H\x1b[${colors.argument.default}m${arg}\x1b[0m`
+
+    appendPipeCommands(arg)
+
+    const finalRow = cursorPosition.row + 1
+    const finalCol = cursorPosition.col + 1
+    buf += `\x1b[${finalRow};${finalCol}H`
+  }
+
+  // Single write for the entire highlight sequence
+  if (buf) {
+    cusWrite?.(buf, { isUserCall: true })
+  }
+}
+
+type ResultItem = { type: string; content: string; startIndex: number; endIndex?: number }
+const processString = (str: string): ResultItem[] => {
+  const result: ResultItem[] = []
+  let i = 0
+
+  while (i < str.length) {
+    if (str[i] === '"' || str[i] === "'") {
+      const quote = str[i]
+      let j = i + 1
+      while (j < str.length && str[j] !== quote) {
+        if (str[j] === '\\' && str[j + 1] === quote) {
+          j += 2
+        } else {
+          j++
+        }
+      }
+      if (j < str.length) {
+        result.push({
+          type: 'matched',
+          startIndex: i,
+          endIndex: j,
+          content: str.slice(i, j + 1)
+        })
+        i = j + 1
+      } else {
+        result.push({
+          type: 'unmatched',
+          content: str[i],
+          startIndex: i
+        })
+        i++
+      }
+      continue
+    }
+    if (str[i] === '{' && str[i + 1] === '{') {
+      let depth = 1
+      let j = i + 2
+      while (j < str.length) {
+        if (str[j] === '{' && str[j + 1] === '{') {
+          depth++
+          j++
+        } else if (str[j] === '}' && str[j + 1] === '}') {
+          depth--
+          if (depth === 0) break
+          j++
+        }
+        j++
+      }
+      if (depth === 0 && j < str.length) {
+        result.push({
+          type: 'matched',
+          startIndex: i,
+          endIndex: j + 1,
+          content: str.slice(i, j + 2)
+        })
+        i = j + 2
+      } else {
+        result.push({
+          type: 'unmatched',
+          content: str[i],
+          startIndex: i
+        })
+        i++
+      }
+      continue
+    }
+    if (str[i] === '{' || str[i] === '[' || str[i] === '(') {
+      const openChar = str[i]
+      const closeChar = openChar === '{' ? '}' : openChar === '[' ? ']' : ')'
+      let depth = 1
+      let j = i + 1
+      while (j < str.length) {
+        if (str[j] === openChar) {
+          depth++
+        } else if (str[j] === closeChar) {
+          depth--
+          if (depth === 0) break
+        }
+        j++
+      }
+      if (depth === 0 && j < str.length) {
+        result.push({
+          type: 'matched',
+          startIndex: i,
+          endIndex: j,
+          content: str.slice(i, j + 1)
+        })
+        i = j + 1
+      } else {
+        result.push({
+          type: 'unmatched',
+          content: str[i],
+          startIndex: i
+        })
+        i++
+      }
+      continue
+    }
+    let start = i
+    while (
+      i < str.length &&
+      str[i] !== '"' &&
+      str[i] !== "'" &&
+      !(str[i] === '{' && str[i + 1] === '{') &&
+      str[i] !== '{' &&
+      str[i] !== '[' &&
+      str[i] !== '('
+    ) {
+      i++
+    }
+
+    if (start < i) {
+      result.push({
+        type: 'afterMatched',
+        content: str.slice(start, i),
+        startIndex: start
+      })
+    }
+    if (i === start) {
+      result.push({
+        type: 'afterMatched',
+        content: str[i],
+        startIndex: i
+      })
+      i++
+    }
+  }
+  return result
+}
+
+const selectSuggestion = (suggestion: CommandSuggestion) => {
+  selectFlag.value = true
+  const DELCODE = String.fromCharCode(127)
+  const RIGHTCODE = String.fromCharCode(27, 91, 67)
+  sendData(RIGHTCODE.repeat(terminalState.value.content.length - terminalState.value.beforeCursor.length))
+  sendData(DELCODE.repeat(terminalState.value.content.length))
+  sendData(suggestion.command)
+  clearAllSuggestions()
+}
+
+// Load OS info once for AI suggestion context
+const loadOsInfoOnce = async () => {
+  if (cachedOsInfoLoaded.value || !connectionId.value || !isConnected.value || isLocalConnect.value) return
+  if (shouldSkipAssetLookup(props.connectData)) {
+    cachedOsInfo.value = undefined
+    cachedOsInfoLoaded.value = true
+    logger.info('Skip OS info probe for xshell wakeup session', {
+      connectionId: connectionId.value,
+      source: props.connectData?.wakeupSource || props.connectData?.source || 'unknown'
+    })
+    return
+  }
+  try {
+    const res = await window.api.getSystemInfo(connectionId.value)
+    logger.debug('Fetched system info for AI suggestion context', { connectionId: connectionId.value, success: !!res?.success })
+    if (res?.success && res.data?.osVersion) {
+      cachedOsInfo.value = res.data.osVersion
+      cachedOsInfoLoaded.value = true
+      return
+    }
+    cachedOsInfo.value = undefined
+    cachedOsInfoLoaded.value = true
+  } catch {
+    cachedOsInfo.value = undefined
+    cachedOsInfoLoaded.value = true
+  }
+}
+
+// Fetch AI suggestion from backend
+const fetchAiSuggestion = async (command: string, requestId: number) => {
+  // Early staleness check before setting loading state to prevent ghost loading indicators
+  if (requestId !== aiSuggestRequestId.value) {
+    return
+  }
+  aiSuggestLoading.value = true
+  // Update position so loading indicator is visible immediately
+  nextTick(() => {
+    const componentInstance = componentRefs.value[connectionId.value]
+    componentInstance?.updateSuggestionsPosition(terminal.value)
+  })
+  try {
+    if (!cachedOsInfoLoaded.value) {
+      await loadOsInfoOnce()
+    }
+    traceAiSuggest('Dispatching AI suggest IPC', {
+      requestId,
+      inputLength: command.length
+    })
+    const result = await window.api.aiSuggestCommand({
+      command,
+      osInfo: cachedOsInfo.value
+    })
+    // Discard stale responses: requestId + input snapshot double check
+    if (requestId !== aiSuggestRequestId.value) {
+      return
+    }
+    const currentInput = terminalState.value.beforeCursor.trim()
+    if (currentInput !== command) {
+      return
+    }
+    // Do not inject AI result while user is navigating the suggestion list
+    if (suggestionSelectionMode.value) {
+      return
+    }
+    if (result && result.command) {
+      aiSuggestion.value = {
+        command: result.command,
+        explanation: result.explanation,
+        source: 'ai'
+      }
+      traceAiSuggest('Accepted AI suggestion', {
+        requestId,
+        outputLength: result.command.length
+      })
+      // Update suggestion position after AI result arrives
+      nextTick(() => {
+        const componentInstance = componentRefs.value[connectionId.value]
+        componentInstance?.updateSuggestionsPosition(terminal.value)
+      })
+    } else {
+      aiSuggestion.value = null
+    }
+  } catch (error) {
+    traceAiSuggest('AI suggest IPC failed', {
+      error: error instanceof Error ? error.message : String(error)
+    })
+    if (requestId === aiSuggestRequestId.value) {
+      aiSuggestion.value = null
+    }
+  } finally {
+    // Always reset loading for current request; stale requests were already exited above
+    if (requestId === aiSuggestRequestId.value) {
+      aiSuggestLoading.value = false
+    }
+  }
+}
+
+// Hover-triggered AI suggestion: called when user hovers the AI icon in suggestion panel
+const onAiTriggerHover = () => {
+  if (!queryCommandFlag.value) return
+  if (terminalMode.value === 'alternate') return
+
+  const commandText = terminalState.value.beforeCursor.trim()
+  if (commandText.length < AI_SUGGEST_MIN_LENGTH) return
+
+  // Skip if already loading or already has a result
+  if (aiSuggestLoading.value || aiSuggestion.value) return
+
+  const currentRequestId = ++aiSuggestRequestId.value
+  fetchAiSuggestion(commandText, currentRequestId)
+}
+
+const onSuggestionClickItem = (index: number) => {
+  if (index < 0 || index >= displaySuggestions.value.length) return
+  selectSuggestion(displaySuggestions.value[index])
+  terminal.value?.focus()
+}
+
+// Shortcut-triggered AI suggestion: called via Ctrl+I / Cmd+I even when suggestion panel is not visible
+const triggerAiSuggestByShortcut = () => {
+  if (!queryCommandFlag.value) return
+  if (terminalMode.value === 'alternate') return
+
+  const commandText = terminalState.value.beforeCursor.trim()
+  if (commandText.length < AI_SUGGEST_MIN_LENGTH) return
+
+  // Skip if already loading or already has a result
+  if (aiSuggestLoading.value || aiSuggestion.value) return
+
+  const currentRequestId = ++aiSuggestRequestId.value
+  fetchAiSuggestion(commandText, currentRequestId)
+}
+
+function tokenizeCommandLine(input: string): string[] {
+  const tokens: string[] = []
+  let current = ''
+  let inSingle = false
+  let inDouble = false
+  let escaped = false
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i]
+    if (escaped) {
+      current += ch
+      escaped = false
+      continue
+    }
+    if (ch === '\\') {
+      escaped = true
+      current += ch
+      continue
+    }
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle
+      current += ch
+      continue
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble
+      current += ch
+      continue
+    }
+    if (ch === ' ' && !inSingle && !inDouble) {
+      if (current.length > 0) {
+        tokens.push(current)
+        current = ''
+      }
+      continue
+    }
+    current += ch
+  }
+  tokens.push(current)
+  return tokens
+}
+
+function mergeSuggestions(history: CommandSuggestion[], spec: CommandSuggestion[], wordIndex: number): CommandSuggestion[] {
+  const seen = new Set<string>()
+  const result: CommandSuggestion[] = []
+  const MAX = 8
+  const push = (s: CommandSuggestion) => {
+    if (result.length >= MAX) return
+    if (!seen.has(s.command)) {
+      seen.add(s.command)
+      result.push(s)
+    }
+  }
+  if (wordIndex === 0) {
+    history.forEach(push)
+    spec.forEach(push)
+  } else {
+    spec.forEach(push)
+    history.forEach(push)
+  }
+  return result
+}
+
+const queryCommand = async (cmd = '') => {
+  if (!queryCommandFlag.value) return
+
+  // Check if it is in the Vim editing mode. If so, do not trigger the automatic completion.
+  if (terminalMode.value === 'alternate') {
+    clearAllSuggestions({ resetActive: false })
+    return
+  }
+
+  // Skip if the terminal is not focused
+  if (terminal.value?.textarea && document.activeElement !== terminal.value.textarea) {
+    return
+  }
+
+  const isAtEndOfLine = terminalState.value.beforeCursor.length === terminalState.value.content.length
+  if (!isAtEndOfLine) {
+    clearAllSuggestions({ resetActive: false })
+    return
+  }
+
+  try {
+    if (suggestionSelectionMode.value) {
+      return
+    }
+
+    const commandText = cmd ? cmd : terminalState.value.beforeCursor
+    const tokens = tokenizeCommandLine(commandText)
+    const wordIndex = tokens.length - 1
+
+    const [historyResult, figResult] = await Promise.all([
+      (window.api as any).queryCommand({ command: commandText, ip: props.connectData.ip }).catch(() => []),
+      (window.api as any).queryFigSpec({ commandLine: commandText, tokens }).catch(() => [])
+    ])
+
+    const merged = mergeSuggestions(
+      (historyResult ?? []) as CommandSuggestion[],
+      (figResult ?? []).map((s: { text: string; displayText: string; description?: string; source: CommandSuggestion['source'] }) => ({
+        command: s.text,
+        displayLabel: s.displayText,
+        explanation: s.description,
+        source: s.source
+      })) as CommandSuggestion[],
+      wordIndex
+    )
+
+    suggestions.value = merged
+    if (merged.length) {
+      setTimeout(() => {
+        const componentInstance = componentRefs.value[connectionId.value]
+        componentInstance?.updateSuggestionsPosition(terminal.value)
+      }, 1)
+    }
+  } catch (error) {
+    logger.error('Query failed', { error: error })
+  }
+}
+let queryCommandDebounceTimer: ReturnType<typeof setTimeout> | null = null
+const debouncedQueryCommand = () => {
+  if (queryCommandDebounceTimer) clearTimeout(queryCommandDebounceTimer)
+  queryCommandDebounceTimer = setTimeout(() => {
+    queryCommandDebounceTimer = null
+    queryCommand()
+  }, 80)
+}
+const insertCommand = async (cmd) => {
+  try {
+    await window.api.insertCommand({
+      command: cmd,
+      ip: props.connectData.ip
+    })
+  } catch (error) {}
+}
+
+const handleKeyInput = (e) => {
+  enterPress.value = false
+  tagPress.value = false
+  specialCode.value = false
+  const ev = e.domEvent
+  const printable = !ev.altKey && !ev.ctrlKey && !ev.metaKey
+  const buffer: any = terminal.value?.buffer.active
+  cursorX.value = buffer.cursorX
+  cursorY.value = buffer.cursorY
+  keyCode.value = ev.keyCode
+  let index = 0
+  if (cursorStartX.value == 0) {
+    cursorStartX.value = cursorX.value
+  } else {
+    cursorX.value !== 0 && cursorX.value < cursorStartX.value && (cursorStartX.value = cursorX.value)
+  }
+
+  if (ev.keyCode === 13 || e.key === '\u0003') {
+    if (displaySuggestions.value.length && activeSuggestion.value >= 0) {
+      return
+    }
+
+    enterPress.value = true
+    selectFlag.value = true
+    currentLine.value = ''
+    cursorStartX.value = 0
+    terminalState.value.contentCrossRowStatus = false
+    terminalState.value.contentCrossStartLine = 0
+    terminalState.value.contentCrossRowLines = 0
+
+    // Ensure scroll to bottom and maintain focus
+    scheduleScrollToBottomAndFocus()
+  } else if (ev.keyCode === 8) {
+    index = cursorX.value - 1 - cursorStartX.value
+    currentLine.value = currentLine.value.slice(0, index) + currentLine.value.slice(index + 1)
+  } else if (ev.keyCode == 38 || ev.keyCode == 40) {
+    specialCode.value = true
+  } else if (ev.keyCode == 37 || ev.keyCode == 39) {
+    specialCode.value = true
+    if (displaySuggestions.value.length) {
+      specialCode.value = false
+    }
+  } else if (ev.keyCode == 9) {
+    tagPress.value = true
+  } else if (printable) {
+    selectFlag.value = false
+  } else {
+    selectFlag.value = false
+  }
+}
+
+const disconnectSSH = async () => {
+  manualDisconnectRequested.value = true
+  localEcho.reset()
+  resetAutoReconnectState()
+  logger.info('Manual disconnect requested', {
+    event: 'ssh.disconnect.manual.renderer',
+    connectionId: connectionId.value
+  })
+  try {
+    let result: { status: string; message?: string }
+    if (props.connectData.asset_type === 'person-serial') {
+      const serialResult = await api.closeSerial(connectionId.value)
+      result = { status: serialResult?.success ? 'success' : 'error', message: serialResult?.message || '' }
+    } else {
+      result = await api.disconnect({ id: connectionId.value })
+    }
+    if (result.status === 'success') {
+      cleanupListeners.value.forEach((cleanup) => cleanup())
+      cleanupListeners.value = []
+      isConnected.value = false
+      cusWrite?.('\r\n' + t('ssh.disconnected'), { isUserCall: true })
+      cusWrite?.('\r\n' + t('ssh.pressEnterToReconnect') + '\r\n', { isUserCall: true })
+    } else {
+      cusWrite?.('\r\n' + t('ssh.disconnectError', { message: result.message }), { isUserCall: true })
+    }
+  } catch (error: any) {
+    cusWrite?.('\r\n' + t('ssh.disconnectError', { message: error.message || t('ssh.unknownError') }), {
+      isUserCall: true
+    })
+  }
+  emit('disconnectSSH', { isConnected: isConnected })
+}
+const contextAct = (action) => {
+  switch (action) {
+    case 'paste':
+      if (startStr.value == '') {
+        startStr.value = beginStr.value
+      }
+      pasteFlag.value = true
+      navigator.clipboard.readText().then((text) => {
+        sendDataAutoSwitchTerminal(text)
+        terminal.value?.focus()
+      })
+      break
+    case 'disconnect':
+      disconnectSSH().then(() => {
+        terminal.value?.focus()
+      })
+      break
+    case 'reconnect':
+      connectSSH()
+      break
+    case 'newTerminal':
+      emit('createNewTerm', props.serverInfo)
+      break
+    case 'close':
+      emit('closeTabInTerm', props.activeTabId || props.currentConnectionId)
+      break
+    case 'clearTerm':
+      terminal.value?.clear()
+      break
+    case 'shrotenName':
+      sendData('export PS1="[\\u@\\W]\\$"')
+      sendData('\r')
+      break
+    case 'fontsizeLargen':
+      adjustFontSize(1)
+      break
+    case 'fontsizeSmaller':
+      adjustFontSize(-1)
+      break
+    case 'fileManager':
+      eventBus.emit('openUserTab', 'files')
+      break
+    default:
+      break
+  }
+}
+
+const focus = () => {
+  if (terminal.value) {
+    if (shouldAutoScrollAfterTerminalWrite(terminal.value)) {
+      terminal.value.scrollToBottom()
+    }
+    terminal.value.focus()
+    inputManager.setActiveTerm(connectionId.value)
+  }
+}
+
+const hideSelectionButton = () => {
+  showAiButton.value = false
+}
+
+// Adjust font size function (only affects current terminal instance)
+const adjustFontSize = async (delta: number) => {
+  if (!terminal.value) return
+
+  const currentFontSize = terminal.value.options.fontSize || 12
+  const newFontSize = Math.max(8, Math.min(32, currentFontSize + delta))
+
+  if (newFontSize !== currentFontSize) {
+    // Update current terminal font size
+    terminal.value.options.fontSize = newFontSize
+
+    // Trigger resize to adjust terminal layout
+    setTimeout(() => {
+      handleResize()
+    }, 50)
+  }
+}
+
+// Handle wheel event for font size adjustment (pinch zoom)
+const handleWheel = (e: WheelEvent) => {
+  if (config && config.pinchZoomStatus !== 1) return
+
+  if (!props.isActive) return
+
+  const activeTerm = inputManager.getActiveTerm()
+  if (activeTerm.id !== connectionId.value) return
+
+  const activeElement = document.activeElement
+  const terminalContainer = terminalElement.value?.closest('.terminal-container')
+  const isTerminalFocused =
+    activeElement === terminal.value?.textarea ||
+    terminalContainer?.contains(activeElement) ||
+    activeElement?.classList.contains('xterm-helper-textarea')
+
+  if (!isTerminalFocused) return
+
+  if (e.ctrlKey && terminal.value) {
+    e.preventDefault()
+    if (e.deltaY < 0) {
+      // Wheel up - increase font size
+      adjustFontSize(1)
+    } else {
+      // Wheel down - decrease font size
+      adjustFontSize(-1)
+    }
+  }
+}
+
+const handleGlobalKeyDown = (e: KeyboardEvent) => {
+  if (contextmenu.value && typeof contextmenu.value.hide === 'function') {
+    contextmenu.value.hide()
+  }
+  const activeTerm = inputManager.getActiveTerm()
+  if (!activeTerm.id || !connectionId.value || activeTerm.id !== connectionId.value) return
+
+  const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0
+
+  // Search functionality
+  // Windows uses the method of listening for key messages, window.addEventListener('message', handlePostMessage)
+  if ((isMac ? e.metaKey : e.ctrlKey) && e.key === 'f') {
+    if (isFocusInAiTab(e)) {
+      return
+    }
+    e.preventDefault()
+    e.stopPropagation()
+    openSearch()
+  }
+
+  // Close current terminal tab
+  if ((isMac && e.metaKey && e.key === 'w') || (!isMac && e.ctrlKey && e.shiftKey && e.key === 'W')) {
+    if (isFocusInAiTab(e)) {
+      return
+    }
+
+    const currentTime = Date.now()
+
+    // Debounce check: ignore if close operation has been processed recently
+    if (currentTime - (window as any).lastCloseTime < CLOSE_DEBOUNCE_TIME) {
+      e.preventDefault()
+      e.stopPropagation()
+      return
+    }
+
+    // Only the currently active terminal responds to close events
+    ;(window as any).lastCloseTime = currentTime
+    e.preventDefault()
+    e.stopPropagation()
+    contextAct('close')
+    return
+  }
+
+  if (e.key === 'Escape' && showSearch.value) {
+    e.preventDefault()
+    e.stopPropagation()
+    closeSearch()
+  }
+}
+// Open command dialog only for the terminal that currently has focus
+const tryOpenLocalCommandDialog = () => {
+  const activeElement = document.activeElement
+  if (!terminalContainer.value?.contains(activeElement as Node)) return
+
+  // If dialog is already open, do nothing (let CommandDialog handle focus toggle internally)
+  if (isCommandDialogVisible.value) return
+
+  // Ensure terminal is focused for accurate positioning
+  terminal.value?.focus()
+  isCommandDialogVisible.value = true
+}
+const handleOpenCommandDialog = () => {
+  tryOpenLocalCommandDialog()
+}
+
+// Listen to global openCommandDialog and restrict to this terminal/tab
+eventBus.on('openCommandDialog', handleOpenCommandDialog)
+
+cleanupListeners.value.push(() => {
+  eventBus.off('openCommandDialog', handleOpenCommandDialog)
+})
+
+// Listen to focusActiveTerminal event to return focus to terminal
+const handleFocusActiveTerminal = (targetConnectionId?: string) => {
+  if (targetConnectionId && targetConnectionId !== props.currentConnectionId) return
+  terminal.value?.focus()
+}
+
+eventBus.on('focusActiveTerminal', handleFocusActiveTerminal)
+
+cleanupListeners.value.push(() => {
+  eventBus.off('focusActiveTerminal', handleFocusActiveTerminal)
+})
+
+// Hide dialog when tab deactivates; restore when re-activates
+watch(
+  () => props.activeTabId,
+  (newActive) => {
+    if (newActive !== props.currentConnectionId) {
+      wasDialogVisibleBeforeDeactivation.value = isCommandDialogVisible.value
+      isCommandDialogVisible.value = false
+    } else {
+      if (wasDialogVisibleBeforeDeactivation.value) {
+        // Restore visibility and reposition
+        nextTick(() => {
+          terminal.value?.focus()
+          isCommandDialogVisible.value = true
+        })
+      }
+    }
+  }
+)
+
+watch(
+  () => props.isActive,
+  (newIsActive) => {
+    if (newIsActive && props.activeTabId === props.currentConnectionId) {
+      nextTick(() => {
+        if (terminal.value) {
+          focus()
+        }
+      })
+    }
+  }
+)
+
+const openSearch = () => {
+  showSearch.value = true
+}
+
+const closeSearch = () => {
+  showSearch.value = false
+  searchAddon.value?.clearDecorations()
+  terminal.value?.focus()
+}
+
+watch(
+  () => commandBarHeight.value,
+  () => {
+    terminalContainerResize()
+  }
+)
+
+const terminalContainerResize = () => {
+  const currentHeight = commandBarHeight.value
+  if (currentHeight > 0) {
+    terminalContainer.value?.style.setProperty('height', `calc(100% - ${currentHeight}px)`)
+  } else {
+    terminalContainer.value?.style.setProperty('height', '100%')
+    if (terminal.value) {
+      if (shouldAutoScrollAfterTerminalWrite(terminal.value)) {
+        terminal.value.scrollToBottom()
+      }
+      terminal.value.focus()
+    }
+  }
+}
+
+const onChatToAiClick = () => {
+  if (terminal.value && terminal.value.hasSelection()) {
+    const text = terminal.value.getSelection()
+    eventBus.emit('openAiRight')
+    setTimeout(() => {
+      const formattedText = `Terminal output:\n\`\`\`\n${text.trim()}\n\`\`\``
+      eventBus.emit('chatToAi', formattedText)
+    }, 100)
+    terminal.value.clearSelection()
+  }
+}
+
+const getCursorLinePosition = () => {
+  if (!terminal.value) {
+    logger.warn('Terminal not available')
+    return null
+  }
+
+  try {
+    const termInstance = terminal.value
+    const terminalCore = (termInstance as any)._core
+    const buffer = terminalCore._bufferService.buffer
+    const renderService = terminalCore._renderService
+
+    const { x: cursorX, y: cursorY } = buffer
+    const baseY = termInstance.buffer.active.baseY
+
+    const cellHeight = renderService.dimensions.css.cell.height || 16
+    const cellWidth = renderService.dimensions.css.cell.width || 8
+
+    const terminalRect = terminalElement.value?.getBoundingClientRect()
+
+    const cursorPixelX = cursorX * cellWidth
+    const cursorPixelY = cursorY * cellHeight
+
+    const screenPosition = terminalRect
+      ? {
+          x: terminalRect.left + cursorPixelX,
+          y: terminalRect.top + cursorPixelY
+        }
+      : null
+
+    return {
+      logicalX: cursorX,
+      logicalY: baseY + cursorY,
+
+      screenX: cursorX,
+      screenY: cursorY,
+
+      pixelX: cursorPixelX,
+      pixelY: cursorPixelY,
+
+      absoluteX: screenPosition?.x || null,
+      absoluteY: screenPosition?.y || null,
+
+      cellHeight,
+      cellWidth,
+
+      terminalRect: terminalRect
+        ? {
+            left: terminalRect.left,
+            top: terminalRect.top,
+            width: terminalRect.width,
+            height: terminalRect.height
+          }
+        : null,
+
+      currentLineContent: buffer.lines.get(baseY + cursorY)?.translateToString(true) || '',
+
+      isCrossRow: cursorEndY.value !== cursorY
+    }
+  } catch (error) {
+    logger.error('Get cursor position failed', { error: error })
+    return null
+  }
+}
+defineExpose({
+  handleResize,
+  autoExecuteCode,
+  terminal,
+  focus,
+  getCursorLinePosition,
+  triggerResize: () => {
+    handleResize()
+  }
+})
+
+const commandOutput = ref('')
+const commandOutputProcessTimer = ref<ReturnType<typeof setTimeout> | null>(null)
+const isCollectingOutput = ref(false)
+// Mapping from command marker to tabId, used to send command execution results back to the corresponding Tab
+const commandMarkerToTabId = ref(new Map<string, string | undefined>())
+// Mapping from command marker to command content, used to remove command echo from output
+const commandMarkerToCommand = ref(new Map<string, string>())
+const currentCommandMarker = ref<string | null>(null)
+const currentCommandTabId = ref<string | undefined>(undefined)
+
+let cachedSelectionButton: HTMLElement | null = null
+
+function updateSelectionButtonPosition() {
+  if (!terminal.value) return
+  const termInstance = terminal.value
+  if (!termInstance.hasSelection()) {
+    showAiButton.value = false
+    return
+  }
+  const position = termInstance.getSelectionPosition()
+  if (position && termInstance.getSelection().trim()) {
+    if (!cachedSelectionButton) {
+      cachedSelectionButton = document.getElementById(`${connectionId.value}Button`) as HTMLElement
+    }
+    const button = cachedSelectionButton
+    if (!button) return
+    const viewportY = termInstance.buffer.active.viewportY
+    const viewportRows = termInstance.rows
+    const visibleStart = viewportY
+    const visibleEnd = viewportY + viewportRows - 1
+    const { y: startY } = position.start
+    const { y: endY } = position.end
+    if ((startY < visibleStart || startY > visibleEnd) && (endY < visibleStart || endY > visibleEnd)) {
+      showAiButton.value = false
+      return
+    }
+    const visibleRow = startY - viewportY
+    const cellHeight = (termInstance as any)._core._renderService.dimensions.css.cell.height
+    const top = visibleRow - 2 > 0 ? (visibleRow - 2) * cellHeight : 0
+    button.style.right = `26px`
+    button.style.top = `${top}px`
+    showAiButton.value = true
+  } else {
+    showAiButton.value = false
+  }
+}
+
+// Helpers for suggestion handling
+const isDeleteKeyData = (d: string) => d === '\x7f' || d === '\b' || d === '\x1b[3~'
+
+const CTRL_LINK_CLASS = 'ctrl-link-mode'
+const ctrlLinkPressed = ref(false)
+const LISTING_CMDS = new Set(['ls', 'll', 'la', 'dir', 'l'])
+const lineListingCache = new Map<number, boolean>()
+const promptBlockCache = new Map<number, { promptY: number; nextPromptY: number; isListing: boolean }>()
+
+const MAX_SCAN_UP = 2000
+const MAX_SCAN_DOWN = 4000
+
+const isPromptLine = (text: string, lineObj?: any): boolean => {
+  const t = stripAnsi(text).trimEnd()
+  if (!t) return false
+  if (lineObj?.isWrapped) return false
+
+  if (typeof startStr.value !== 'undefined' && startStr.value) {
+    const p = String(startStr.value).trimEnd()
+    if (p && t.startsWith(p)) return true
+  }
+
+  // Common shell prompts (including $/#)
+  return /[$#]\s*$/.test(t) || /[$#]\s+/.test(t)
+}
+
+const extractCmdFromPromptLine = (promptLine: string): string => {
+  const t = stripAnsi(promptLine).trimEnd()
+
+  if (typeof startStr.value !== 'undefined' && startStr.value) {
+    const p = String(startStr.value).trimEnd()
+    if (p && t.startsWith(p)) return t.slice(p.length).trim()
+  }
+
+  // Retrieve the command following the last "$" or "#"
+  const m = t.match(/[$#]\s+(.*)$/)
+  return (m?.[1] ?? '').trim()
+}
+
+const isListingCommand = (cmdLine: string): boolean => {
+  if (!cmdLine) return false
+  const firstSeg = cmdLine.split(';')[0].trim()
+  const cleaned = firstSeg
+    .replace(/^sudo\s+/, '')
+    .replace(/^\\/, '')
+    .trim()
+  const firstToken = cleaned.split(/\s+/)[0]
+  return LISTING_CMDS.has(firstToken)
+}
+
+const findPromptUp = (absY: number, term: Terminal): number | null => {
+  const buf = term.buffer.active
+  const minY = Math.max(0, absY - MAX_SCAN_UP)
+  for (let y = absY; y >= minY; y--) {
+    const line = buf.getLine(y)
+    if (!line) continue
+    const text = line.translateToString(true)
+    if (isPromptLine(text, line)) return y
+  }
+  return null
+}
+
+const findNextPromptDown = (promptY: number, term: Terminal): number => {
+  const buf = term.buffer.active
+  const maxY = Math.min(buf.length - 1, promptY + MAX_SCAN_DOWN)
+  for (let y = promptY + 1; y <= maxY; y++) {
+    const line = buf.getLine(y)
+    if (!line) continue
+    const text = line.translateToString(true)
+    if (isPromptLine(text, line)) return y
+  }
+  return buf.length
+}
+
+// Check whether (1-based) belongs to the ls/ll/la output block
+const isListingOutputLine = (bufferLineNumber: number, term: Terminal): boolean => {
+  const absY = bufferLineNumber - 1
+  const cached = lineListingCache.get(absY)
+  if (cached !== undefined) return cached
+
+  const promptY = findPromptUp(absY, term)
+  if (promptY === null) {
+    lineListingCache.set(absY, false)
+    return false
+  }
+
+  let block = promptBlockCache.get(promptY)
+  if (!block) {
+    const promptText = term.buffer.active.getLine(promptY)?.translateToString(true) ?? ''
+    const cmd = extractCmdFromPromptLine(promptText)
+    const isListing = isListingCommand(cmd)
+    const nextPromptY = findNextPromptDown(promptY, term)
+    block = { promptY, nextPromptY, isListing }
+    promptBlockCache.set(promptY, block)
+  }
+
+  const inOutput = absY > block.promptY && absY < block.nextPromptY
+  const res = block.isListing && inOutput
+  lineListingCache.set(absY, res)
+  return res
+}
+
+const isThisTerminalActive = (): boolean => {
+  const activeTerm = inputManager.getActiveTerm()
+  if (!activeTerm?.id || !connectionId.value) return false
+  if (activeTerm.id !== connectionId.value) return false
+  if (props.activeTabId !== props.currentConnectionId) return false
+  if (!props.isActive) return false
+  return true
+}
+
+// Detect terminal status
+const canLinkify = (): boolean => {
+  if (!isThisTerminalActive()) return false
+  if (terminalMode.value !== 'none') return false
+  if (!terminal.value) return false
+  return true
+}
+
+// TODO: Hover background color
+// let ctrlOverlay: HTMLDivElement | null = null
+//
+// const resetListingCache = () => {
+//   lineListingCache.clear()
+//   promptBlockCache.clear()
+// }
+// const clearCtrlOverlay = () => {
+//   ctrlOverlay?.remove()
+//   ctrlOverlay = null
+// }
+
+// const applyCtrlOverlay = () => {
+//   clearCtrlOverlay()
+//   // Rescan every time you press Ctrl
+//   resetListingCache()
+//   if (!terminal.value || !terminalElement.value) return
+//
+//   const term = terminal.value
+//   const buf = term.buffer.active
+//   const viewportY = buf.viewportY
+//
+//   const rowEl = terminalElement.value.querySelector('.xterm-rows > div') as HTMLElement
+//   if (!rowEl) return
+//   const rowHeight = rowEl.getBoundingClientRect().height
+//   if (!rowHeight) return
+//
+//   // Get the width of a single character
+//   const cellWidth = (term as any)._core._renderService.dimensions.css.cell.width
+//   if (!cellWidth) return
+//
+//   const overlay = document.createElement('div')
+//   overlay.style.cssText = `
+//     position: absolute;
+//     top: 0; left: 0;
+//     width: 100%; height: 100%;
+//     pointer-events: none;
+//     z-index: 2;
+//   `
+//
+//   let hasAny = false
+//
+//   for (let row = 0; row < term.rows; row++) {
+//     const absY = viewportY + row
+//     if (!isListingOutputLine(absY + 1, term)) continue
+//
+//     const line = buf.getLine(absY)
+//     if (!line) continue
+//     const text = line.translateToString(true)
+//     if (!text.trim()) continue
+//
+//     const candidates = extractCandidates(text)
+//     if (!candidates.length) continue
+//
+//     for (const c of candidates) {
+//       // toCellX returns a 1-based cell column, which is converted to a 0-based pixel (px) column
+//       const startCell = toCellX(text, c.startChar) - 1
+//       const endCell = toCellX(text, c.endChar) - 1
+//
+//       const token = document.createElement('div')
+//       token.style.cssText = `
+//         position: absolute;
+//         top: ${row * rowHeight}px;
+//         left: ${startCell * cellWidth}px;
+//         width: ${(endCell - startCell) * cellWidth}px;
+//         height: ${rowHeight}px;
+//         background: rgba(22,119,255,0.15);
+//         border-radius: 2px;
+//         pointer-events: none;
+//       `
+//       overlay.appendChild(token)
+//       hasAny = true
+//     }
+//   }
+//
+//   if (!hasAny) return
+//
+//   const screen = terminalElement.value.querySelector('.xterm-screen') as HTMLElement
+//   if (!screen) return
+//   if (getComputedStyle(screen).position === 'static') {
+//     screen.style.position = 'relative'
+//   }
+//
+//   screen.appendChild(overlay)
+//   ctrlOverlay = overlay
+// }
+
+const setCtrlLinkPressed = (v: boolean, options: { preserveSelection?: boolean } = {}) => {
+  if (ctrlLinkPressed.value === v) return
+  ctrlLinkPressed.value = v
+
+  if (terminalElement.value) {
+    terminalElement.value.classList.toggle(CTRL_LINK_CLASS, v)
+  }
+
+  terminal.value?.refresh(0, (terminal.value?.rows ?? 1) - 1)
+
+  if (v) {
+    // applyCtrlOverlay()
+  } else {
+    // clearCtrlOverlay()
+    if (!options.preserveSelection) {
+      terminal.value?.clearSelection()
+      showAiButton.value = false
+    }
+  }
+}
+
+// Ctrl key listener
+const handleCtrlKeyDown = (e: KeyboardEvent) => {
+  if (handleSelectAllShortcut(e)) return
+  if (e.key !== 'Control') return
+  if (!canLinkify()) return
+  setCtrlLinkPressed(true)
+}
+const handleCtrlKeyUp = (e: KeyboardEvent) => {
+  if (e.key !== 'Control') return
+  if (!ctrlLinkPressed.value) {
+    preserveSelectionOnCtrlLinkRelease.value = false
+    return
+  }
+  setCtrlLinkPressed(false, { preserveSelection: preserveSelectionOnCtrlLinkRelease.value })
+  preserveSelectionOnCtrlLinkRelease.value = false
+}
+
+type LsBlock = {
+  startLine: number // 1-based
+  endLine: number // 1-based
+  cwd: string | null
+  cmd: string
+  ts: number
+}
+
+const lsBlocks = ref<LsBlock[]>([])
+const pendingLs = ref<{ startLine: number; cmd: string; ts: number; cwd: string | null } | null>(null)
+
+const getAbsLine1Based = (): number => {
+  const buf: any = terminal.value?.buffer.active
+  return (buf?.baseY ?? 0) + (buf?.cursorY ?? 0) + 1
+}
+
+const isListingCmd = (cmd: string): boolean => {
+  if (!cmd) return false
+  const firstToken = cmd.trim().split(/\s+/)[0]
+  return LISTING_CMDS.has(firstToken)
+}
+
+const findLsBlockByLine = (y: number): LsBlock | null => {
+  if (!terminal.value) return null
+
+  for (let i = lsBlocks.value.length - 1; i >= 0; i--) {
+    const b = lsBlocks.value[i]
+    if (y < b.startLine) continue
+
+    // calculate endLine，
+    const term = terminal.value
+    // return 0-based absY
+    const dynamicEndLine = findNextPromptDown(b.startLine - 1, term) // findNextPromptDown
+
+    if (y < dynamicEndLine) {
+      logger.info('findLsBlockByLine matched', { y, startLine: b.startLine, dynamicEndLine, cmd: b.cmd })
+      return b
+    }
+  }
+  return null
+}
+
+const resolvePosix = (base: string, name: string): string => {
+  const b = base.endsWith('/') ? base.slice(0, -1) : base
+  const n = name.replace(/^\/+/, '')
+  return `${b}/${n}`
+}
+
+const extractLsDirArg = (cmd: string): string | null => {
+  const parts = cmd.trim().split(/\s+/)
+  if (!parts.length) return null
+  // parts[0] is ls/ll/la
+  const args = parts.slice(1).filter((p) => p && !p.startsWith('-'))
+  return args[0] ?? null
+}
+
+const safeDecodeB64 = (s: string) => {
+  try {
+    return Base64Util.decode(s)
+  } catch {
+    return ''
+  }
+}
+
+const getBasePath = (value: string) => {
+  if (value.includes('local-team')) {
+    const [, rest = ''] = String(value || '').split('@')
+    const parts = rest.split(':')
+    const hostname = safeDecodeB64(parts[2] || '') || 'Local'
+    return `/Default/${hostname}`
+  }
+
+  return ''
+}
+
+const downloadFile = async (remotePath: string, fileName: string) => {
+  logger.info('downloadFiledownloadFiledownloadFile:', { remotePath })
+  const localPath = await api.openSaveDialog({ fileName })
+  if (!localPath) return
+
+  remotePath = getBasePath(connectionId.value) + remotePath
+
+  try {
+    const res = await api.downloadFile({
+      id: connectionId.value,
+      remotePath: remotePath,
+      localPath: localPath
+    })
+
+    const config = {
+      success: { type: 'success', text: t('files.downloadSuccess') },
+      cancelled: { type: 'info', text: t('files.downloadCancel') },
+      skipped: { type: 'info', text: t('files.downloadSkipped') }
+    }[res.status] || { type: 'error', text: `${t('files.downloadFailed')}：${res.message}` }
+    message[config.type]({
+      content: config.text,
+      key: `download-${connectionId.value}-${Date.now()}`,
+      duration: 3
+    })
+  } catch (err: any) {
+    logger.error('Download error', { error: err })
+    message.error({
+      content: `${t('files.downloadError')}：${(err as Error).message}`,
+      key: `download-${connectionId.value}-${Date.now()}`,
+      duration: 3
+    })
+  }
+}
+
+const triggerDownloadOrOpen = (raw: string, y: number) => {
+  const name = normalizeClickableText(raw)
+
+  if (!name) return
+  // if (name.startsWith('/')) {
+  //   download(fullPath,name)
+  //   return
+  // }
+
+  const block = findLsBlockByLine(y)
+  const cwd = block?.cwd
+
+  if (!cwd) {
+    message.error({
+      content: `${t('files.downloadError')}：${t('files.getCwdFailed')}`,
+      key: `download-${connectionId.value}-${Date.now()}`,
+      duration: 3
+    })
+    return
+  }
+  let baseDir = cwd
+  const dirArg = block ? extractLsDirArg(block.cmd) : null
+  if (dirArg) {
+    baseDir = dirArg.startsWith('/') ? dirArg : resolvePosix(cwd, dirArg)
+  }
+
+  const fullPath = resolvePosix(baseDir, name)
+  downloadFile(fullPath, name)
+}
+
+const normalizeClickableText = (s: string): string => {
+  let t = s.trim()
+  if (!t) return ''
+  if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
+    t = t.slice(1, -1).trim()
+  }
+  t = t.replace(/[\/\*\@\|\=]+$/g, '')
+  return t.trim()
+}
+
+const toCellX = (line: string, charIndex: number): number => {
+  return calculateDisplayPosition(line, charIndex) + 1
+}
+
+type Candidate = { text: string; startChar: number; endChar: number }
+
+// Try to recognize the `ls -l` command
+const extractCandidates = (line: string): Candidate[] => {
+  const out: Candidate[] = []
+
+  const longRe = /^[\-dlcbps][rwx\-]{9}\s+\d+\s+\S+\s+\S+\s+\d+\s+\w+\s+\d+\s+(?:\d{2}:\d{2}|\d{4})\s+(.+)$/
+  const m = longRe.exec(line)
+  if (m?.[1]) {
+    const namePart = m[1]
+
+    const startChar = m[0].length - namePart.length
+
+    const arrowIdx = namePart.indexOf(' -> ')
+    const nameOnly = arrowIdx >= 0 ? namePart.slice(0, arrowIdx) : namePart
+
+    out.push({
+      text: nameOnly,
+      startChar,
+      endChar: startChar + nameOnly.length
+    })
+    return out
+  }
+
+  const tokenRe = /\S+/g
+  let mt: RegExpExecArray | null
+  while ((mt = tokenRe.exec(line))) {
+    const token = mt[0]
+    if (token === '.' || token === '..') continue
+    out.push({ text: token, startChar: mt.index, endChar: mt.index + token.length })
+  }
+  return out
+}
+const createCtrlLinkProvider = (term: Terminal): ILinkProvider => {
+  return {
+    provideLinks: (bufferLineNumber, callback) => {
+      if (!ctrlLinkPressed.value || !canLinkify()) {
+        callback(undefined)
+        return
+      }
+      //
+      // const block = findLsBlockByLine(bufferLineNumber)
+      // if (!block) {
+      //   callback(undefined)
+      //   return
+      // }
+
+      const line = term.buffer.active.getLine(bufferLineNumber - 1)
+      if (!line) return callback(undefined)
+
+      const text = line.translateToString(true)
+      const trimmed = text.trim()
+      if (!trimmed) return callback(undefined)
+
+      const isPrompt =
+        (typeof startStr.value !== 'undefined' && startStr.value && trimmed.startsWith(startStr.value.trimEnd())) ||
+        isTerminalPromptLine(trimmed) ||
+        /[#$]\s/.test(trimmed)
+      if (isPrompt) return callback(undefined)
+
+      if (!isListingOutputLine(bufferLineNumber, term)) {
+        callback(undefined)
+        return
+      }
+
+      const candidates = extractCandidates(text)
+      if (!candidates.length) return callback(undefined)
+
+      const links: ILink[] = candidates.map((c) => {
+        const startX = toCellX(text, c.startChar)
+        const endX = toCellX(text, c.endChar) - 1
+        return {
+          text: c.text,
+          range: {
+            start: { x: startX, y: bufferLineNumber },
+            end: { x: Math.max(endX, startX), y: bufferLineNumber }
+          },
+          activate: (_event, linkText) => {
+            if (!ctrlLinkPressed.value) return
+            term.clearSelection()
+            showAiButton.value = false
+            triggerDownloadOrOpen(linkText, bufferLineNumber)
+          }
+        }
+      })
+
+      callback(links)
+    }
+  }
+}
+</script>
+
+<style lang="less">
+.ant-form-item .ant-form-item-label > label {
+  color: var(--text-color);
+}
+
+.ant-radio-wrapper {
+  color: var(--text-color);
+}
+
+.terminal-container {
+  width: 100%;
+  height: 100%;
+  border-radius: 6px;
+  overflow: hidden;
+  padding: 4px 4px 0px 12px;
+  position: relative;
+
+  &.transparent-bg {
+    background-color: transparent !important;
+  }
+}
+
+.terminal {
+  width: 100%;
+  height: 100%;
+}
+
+.xterm-screen {
+  -webkit-font-smoothing: subpixel-antialiased;
+  transform: translateZ(0);
+}
+
+.terminal .xterm-viewport,
+.terminal .xterm-scrollable-element {
+  background-color: transparent !important;
+}
+
+.terminal ::-webkit-scrollbar {
+  width: 6px;
+}
+
+.terminal ::-webkit-scrollbar-track {
+  background: transparent;
+  border-radius: 3px;
+}
+
+.terminal ::-webkit-scrollbar-thumb {
+  background-color: transparent;
+  border-radius: 3px;
+}
+
+/* Firefox scrollbar styles */
+.terminal {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+
+.terminal .xterm-viewport {
+  scrollbar-width: thin !important;
+  scrollbar-color: transparent transparent !important;
+}
+
+/* Show scrollbar only while content is scrolling (hide after 2s of no scrolling) */
+.terminal-container.scrollbar-visible .terminal ::-webkit-scrollbar-thumb {
+  background-color: var(--border-color-light);
+}
+
+.terminal-container.scrollbar-visible .terminal ::-webkit-scrollbar-thumb:hover {
+  background-color: var(--text-color-tertiary);
+}
+
+.terminal-container.scrollbar-visible .terminal {
+  scrollbar-color: var(--border-color-light) transparent;
+}
+
+.terminal-container.scrollbar-visible .terminal .xterm-viewport {
+  scrollbar-color: var(--border-color-light) transparent !important;
+}
+
+.select-button {
+  position: absolute;
+  z-index: 10;
+  padding: 4px 8px;
+  border-radius: 4px;
+  color: var(--text-color);
+  font-size: 12px;
+  background-color: var(--bg-color-secondary);
+  border: 1px solid var(--border-color-light);
+
+  .main-text {
+    color: var(--text-color);
+    font-size: 12px;
+    font-weight: 500;
+  }
+
+  .shortcut-text {
+    color: var(--text-color-secondary);
+    font-size: 10px;
+    margin-left: 4px;
+    font-weight: 400;
+  }
+
+  &:hover {
+    color: var(--text-color) !important;
+    border: 1px solid var(--border-color-light) !important;
+
+    .main-text {
+      color: var(--text-color) !important;
+    }
+
+    .shortcut-text {
+      color: var(--text-color-secondary) !important;
+    }
+  }
+}
+</style>

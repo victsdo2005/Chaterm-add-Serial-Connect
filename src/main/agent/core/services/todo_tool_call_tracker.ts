@@ -1,0 +1,156 @@
+import { TodoContextTracker } from './todo_context_tracker'
+import { TodoStorage } from '../storage/todo/TodoStorage'
+import { TodoToolCall } from '../../shared/todo/TodoSchemas'
+const logger = createLogger('agent')
+
+export class TodoToolCallTracker {
+  /**
+   * Record tool call to active todo item
+   */
+  static async recordToolCall(taskId: string, toolName: string, parameters: Record<string, unknown>): Promise<void> {
+    try {
+      const contextTracker = TodoContextTracker.forSession(taskId)
+      const activeTodoId = contextTracker.getActiveTodoId()
+      if (!activeTodoId) {
+        return // No active todo, don't record
+      }
+      const storage = new TodoStorage(taskId)
+      const todos = await storage.readTodos()
+      const activeTodo = todos.find((t) => t.id === activeTodoId)
+      if (!activeTodo) {
+        return
+      }
+      // Create tool call record
+      const toolCall: TodoToolCall = {
+        id: `tool_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        name: toolName,
+        parameters: parameters,
+        timestamp: new Date()
+      }
+      // Add to todo's tool call list
+      if (!activeTodo.toolCalls) {
+        activeTodo.toolCalls = []
+      }
+      activeTodo.toolCalls.push(toolCall)
+      // Update todo's last modified time
+      activeTodo.updatedAt = new Date()
+      // Save updated todos
+      await storage.writeTodos(todos)
+      logger.info(`Recorded tool call "${toolName}" for todo "${activeTodo.content}"`)
+    } catch (error) {
+      logger.error('Failed to record tool call', { error: error })
+      // Don't throw error, avoid affecting main functionality
+    }
+  }
+
+  /**
+   * Get all tool call records for specified todo
+   */
+  static async getToolCallsForTodo(taskId: string, todoId: string): Promise<TodoToolCall[]> {
+    try {
+      const storage = new TodoStorage(taskId)
+      const todos = await storage.readTodos()
+      const todo = todos.find((t) => t.id === todoId)
+      return todo?.toolCalls || []
+    } catch (error) {
+      logger.error('Failed to get tool calls for todo', { error: error })
+      return []
+    }
+  }
+
+  /**
+   * Get tool call statistics for all todos
+   */
+  static async getToolCallStatistics(taskId: string): Promise<{
+    totalCalls: number
+    callsByTool: Record<string, number>
+    callsByTodo: Record<string, number>
+  }> {
+    try {
+      const storage = new TodoStorage(taskId)
+      const todos = await storage.readTodos()
+      let totalCalls = 0
+      const callsByTool: Record<string, number> = {}
+      const callsByTodo: Record<string, number> = {}
+      todos.forEach((todo) => {
+        const todoCallCount = todo.toolCalls?.length || 0
+        totalCalls += todoCallCount
+        callsByTodo[todo.id] = todoCallCount
+        todo.toolCalls?.forEach((call) => {
+          callsByTool[call.name] = (callsByTool[call.name] || 0) + 1
+        })
+      })
+      return {
+        totalCalls,
+        callsByTool,
+        callsByTodo
+      }
+    } catch (error) {
+      logger.error('Failed to get tool call statistics', { error: error })
+      return {
+        totalCalls: 0,
+        callsByTool: {},
+        callsByTodo: {}
+      }
+    }
+  }
+
+  /**
+   * Clear tool call records for specified todo
+   */
+  static async clearToolCallsForTodo(taskId: string, todoId: string): Promise<void> {
+    try {
+      const storage = new TodoStorage(taskId)
+      const todos = await storage.readTodos()
+      const todo = todos.find((t) => t.id === todoId)
+      if (todo) {
+        todo.toolCalls = []
+        todo.updatedAt = new Date()
+        await storage.writeTodos(todos)
+        logger.info(`Cleared tool calls for todo "${todo.content}"`)
+      }
+    } catch (error) {
+      logger.error('Failed to clear tool calls for todo', { error: error })
+    }
+  }
+
+  /**
+   * 获取最近的工具调用记录（跨所有 todos）
+   */
+  static async getRecentToolCalls(taskId: string, limit: number = 10): Promise<Array<TodoToolCall & { todoId: string; todoContent: string }>> {
+    try {
+      const storage = new TodoStorage(taskId)
+      const todos = await storage.readTodos()
+      const allCalls: Array<TodoToolCall & { todoId: string; todoContent: string }> = []
+      todos.forEach((todo) => {
+        if (todo.toolCalls) {
+          todo.toolCalls.forEach((call) => {
+            allCalls.push({
+              ...call,
+              todoId: todo.id,
+              todoContent: todo.content
+            })
+          })
+        }
+      })
+      // 按时间戳降序排序，返回最近的记录
+      return allCalls.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()).slice(0, limit)
+    } catch (error) {
+      logger.error('Failed to get recent tool calls', { error: error })
+      return []
+    }
+  }
+
+  /**
+   * 检查是否有工具调用与指定的 todo 关联
+   */
+  static async hasToolCallsForTodo(taskId: string, todoId: string): Promise<boolean> {
+    try {
+      const toolCalls = await this.getToolCallsForTodo(taskId, todoId)
+      return toolCalls.length > 0
+    } catch (error) {
+      logger.error('Failed to check tool calls for todo', { error: error })
+      return false
+    }
+  }
+}

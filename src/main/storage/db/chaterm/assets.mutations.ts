@@ -1,0 +1,435 @@
+import Database from 'better-sqlite3'
+import { v4 as uuidv4 } from 'uuid'
+import { DEFAULT_ASSET_TYPE } from './assets.routes'
+const logger = createLogger('db')
+
+// Helper function to check if asset type is an organization type
+const isOrganizationType = (assetType: string): boolean => {
+  return assetType === 'organization' || assetType.startsWith('organization-')
+}
+
+// Use dynamically imported incremental sync trigger, keep consistent with original implementation
+function triggerIncrementalSync(): void {
+  setImmediate(async () => {
+    try {
+      const { SyncController } = await import('../../data_sync/core/SyncController')
+      await SyncController.triggerIncrementalSync()
+    } catch (error) {
+      logger.warn('Failed to trigger incremental sync', { error: error })
+    }
+  })
+}
+
+export function updateLocalAssetLabelLogic(db: Database.Database, uuid: string, label: string): any {
+  try {
+    const now = new Date().toISOString()
+    const stmt = db.prepare(`
+        UPDATE t_assets
+        SET label = ?, updated_at = ?
+        WHERE uuid = ?
+      `)
+    const result = stmt.run(label, now, uuid)
+
+    if (result.changes > 0) {
+      triggerIncrementalSync()
+    }
+
+    return {
+      data: {
+        message: result.changes > 0 ? 'success' : 'failed'
+      }
+    }
+  } catch (error) {
+    logger.error('Chaterm database get error', { error: error })
+    throw error
+  }
+}
+
+export function updateLocalAsseFavoriteLogic(db: Database.Database, uuid: string, status: number): any {
+  try {
+    const now = new Date().toISOString()
+    const stmt = db.prepare(`
+        UPDATE t_assets
+        SET favorite = ?, updated_at = ?
+        WHERE uuid = ?
+      `)
+    const result = stmt.run(status, now, uuid)
+
+    if (result.changes > 0) {
+      triggerIncrementalSync()
+    }
+
+    return {
+      data: {
+        message: result.changes > 0 ? 'success' : 'failed'
+      }
+    }
+  } catch (error) {
+    logger.error('Chaterm database get error', { error: error })
+    throw error
+  }
+}
+
+export function getAssetGroupLogic(db: Database.Database): any {
+  try {
+    const stmt = db.prepare(`
+        SELECT DISTINCT group_name
+        FROM t_assets
+        WHERE group_name IS NOT NULL
+        ORDER BY group_name
+      `)
+    const results = stmt.all() || []
+
+    return {
+      data: {
+        groups: results.map((item: any) => item.group_name)
+      }
+    }
+  } catch (error) {
+    logger.error('Chaterm database get error', { error: error })
+    throw error
+  }
+}
+
+export function createOrUpdateAssetLogic(db: Database.Database, params: any): any {
+  try {
+    const form = params
+    if (!form) {
+      throw new Error('No asset data provided')
+    }
+
+    const now = new Date().toISOString()
+
+    // First check if duplicate asset exists (based on IP + username + port + label + asset_type)
+    const checkDuplicateStmt = db.prepare(`
+      SELECT uuid, label, created_at FROM t_assets 
+      WHERE asset_ip = ? AND username = ? AND port = ? AND label = ? AND asset_type = ?
+    `)
+    const existingAsset = checkDuplicateStmt.get(form.ip, form.username, form.port, form.label || form.ip, form.asset_type || DEFAULT_ASSET_TYPE)
+
+    if (existingAsset) {
+      // If duplicate asset exists, update existing record
+      const updateStmt = db.prepare(`
+        UPDATE t_assets SET
+          label = ?,
+          auth_type = ?,
+          password = ?,
+          key_chain_id = ?,
+          group_name = ?,
+          asset_type = ?,
+          need_proxy = ?,
+          proxy_name = ?,
+          jump_host_uuid = ?,
+          baud_rate = ?,
+          data_bits = ?,
+          stop_bits = ?,
+          parity = ?,
+          flow_control = ?,
+          updated_at = ?,
+          version = version + 1
+        WHERE uuid = ?
+      `)
+
+      const result = updateStmt.run(
+        form.label || form.ip,
+        form.auth_type,
+        form.password,
+        form.keyChain,
+        form.group_name,
+        form.asset_type || DEFAULT_ASSET_TYPE,
+        form.needProxy ? 1 : 0,
+        form.proxyName,
+        form.jumpHostUuid || null,
+        form.baudRate ?? null,
+        form.dataBits ?? null,
+        form.stopBits ?? null,
+        form.parity ?? null,
+        form.flowControl ?? null,
+        now,
+        existingAsset.uuid
+      )
+
+      if (result.changes > 0) {
+        triggerIncrementalSync()
+      }
+
+      return {
+        data: {
+          message: result.changes > 0 ? 'updated' : 'failed',
+          uuid: existingAsset.uuid,
+          action: 'updated'
+        }
+      }
+    }
+
+    // 如果不存在重复，创建新资产
+    const uuid = uuidv4()
+    const insertStmt = db.prepare(`
+        INSERT INTO t_assets (
+          label,
+          asset_ip,
+          uuid,
+          auth_type,
+          port,
+          username,
+          password,
+          key_chain_id,
+          group_name,
+          favorite,
+          asset_type,
+          need_proxy,
+          proxy_name,
+          jump_host_uuid,
+          baud_rate,
+          data_bits,
+          stop_bits,
+          parity,
+          flow_control,
+          created_at,
+          updated_at,
+          version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+
+    const result = insertStmt.run(
+      form.label || form.ip,
+      form.ip,
+      uuid,
+      form.auth_type,
+      form.port,
+      form.username,
+      form.password,
+      form.keyChain,
+      form.group_name,
+      2,
+      form.asset_type || DEFAULT_ASSET_TYPE,
+      form.needProxy ? 1 : 0,
+      form.proxyName,
+      form.jumpHostUuid || null,
+      form.baudRate ?? null,
+      form.dataBits ?? null,
+      form.stopBits ?? null,
+      form.parity ?? null,
+      form.flowControl ?? null,
+      now,
+      now,
+      1
+    )
+
+    if (result.changes > 0) {
+      triggerIncrementalSync()
+    }
+
+    return {
+      data: {
+        message: result.changes > 0 ? 'success' : 'failed',
+        uuid: uuid,
+        action: 'created'
+      }
+    }
+  } catch (error) {
+    logger.error('Chaterm database create or update asset error', { error: error })
+    throw error
+  }
+}
+
+export function createAssetLogic(db: Database.Database, params: any): any {
+  try {
+    const form = params
+    if (!form) {
+      throw new Error('No asset data provided')
+    }
+
+    const now = new Date().toISOString()
+
+    // First check if duplicate asset exists (based on IP + username + port + label + asset_type)
+    const checkDuplicateStmt = db.prepare(`
+      SELECT uuid, label, created_at FROM t_assets 
+      WHERE asset_ip = ? AND username = ? AND port = ? AND label = ? AND asset_type = ?
+    `)
+    const existingAsset = checkDuplicateStmt.get(form.ip, form.username, form.port, form.label || form.ip, form.asset_type || DEFAULT_ASSET_TYPE)
+
+    if (existingAsset) {
+      // If duplicate asset exists, return duplicate information instead of creating new record
+      return {
+        data: {
+          message: 'duplicate',
+          uuid: existingAsset.uuid,
+          existingLabel: existingAsset.label,
+          existingCreatedAt: existingAsset.created_at
+        }
+      }
+    }
+
+    // If no duplicate exists, create new asset
+    const uuid = uuidv4()
+    const insertStmt = db.prepare(`
+        INSERT INTO t_assets (
+          label,
+          asset_ip,
+          uuid,
+          auth_type,
+          port,
+          username,
+          password,
+          key_chain_id,
+          group_name,
+          favorite,
+          asset_type,
+          need_proxy,
+          proxy_name,
+          jump_host_uuid,
+          baud_rate,
+          data_bits,
+          stop_bits,
+          parity,
+          flow_control,
+          created_at,
+          updated_at,
+          version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+
+    const result = insertStmt.run(
+      form.label || form.ip,
+      form.ip,
+      uuid,
+      form.auth_type,
+      form.port,
+      form.username,
+      form.password,
+      form.keyChain,
+      form.group_name,
+      2,
+      form.asset_type || DEFAULT_ASSET_TYPE,
+      form.needProxy ? 1 : 0,
+      form.proxyName,
+      form.jumpHostUuid || null,
+      form.baudRate ?? null,
+      form.dataBits ?? null,
+      form.stopBits ?? null,
+      form.parity ?? null,
+      form.flowControl ?? null,
+      now,
+      now,
+      1
+    )
+
+    if (result.changes > 0) {
+      triggerIncrementalSync()
+    }
+
+    return {
+      data: {
+        message: result.changes > 0 ? 'success' : 'failed',
+        uuid: uuid
+      }
+    }
+  } catch (error) {
+    logger.error('Chaterm database create asset error', { error: error })
+    throw error
+  }
+}
+
+export function deleteAssetLogic(db: Database.Database, uuid: string): any {
+  try {
+    const checkStmt = db.prepare(`
+      SELECT asset_type FROM t_assets WHERE uuid = ?
+    `)
+    const asset = checkStmt.get(uuid)
+
+    if (asset && isOrganizationType(asset.asset_type)) {
+      const deleteOrgAssetsStmt = db.prepare(`
+        DELETE FROM t_organization_assets
+        WHERE organization_uuid = ?
+      `)
+      deleteOrgAssetsStmt.run(uuid)
+    }
+
+    const stmt = db.prepare(`
+        DELETE FROM t_assets
+        WHERE uuid = ?
+      `)
+    const result = stmt.run(uuid)
+
+    if (result.changes > 0) {
+      triggerIncrementalSync()
+    }
+
+    return {
+      data: {
+        message: result.changes > 0 ? 'success' : 'failed'
+      }
+    }
+  } catch (error) {
+    logger.error('Chaterm database delete asset error', { error: error })
+    throw error
+  }
+}
+
+export function updateAssetLogic(db: Database.Database, params: any): any {
+  try {
+    const form = params
+    if (!form || !form.uuid) {
+      throw new Error('No asset data or UUID provided')
+    }
+
+    const now = new Date().toISOString()
+
+    const stmt = db.prepare(`
+        UPDATE t_assets
+        SET label = ?,
+            asset_ip = ?,
+            auth_type = ?,
+            port = ?,
+            username = ?,
+            password = ?,
+            key_chain_id = ?,
+            group_name = ?,
+            need_proxy = ?,
+            proxy_name = ?,
+            jump_host_uuid = ?,
+            baud_rate = ?,
+            data_bits = ?,
+            stop_bits = ?,
+            parity = ?,
+            flow_control = ?,
+            updated_at = ?
+        WHERE uuid = ?
+      `)
+
+    const result = stmt.run(
+      form.label || form.ip,
+      form.ip,
+      form.auth_type,
+      form.port,
+      form.username,
+      form.password,
+      form.keyChain,
+      form.group_name,
+      form.needProxy ? 1 : 0,
+      form.proxyName || '',
+      form.jumpHostUuid || null,
+      form.baudRate ?? null,
+      form.dataBits ?? null,
+      form.stopBits ?? null,
+      form.parity ?? null,
+      form.flowControl ?? null,
+      now,
+      form.uuid
+    )
+
+    if (result.changes > 0) {
+      triggerIncrementalSync()
+    }
+
+    return {
+      data: {
+        message: result.changes > 0 ? 'success' : 'failed'
+      }
+    }
+  } catch (error) {
+    logger.error('Chaterm database update asset error', { error: error })
+    throw error
+  }
+}

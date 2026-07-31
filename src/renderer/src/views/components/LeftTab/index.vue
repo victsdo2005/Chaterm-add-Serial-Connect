@@ -1,0 +1,558 @@
+<template>
+  <div class="term_left_tab">
+    <div class="main-menu">
+      <a-tooltip
+        v-for="i in visibleMainMenuTabs"
+        :key="i.key"
+        :title="$t(i.nameKey)"
+        placement="right"
+        :mouse-enter-delay="1"
+      >
+        <p
+          v-if="i.key === 'files'"
+          class="term_menu"
+          :class="{ active: activeKey === i.key }"
+          @click="files(i.key)"
+        >
+          <img
+            :src="i.icon"
+            alt=""
+          />
+        </p>
+        <p
+          v-else-if="i.key === 'knowledgecenter'"
+          class="term_menu"
+          :class="{ active: activeKey === i.key }"
+          @click="menuClick(i.key)"
+        >
+          <img
+            :src="i.icon"
+            alt=""
+          />
+        </p>
+        <p
+          v-else-if="i.key === 'assets'"
+          class="term_menu"
+          :class="{ active: activeKey === i.key }"
+          data-onboarding-id="assets-entry"
+          @click="menuClick(i.key)"
+        >
+          <img
+            :src="i.icon"
+            alt=""
+          />
+        </p>
+        <p
+          v-else-if="i.key === 'ai'"
+          class="term_menu"
+          :class="{ active: activeKey === i.key }"
+          data-onboarding-id="left-ai-toggle"
+          @click="menuClick(i.key)"
+        >
+          <img
+            :src="i.icon"
+            alt=""
+          />
+        </p>
+        <p
+          v-else-if="i.key === 'snippets'"
+          class="term_menu"
+          :class="{ active: activeKey === i.key }"
+          @click="menuClick(i.key)"
+        >
+          <img
+            :src="i.icon"
+            alt=""
+          />
+        </p>
+        <p
+          v-else
+          class="term_menu"
+          :class="{ active: activeKey === i.key }"
+          @click="menuClick(i.key)"
+        >
+          <img
+            :src="i.icon"
+            alt=""
+          />
+        </p>
+      </a-tooltip>
+
+      <a-tooltip
+        v-for="view in pluginViews"
+        :key="view.id"
+        :title="view.name"
+        placement="right"
+        :mouse-enter-delay="1"
+      >
+        <p
+          class="term_menu"
+          :class="{ active: activeKey === view.id }"
+          @click="pluginMenuClick(view.id)"
+        >
+          <img
+            v-if="view.icon.includes('/')"
+            :src="pluginViewIconSrc(view.icon)"
+            alt=""
+          />
+          <i
+            v-else
+            :class="view.icon"
+            class="plugin-icon"
+          ></i>
+        </p>
+      </a-tooltip>
+    </div>
+
+    <div class="bottom-menu">
+      <a-tooltip
+        v-for="i in menuTabsData.slice(-2)"
+        :key="i.key"
+        :title="$t(i.nameKey)"
+        :mouse-enter-delay="1"
+      >
+        <div v-if="i.key === 'user'">
+          <p
+            class="setting_menu user-menu-trigger"
+            :class="{ active: activeKey === i.key, 'has-avatar': showUserAvatar }"
+            @click="showUserMenu = !showUserMenu"
+          >
+            <img
+              v-if="showUserAvatar"
+              class="user-avatar-icon"
+              :src="userStore.userInfo.avatar"
+              referrerpolicy="no-referrer"
+              alt=""
+            />
+            <img
+              v-else
+              :src="i.icon"
+              alt=""
+            />
+            <span
+              v-if="isVipUser"
+              class="vip-flag"
+              >VIP</span
+            >
+          </p>
+        </div>
+        <div v-else-if="i.key === 'setting'">
+          <p
+            class="setting_menu"
+            :class="{ active: activeKey === i.key }"
+            data-onboarding-id="setting-entry"
+            @click="userConfig"
+          >
+            <img
+              :src="i.icon"
+              alt=""
+            />
+          </p>
+        </div>
+        <div v-else>
+          <p
+            class="setting_menu"
+            :class="{ active: activeKey === i.key }"
+            @click="menuClick(i.key)"
+          >
+            <img
+              :src="i.icon"
+              alt=""
+            />
+          </p>
+        </div>
+      </a-tooltip>
+    </div>
+
+    <div
+      v-if="showUserMenu"
+      class="user-menu"
+    >
+      <div
+        v-if="isSkippedLogin"
+        class="menu-item"
+        @click="goToLogin"
+      >
+        <LoginOutlined class="menu-item-icon" />
+        <span>{{ $t('common.login') }}</span>
+      </div>
+      <div
+        v-if="!isSkippedLogin && !isEnterpriseDeploy"
+        class="menu-item"
+        @click="openAccountCenter"
+      >
+        <DashboardOutlined class="menu-item-icon" />
+        <span>{{ $t('common.accountCenter') }}</span>
+      </div>
+      <div
+        v-if="!isSkippedLogin"
+        class="menu-item"
+        @click="userInfo"
+      >
+        <UserOutlined class="menu-item-icon" />
+        <span>{{ $t('common.userInfo') }}</span>
+      </div>
+      <div
+        v-if="!isSkippedLogin"
+        class="menu-item"
+        @click="logout"
+      >
+        <LogoutOutlined class="menu-item-icon" />
+        <span>{{ $t('common.logout') }}</span>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { removeToken } from '@/utils/permission'
+const emit = defineEmits(['toggle-menu', 'open-user-tab'])
+import { menuTabsData } from './constants/data'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
+import { userLogOut, getUser } from '@/api/user/user'
+import { userInfoStore } from '@/store/index'
+import { pinia } from '@/main'
+import { setUserInfo } from '@/utils/permission'
+import eventBus from '@/utils/eventBus'
+import { shortcutService } from '@/services/shortcutService'
+import { dataSyncService } from '@/services/dataSyncService'
+import { chatSyncService } from '@/services/chatSyncService'
+import { convertFileLocalResourceSrc } from '@/utils/convertFileLocalResourceSrc'
+import { getAccountCenterUrl } from '@/utils/edition'
+import { isEnterpriseDeployEnabled } from '@/views/components/AiTab/composables/useModelConfiguration'
+import { captureButtonClick } from '@/utils/telemetry'
+import { DashboardOutlined, LoginOutlined, LogoutOutlined, UserOutlined } from '@ant-design/icons-vue'
+
+const logger = createRendererLogger('leftTab')
+let storageEventHandler: ((e: StorageEvent) => void) | null = null
+let removePluginMetadataListener: (() => void) | null = null
+const pluginViews = ref<any[]>([])
+const kbSearchPolicyEnabled =
+  String(import.meta.env.RENDERER_KB_SEARCH_ENABLED || '')
+    .trim()
+    .toLowerCase() !== 'false'
+const visibleMainMenuTabs = computed(() => menuTabsData.slice(0, -2).filter((tab) => kbSearchPolicyEnabled || tab.key !== 'knowledgecenter'))
+
+/** file:// URLs cannot be used in img src in the renderer; map via custom protocol (see main process). */
+const pluginViewIconSrc = (icon: string) => convertFileLocalResourceSrc(icon)
+const userStore = userInfoStore(pinia)
+const activeKey = ref('workspace')
+const showUserMenu = ref<boolean>(false)
+const isSkippedLogin = ref<boolean>(localStorage.getItem('login-skipped') === 'true')
+const showUserAvatar = computed(() => !isSkippedLogin.value && !!userStore.userInfo.avatar)
+const isEnterpriseDeploy = isEnterpriseDeployEnabled()
+const isVipUser = computed(() => {
+  if (isSkippedLogin.value) return false
+  const info: any = userStore.userInfo
+  const sub = info?.subscription?.toLowerCase?.()
+  if (sub !== 'pro' && sub !== 'ultra') return false
+  const expiresAt = info?.subscriptionExpiresAt || info?.expires
+  return !!expiresAt && new Date() < new Date(expiresAt)
+})
+const router = useRouter()
+
+const goToLogin = () => {
+  showUserMenu.value = false
+  router.push('/login')
+}
+
+const menuClick = (key) => {
+  let type = ''
+  let beforeActive = ''
+  if (activeKey.value == key) {
+    type = 'same'
+    if (key == 'ai') {
+      beforeActive = userStore.stashMenu
+    }
+  } else {
+    beforeActive = activeKey.value
+    type = 'dif'
+    userStore.updateStashMenu(activeKey.value)
+    activeKey.value = key
+  }
+
+  emit('toggle-menu', {
+    menu: activeKey.value,
+    type,
+    beforeActive,
+    isPlugin: false
+  })
+}
+
+const pluginMenuClick = (viewId: string) => {
+  let type = ''
+  let beforeActive = activeKey.value
+
+  if (activeKey.value === viewId) {
+    type = 'same'
+  } else {
+    type = 'dif'
+    userStore.updateStashMenu(activeKey.value)
+    activeKey.value = viewId
+  }
+
+  emit('toggle-menu', {
+    menu: viewId,
+    type,
+    beforeActive,
+    isPlugin: true
+  })
+}
+const openAiRight = () => {
+  let type = ''
+  let beforeActive = ''
+  if (activeKey.value == 'ai') {
+    type = 'same'
+    beforeActive = userStore.stashMenu
+  } else {
+    beforeActive = activeKey.value
+    type = 'dif'
+    userStore.updateStashMenu(activeKey.value)
+    activeKey.value = 'ai'
+  }
+
+  emit('toggle-menu', {
+    menu: 'openAiRight',
+    type,
+    beforeActive
+  })
+}
+const userInfo = () => {
+  emit('open-user-tab', 'userInfo')
+  showUserMenu.value = false
+}
+
+const openAccountCenter = async () => {
+  showUserMenu.value = false
+  const token = localStorage.getItem('ctm-token') || ''
+  await captureButtonClick('account_center_menu_clicked', {
+    source: 'left_tab_menu',
+    entryType: 'menu',
+    subscription: userStore.userInfo?.subscription || ''
+  })
+  await window.api.openExternalUrl(getAccountCenterUrl(token))
+}
+
+const userConfig = () => {
+  emit('open-user-tab', 'userConfig')
+  showUserMenu.value = false
+}
+
+const files = (key) => {
+  emit('open-user-tab', 'files')
+  showUserMenu.value = false
+  menuClick(key)
+}
+
+const logout = async () => {
+  const isSkippedLogin = localStorage.getItem('login-skipped') === 'true'
+  try {
+    if (dataSyncService.getInitializationStatus()) {
+      logger.info('Data sync is enabled during logout, stopping')
+      await dataSyncService.disableDataSync()
+      await chatSyncService.disable()
+      dataSyncService.reset()
+      logger.info('Data sync and chat sync have been stopped')
+    }
+  } catch (error) {
+    logger.error('Failed to stop data sync during logout', { error: error })
+  }
+
+  if (isSkippedLogin) {
+    localStorage.removeItem('login-skipped')
+    removeToken()
+    shortcutService.init()
+    router.push('/login')
+    showUserMenu.value = false
+    return
+  }
+
+  userLogOut()
+    .then((res) => {
+      logger.info('Logout response', { data: res })
+      removeToken()
+      shortcutService.init()
+      router.push('/login')
+    })
+    .catch((err) => {
+      logger.error('Logout failed', { error: err })
+      removeToken()
+      shortcutService.init()
+      router.push('/login')
+    })
+
+  showUserMenu.value = false
+}
+const api = (window as any).api
+
+const refreshPluginViews = async () => {
+  const views = await api.getPluginViews()
+  pluginViews.value = views
+}
+
+const refreshUserInfo = async () => {
+  if (isSkippedLogin.value) return
+  try {
+    const res: any = await getUser({})
+    if (res?.data) setUserInfo(res.data)
+  } catch (e) {
+    logger.error('Refresh user info failed', { error: e })
+  }
+}
+
+onMounted(async () => {
+  eventBus.on('openAiRight', openAiRight)
+  eventBus.on('openUserTab', (tab) => {
+    emit('open-user-tab', tab)
+  })
+  refreshUserInfo()
+  try {
+    const views = await api.getPluginViews()
+    pluginViews.value = views
+  } catch (e) {
+    logger.error('Get View Error', { error: e })
+  }
+  removePluginMetadataListener = api.onPluginMetadataChanged(async () => {
+    await refreshPluginViews()
+  })
+  storageEventHandler = (e: StorageEvent) => {
+    if (e.key === 'login-skipped') {
+      isSkippedLogin.value = e.newValue === 'true'
+    }
+  }
+  window.addEventListener('storage', storageEventHandler)
+})
+
+onUnmounted(() => {
+  eventBus.off('openAiRight')
+  eventBus.off('openUserTab')
+  if (storageEventHandler) {
+    window.removeEventListener('storage', storageEventHandler)
+    storageEventHandler = null
+  }
+  if (removePluginMetadataListener) {
+    removePluginMetadataListener()
+    removePluginMetadataListener = null
+  }
+})
+</script>
+<style lang="less">
+.term_left_tab {
+  width: 100%;
+  height: 100%;
+  padding: 10px 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  background-color: var(--bg-color-secondary);
+
+  .main-menu,
+  .bottom-menu {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 0 4px;
+  }
+
+  .term_menu,
+  .setting_menu {
+    width: 100%;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    border-radius: 8px;
+    transition: all 0.3s ease;
+
+    &:hover {
+      background-color: var(--hover-bg-color);
+    }
+
+    &:active {
+      transform: scale(0.95);
+    }
+
+    img {
+      width: 20px;
+      height: 20px;
+      transition: all 0.3s ease;
+      opacity: 0.45;
+      filter: var(--icon-filter);
+    }
+
+    &:hover img,
+    &.active img {
+      opacity: 1;
+      transform: scale(1.1);
+    }
+
+    &.has-avatar img.user-avatar-icon {
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      object-fit: cover;
+      opacity: 1;
+      filter: none;
+    }
+  }
+
+  .user-menu-trigger {
+    position: relative;
+
+    .vip-flag {
+      position: absolute;
+      bottom: 0;
+      left: 50%;
+      transform: translateX(-50%);
+      background: linear-gradient(135deg, #ffd700, #ff8f00);
+      color: #000;
+      font-size: 8px;
+      font-weight: bold;
+      line-height: 1;
+      padding: 1px 3px;
+      border-radius: 4px;
+      letter-spacing: 0.4px;
+      pointer-events: none;
+      z-index: 1;
+    }
+  }
+
+  .user-menu {
+    position: absolute;
+    bottom: 40px;
+    left: 40px;
+    background: var(--bg-color-secondary);
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+    z-index: 1000;
+    min-width: 120px;
+    border: 1px solid var(--border-color);
+
+    .menu-item {
+      padding: 4px 12px;
+      color: var(--text-color);
+      cursor: pointer;
+      transition: all 0.2s ease;
+      font-size: 14px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+
+      .menu-item-icon {
+        font-size: 14px;
+        opacity: 0.85;
+      }
+
+      &:hover {
+        background: var(--hover-bg-color);
+      }
+
+      &:active {
+        background: var(--active-bg-color);
+      }
+    }
+  }
+}
+</style>

@@ -1,0 +1,882 @@
+<template>
+  <div
+    class="extension_panel"
+    @dragover.prevent
+    @drop.prevent="onDrop"
+  >
+    <div class="panel_header">
+      <span class="panel_title">{{ t('extensions.plugins') }}</span>
+    </div>
+
+    <div class="search_box">
+      <a-input
+        v-model:value="searchValue"
+        class="transparent-Input"
+        :placeholder="$t('extensions.fuzzySearch')"
+        allow-clear
+      >
+        <template #suffix>
+          <search-outlined />
+        </template>
+      </a-input>
+    </div>
+
+    <div
+      class="list_container"
+      @dragover.prevent
+    >
+      <a-menu
+        v-model:selected-keys="selectedKeys"
+        v-model:open-keys="openKeys"
+        class="custom_extension_menu"
+        mode="inline"
+        :theme="currentTheme === 'light' ? 'light' : 'dark'"
+        @select="handleSelect"
+      >
+        <template
+          v-for="item in filteredList"
+          :key="item.pluginId"
+        >
+          <a-menu-item class="extension_item">
+            <div class="item_wrapper">
+              <div class="item_icon">
+                <Transition name="icon-fade">
+                  <img
+                    v-if="getIconSrc(item)"
+                    :src="getIconSrc(item)"
+                    alt="icon"
+                  />
+                </Transition>
+              </div>
+
+              <div class="item_info">
+                <div class="item_name_container">
+                  <div
+                    class="item_name"
+                    :title="item.name"
+                  >
+                    {{ item.name }}
+                  </div>
+
+                  <a-tag
+                    v-if="['Jumpserver Support', 'Alias'].includes(item.name)"
+                    class="right-tag"
+                  >
+                    {{ $t('extensions.system') }}
+                  </a-tag>
+                  <a-tag
+                    v-else-if="item.required"
+                    class="right-tag"
+                  >
+                    System
+                  </a-tag>
+                </div>
+
+                <div
+                  class="item_desc"
+                  :title="item.description"
+                >
+                  {{ item.description || $t('extensions.noDescription') }}
+                </div>
+              </div>
+
+              <div class="item_actions">
+                <template v-if="item.isPlugin && !item.installed">
+                  <template v-if="item.installable !== false">
+                    <a-tooltip :title="$t('extensions.install')">
+                      <a-button
+                        size="small"
+                        type="primary"
+                        class="op_btn icon_btn"
+                        :loading="item.pluginId ? !!installLoadingMap[item.pluginId] : false"
+                        @click.stop="onInstallClick(item)"
+                      >
+                        <template #icon>
+                          <CloudDownloadOutlined />
+                        </template>
+                      </a-button>
+                    </a-tooltip>
+                  </template>
+                  <template v-else>
+                    <a-tooltip :title="$t('extensions.subscribe')">
+                      <a-button
+                        size="small"
+                        type="primary"
+                        class="op_btn icon_btn"
+                        @click.stop="onSubscribeClick(item)"
+                      >
+                        <template #icon>
+                          <CrownOutlined />
+                        </template>
+                      </a-button>
+                    </a-tooltip>
+                  </template>
+                </template>
+                <template v-else-if="item.isPlugin && item.installed && item.hasUpdate">
+                  <a-tooltip :title="$t('extensions.update')">
+                    <a-button
+                      size="small"
+                      class="op_btn icon_btn"
+                      type="primary"
+                      :loading="item.pluginId ? !!updateLoadingMap[item.pluginId] : false"
+                      @click.stop="onUpdateClick(item)"
+                    >
+                      <template #icon>
+                        <CloudSyncOutlined />
+                      </template>
+                    </a-button>
+                  </a-tooltip>
+                </template>
+              </div>
+            </div>
+          </a-menu-item>
+        </template>
+      </a-menu>
+
+      <div class="drag_placeholder"></div>
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { CloudDownloadOutlined, LoadingOutlined, SearchOutlined, CloudSyncOutlined, CrownOutlined } from '@ant-design/icons-vue'
+import { computed, h, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { notification } from 'ant-design-vue'
+import i18n from '@/locales'
+import iconAlias from '@/assets/img/alias.svg'
+import iconJumpserver from '@/assets/img/jumpserver.svg'
+import { userConfigStore } from '@/services/userConfigStoreService'
+import eventBus from '@/utils/eventBus'
+import { downloadPluginPackage, getPluginDownload, getPluginDownloadInfo, getPluginIconUrl } from '@/api/plugin/plugin'
+import { convertFileLocalResourceSrc } from '@/utils/convertFileLocalResourceSrc'
+import { type DisplayPluginItem, usePluginStore } from './usePlugins'
+import { getActualTheme } from '@/utils/themeUtils'
+
+const api = (window as any).api
+const { t } = i18n.global
+
+const logger = createRendererLogger('extensions')
+
+const emit = defineEmits(['open-user-tab'])
+const searchValue = ref('')
+const userConfig = ref({
+  aliasStatus: 2
+})
+const currentTheme = ref('dark')
+const isInstalling = ref(false)
+
+const iconMap: Record<string, string> = {
+  'alias.svg': iconAlias,
+  'jumpserver.svg': iconJumpserver
+}
+
+const { pluginList, loadPlugins, loadStorePlugins, uninstallLocalPlugin } = usePluginStore()
+
+const selectedKeys = ref<string[]>([])
+const openKeys = ref<string[]>([])
+
+const createdBlobUrls = new Set<string>()
+
+const preloadedKeys = new Set<string>()
+const iconUrls = reactive<Record<string, string>>({})
+const getPluginKey = (item: DisplayPluginItem) => {
+  return `${item.pluginId}@${item.latestVersion || item.installedVersion || ''}`
+}
+
+const getIcons = async (item: DisplayPluginItem): Promise<string> => {
+  // Non-plug-in + built-in iconKey
+  if (!item.isPlugin && item.iconKey) {
+    return iconMap[item.iconKey] ?? ''
+  }
+
+  // Installed
+  if (item.installed && item.iconUrl) {
+    const src = convertFileLocalResourceSrc(item.iconUrl)
+    if (item.pluginId) {
+      iconUrls[item.pluginId] = src
+    }
+    return src
+  }
+
+  if (!item.pluginId) return ''
+
+  if (iconUrls[item.pluginId] !== undefined) {
+    return iconUrls[item.pluginId]
+  }
+
+  const key = getPluginKey(item)
+  if (preloadedKeys.has(key)) {
+    return iconUrls[item.pluginId] ?? ''
+  }
+  preloadedKeys.add(key)
+
+  try {
+    const url = await getPluginIconUrl(item.pluginId, item.latestVersion)
+    iconUrls[item.pluginId] = url
+    return url
+  } catch (e) {
+    logger.error('Preload icon failed', { pluginId: item.pluginId, error: e })
+    iconUrls[item.pluginId] = ''
+    return ''
+  }
+}
+
+const preloadIcons = async (list: DisplayPluginItem[]): Promise<void> => {
+  for (const item of list) {
+    if (!item.isPlugin) continue
+
+    const key = getPluginKey(item)
+    if (preloadedKeys.has(key)) continue
+
+    void getIcons(item)
+  }
+}
+const handleSelect = (item) => {
+  const { key } = item
+
+  const specialRoutes = {
+    Alias: 'aliasConfig',
+    jumpserverSupport: 'jumpserverSupport'
+  }
+
+  if (specialRoutes[key]) {
+    emit('open-user-tab', specialRoutes[key])
+    return
+  }
+
+  const activePlugin = filteredList.value.find((i) => i.pluginId === key)
+  if (!activePlugin) return
+
+  const { installed: fromLocal, pluginId, name } = activePlugin
+
+  emit('open-user-tab', {
+    key: `plugins:${name}`,
+    fromLocal,
+    pluginId
+  })
+}
+
+const handleExplorerActive = (tabId: string) => {
+  const index = selectedKeys.value.findIndex((item) => item === tabId)
+  if (index !== -1) {
+    selectedKeys.value.splice(index, 1)
+  }
+}
+
+defineExpose({
+  handleExplorerActive
+})
+
+const showNotification = (type: 'success' | 'error' | 'info' | 'open' | 'warning', message: string, description?: string) => {
+  notification[type]({
+    message,
+    description,
+    placement: 'bottomRight',
+    duration: type === 'error' ? 4.5 : 3
+  })
+}
+
+// Drag and drop to install the plugin
+const onDrop = async (e: DragEvent) => {
+  const fileList = e.dataTransfer?.files
+  if (!fileList || fileList.length === 0) {
+    return
+  }
+
+  const file = fileList[0] as any
+
+  const filePath = api.getPathForFile(file) as string | undefined
+
+  if (!filePath) {
+    showNotification('error', t('extensions.installFailed'), t('extensions.unableToGetFilePath'))
+    return
+  }
+
+  if (!filePath.endsWith('.chaterm')) {
+    showNotification('warning', t('extensions.formatError'), t('extensions.onDropTip'))
+    return
+  }
+
+  isInstalling.value = true
+
+  const notificationKey = 'installing_plugin'
+  notification.open({
+    key: notificationKey,
+    message: t('extensions.installing'),
+    description: t('extensions.waitForInstall'),
+    icon: () => h(LoadingOutlined, { style: 'color: #1890ff' }),
+    placement: 'bottomRight',
+    duration: 0
+  })
+
+  try {
+    await api.installPlugin(filePath)
+
+    notification.success({
+      key: notificationKey,
+      message: t('extensions.installSuccess'),
+      description: t('extensions.initSuccess'),
+      placement: 'bottomRight',
+      duration: 3
+    })
+
+    // Reinstall the local plugin after installation
+    await loadPlugins()
+  } catch (err: any) {
+    notification.error({
+      key: notificationKey,
+      message: t('extensions.installFailed'),
+      description: err?.message ?? String(err),
+      placement: 'bottomRight'
+    })
+  } finally {
+    isInstalling.value = false
+  }
+}
+
+const refreshPlugins = () => {
+  loadPlugins()
+}
+
+const uninstallPluginEvent = (pluginId: string) => {
+  uninstallLocalPlugin(pluginId)
+  getIcons(pluginList.value[0])
+}
+
+const updatePluginEvent = async (pluginId: string) => {
+  const active = filteredList.value.find((i) => i.pluginId === pluginId)
+  if (!active) return
+  const latestVersion = active.latestVersion
+  await onUpdateClick({ pluginId, latestVersion })
+}
+
+const installPluginEvent = async (pluginId: string) => {
+  const active = filteredList.value.find((i) => i.pluginId === pluginId)
+  if (!active) return
+  const latestVersion = active.latestVersion
+  await onInstallClick({ pluginId, latestVersion })
+}
+
+const pluginLoadingStateRequest = (payload: { pluginId: string; callback?: (state: { installing: boolean; updating: boolean }) => void }) => {
+  if (!payload?.pluginId || typeof payload.callback !== 'function') return
+  payload.callback({
+    installing: !!installLoadingMap.value[payload.pluginId],
+    updating: !!updateLoadingMap.value[payload.pluginId]
+  })
+}
+
+const loadConfig = async () => {
+  try {
+    const config = await userConfigStore.getConfig()
+    if (config) {
+      userConfig.value = config
+      currentTheme.value = getActualTheme(config.theme || 'dark')
+    }
+  } catch (error) {
+    logger.error('Failed to load config', { error: error })
+  }
+}
+
+onMounted(() => {
+  loadConfig()
+  loadStorePlugins()
+  loadPlugins()
+
+  eventBus.on('aliasStatusChanged', () => {
+    loadConfig()
+  })
+  eventBus.on('updateTheme', (payload) => {
+    // Accept both legacy string and the new ThemeChangePayload shape.
+    const themeId = typeof payload === 'string' ? payload : payload?.themeId
+    if (!themeId) return
+    currentTheme.value = getActualTheme(themeId)
+  })
+  eventBus.on('reloadPlugins', refreshPlugins)
+  eventBus.on('uninstallPluginEvent', uninstallPluginEvent)
+  eventBus.on('installPluginEvent', installPluginEvent)
+  eventBus.on('updatePluginEvent', updatePluginEvent)
+  eventBus.on('pluginLoadingStateRequest', pluginLoadingStateRequest)
+})
+
+watch(
+  () => userConfig.value.aliasStatus,
+  () => {
+    loadConfig()
+  }
+)
+
+// Used for rendering list：Alias + pluginList
+const list = computed<DisplayPluginItem[]>(() => {
+  const base: DisplayPluginItem[] = [
+    {
+      name: 'Jumpserver Support',
+      description: t('extensions.jumpserverSupport.jmsPluginDesc'),
+      iconKey: 'jumpserver.svg',
+      iconUrl: '',
+      tabName: 'jumpserverSupport',
+      show: true,
+      isPlugin: false,
+      pluginId: 'jumpserverSupport',
+      installed: false,
+      hasUpdate: false,
+      isDraggedOnly: false,
+      installedVersion: '',
+      latestVersion: ''
+    },
+    {
+      name: 'Alias',
+      description: t('extensions.aliasDescription'),
+      iconKey: 'alias.svg',
+      iconUrl: '',
+      tabName: 'aliasConfig',
+      show: userConfig.value.aliasStatus === 1,
+      isPlugin: false,
+      pluginId: 'Alias',
+      installed: false,
+      hasUpdate: false,
+      isDraggedOnly: false,
+      installedVersion: '',
+      latestVersion: ''
+    }
+  ]
+
+  return [...base, ...pluginList.value]
+})
+
+const filteredList = computed(() => {
+  const all = list.value.filter((item) => item.show)
+  if (!searchValue.value) return all
+  const query = searchValue.value.toLowerCase().trim()
+  return all.filter((item) => item.name.toLowerCase().includes(query))
+})
+
+watch(
+  () => filteredList.value,
+  (list) => {
+    if (Array.isArray(list)) {
+      preloadIcons(list)
+    }
+  },
+  { immediate: false, deep: false }
+)
+
+const getIconSrc = (item: any) => {
+  if (!item.isPlugin && item.iconKey) {
+    return iconMap[item.iconKey] || ''
+  }
+  if (item.installed && item.iconUrl) {
+    return convertFileLocalResourceSrc(item.iconUrl)
+  }
+  if (!item.pluginId) {
+    return ''
+  }
+  const blobUrl = iconUrls[item.pluginId]
+  return blobUrl || ''
+}
+
+interface PluginDownloadInfo {
+  download_url?: string
+  file_name?: string
+  sha256?: string
+}
+
+const normalizePluginPlatform = (platform: string): string => {
+  if (platform === 'win32') return 'win'
+  if (platform === 'darwin') return 'mac'
+  if (platform === 'linux') return 'linux'
+  return 'all'
+}
+
+const getCurrentPluginPlatform = async (): Promise<string> => {
+  try {
+    const platform = await api.getPlatform()
+    return normalizePluginPlatform(platform)
+  } catch {
+    return 'all'
+  }
+}
+
+// Axios and the project request may return different binary formats, so convert them to ArrayBuffer before installation.
+const toArrayBuffer = (data: any): ArrayBuffer => {
+  if (data?.data) return toArrayBuffer(data.data)
+  if (data instanceof ArrayBuffer) return data
+  if (ArrayBuffer.isView(data)) {
+    const buffer = data.buffer as ArrayBuffer
+    return buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)
+  }
+  return data as ArrayBuffer
+}
+
+// Compatible with old download interfaces
+const getFileNameFromDownloadResponse = (res: any): string => {
+  const disposition = res?.headers?.['content-disposition'] || res?.headers?.['Content-Disposition']
+  const match = disposition ? /filename="?([^"]+)"?/.exec(disposition) : null
+  return match?.[1] ? decodeURIComponent(match[1]) : ''
+}
+
+const sha256Hex = async (data: ArrayBuffer): Promise<string> => {
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', data)
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+const verifyPackageSha256 = async (data: ArrayBuffer, expected?: string) => {
+  if (!expected) return
+  const actual = await sha256Hex(data)
+  if (actual.toLowerCase() !== expected.toLowerCase()) {
+    throw new Error('Plugin package checksum mismatch')
+  }
+}
+
+const installOrUpdateFromStore = async (pluginId: string, version: string) => {
+  let data: ArrayBuffer | null = null
+  let fileName = ''
+  let sha256 = ''
+  const platform = await getCurrentPluginPlatform()
+  let info: PluginDownloadInfo | null = null
+
+  try {
+    const infoRes: any = await getPluginDownloadInfo(pluginId, version, platform)
+    info = infoRes?.data ?? infoRes
+    if (!info?.download_url) {
+      throw new Error('missing download url')
+    }
+  } catch (error) {
+    logger.warn('download-info unavailable, fallback to legacy plugin download', { pluginId, version, error })
+    const legacyRes: any = await getPluginDownload(pluginId, version, platform)
+    fileName = getFileNameFromDownloadResponse(legacyRes)
+    data = toArrayBuffer(legacyRes)
+    info = null
+  }
+
+  if (info?.download_url) {
+    fileName = info.file_name || ''
+    sha256 = info.sha256 || ''
+    if (/^https?:\/\//i.test(info.download_url)) {
+      // The CDN package is directly handed over to the main process for downloading, verification, and installation, avoiding slowdowns caused by bidirectional transmission of large packages between the main process and the Renderer
+      await api.installPluginFromUrl({
+        pluginId,
+        version,
+        fileName: fileName || `${pluginId}-${version || 'latest'}.chaterm`,
+        url: info.download_url,
+        sha256
+      })
+      return
+    }
+    data = toArrayBuffer(await downloadPluginPackage(info.download_url))
+  }
+
+  if (!fileName) {
+    fileName = `${pluginId}-${version || 'latest'}.chaterm`
+  }
+  if (!data) {
+    throw new Error('Plugin package download failed')
+  }
+
+  await verifyPackageSha256(data, sha256)
+
+  await api.installPluginFromBuffer({
+    pluginId,
+    version,
+    fileName,
+    data
+  })
+}
+
+const installLoadingMap = ref<Record<string, boolean>>({})
+const updateLoadingMap = ref<Record<string, boolean>>({})
+const setInstallLoading = (id: string, v: boolean) => {
+  if (v) {
+    installLoadingMap.value[id] = true
+  } else {
+    delete installLoadingMap.value[id]
+  }
+  eventBus.emit('pluginInstallLoadingChanged', { pluginId: id, loading: v })
+}
+
+const isPluginInstallCancelled = (error: any) => {
+  return String(error?.message || error || '')
+    .toLowerCase()
+    .includes('plugin install cancelled')
+}
+
+const onInstallClick = async (item: any) => {
+  const id = item.pluginId as string
+
+  setInstallLoading(id, true)
+
+  try {
+    await installOrUpdateFromStore(id, item.latestVersion)
+
+    await loadPlugins()
+
+    const installHint = await api.getInstallHint(id)
+
+    if (!installHint || !installHint.message) {
+      showNotification('success', t('extensions.installSuccess'))
+    } else {
+      showNotification('success', t('extensions.installSuccess'), installHint.message)
+    }
+  } catch (e: any) {
+    if (isPluginInstallCancelled(e)) {
+      return
+    }
+    showNotification('error', t('extensions.installFailed'), e?.message ?? String(e))
+    throw e
+  } finally {
+    setInstallLoading(id, false)
+  }
+}
+const setUpdateLoading = (id: string, v: boolean) => {
+  if (v) {
+    updateLoadingMap.value[id] = true
+  } else {
+    delete updateLoadingMap.value[id]
+  }
+  // The update button on the sidebar and the details page share the same update status to avoid inconsistent status display.
+  eventBus.emit('pluginUpdateLoadingChanged', { pluginId: id, loading: v })
+}
+
+const onUpdateClick = async (item: any) => {
+  const id = item.pluginId as string
+
+  setUpdateLoading(id, true)
+
+  try {
+    await installOrUpdateFromStore(id, item.latestVersion)
+    await loadPlugins()
+    showNotification('success', t('extensions.updateSuccess'))
+  } catch (e: any) {
+    if (isPluginInstallCancelled(e)) {
+      return
+    }
+    showNotification('error', t('extensions.updateFailed'), e?.message ?? String(e))
+    throw e
+  } finally {
+    setUpdateLoading(id, false)
+  }
+}
+
+const onSubscribeClick = (_item: any) => {
+  const pricingUrl = 'https://github.com/chaterm/Chaterm/discussions/1521'
+  window.open(pricingUrl, '_blank')
+}
+
+onBeforeUnmount(() => {
+  eventBus.off('aliasStatusChanged')
+  eventBus.off('reloadPlugins', refreshPlugins)
+  eventBus.off('uninstallPluginEvent', uninstallPluginEvent)
+  eventBus.off('installPluginEvent', installPluginEvent)
+  eventBus.off('updatePluginEvent', updatePluginEvent)
+  eventBus.off('pluginLoadingStateRequest', pluginLoadingStateRequest)
+  createdBlobUrls.forEach((url) => URL.revokeObjectURL(url))
+  createdBlobUrls.clear()
+})
+</script>
+<style scoped lang="less">
+:deep(.extension_full_height) {
+  height: 100% !important;
+  width: 100% !important;
+  display: block;
+}
+
+:deep(.ant-spin-container) {
+  height: 100% !important;
+  display: flex;
+  flex-direction: column;
+}
+
+.extension_panel {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.panel_header {
+  padding: 16px 16px 8px 16px;
+  flex-shrink: 0;
+}
+.panel_title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ant-text-color);
+}
+
+.search_box {
+  padding: 0 12px 10px 12px;
+  flex-shrink: 0;
+}
+
+.list_container {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 8px;
+  display: flex;
+  flex-direction: column;
+}
+
+.drag_placeholder {
+  flex: 1;
+  min-height: 20px;
+}
+
+.custom_extension_menu {
+  background: transparent !important;
+  border: none !important;
+  width: 100%;
+}
+
+:deep(.ant-menu-item) {
+  height: auto !important;
+  line-height: 1.5 !important;
+  padding: 8px !important;
+  margin-bottom: 4px !important;
+  border-radius: 6px;
+  display: block;
+}
+
+.item_wrapper {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  position: relative;
+}
+
+.item_icon {
+  width: 36px;
+  height: 36px;
+  flex-shrink: 0;
+  margin-right: 12px;
+  background: var(--bg-color-tertiary);
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+.item_icon img {
+  height: 100%;
+}
+
+.item_info {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.item_desc {
+  font-size: 12px;
+  color: var(--text-color);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.item_action {
+  margin-left: 8px;
+  padding: 4px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  z-index: 10;
+}
+
+.transparent-Input {
+  background-color: var(--bg-color-secondary) !important;
+  border: 1px solid var(--border-color) !important;
+
+  :deep(.ant-input) {
+    background-color: var(--bg-color-secondary) !important;
+    color: var(--text-color) !important;
+
+    &::placeholder {
+      color: var(--text-color-tertiary) !important;
+    }
+  }
+  :deep(.ant-input-suffix) {
+    color: var(--text-color-tertiary) !important;
+  }
+}
+
+.item_actions {
+  flex-shrink: 0;
+  display: flex;
+  gap: 10px;
+  margin-left: auto;
+  align-self: flex-end;
+}
+.op_btn {
+  background-color: var(--button-bg-color) !important;
+  border-color: var(--button-bg-color) !important;
+  color: #fff !important;
+  &:hover {
+    background-color: var(--button-hover-bg) !important;
+  }
+
+  &.ant-btn.ant-btn-sm {
+    font-size: 13px;
+    height: 20px;
+    padding: 0px 10px 20px 10px;
+    border-radius: 4px;
+  }
+
+  &.icon_btn.ant-btn.ant-btn-sm {
+    padding: 0;
+    width: 20px;
+    height: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+}
+.icon-fade-enter-active,
+.icon-fade-leave-active {
+  transition: opacity 1s ease-out;
+}
+
+.icon-fade-enter-from,
+.icon-fade-leave-to {
+  opacity: 0;
+}
+
+.icon-fade-enter-to,
+.icon-fade-leave-from {
+  opacity: 1;
+}
+
+.item_name_container {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+}
+
+.item_name {
+  flex: 1;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-color);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  overflow: hidden;
+  margin-bottom: 2px;
+}
+
+.right-tag {
+  margin: 0;
+  height: 20px;
+  line-height: 18px;
+  font-size: 12px;
+  border-radius: 7px;
+  font-weight: normal;
+  color: var(--text-color-tertiary);
+  border-color: var(--text-color-quaternary);
+  align-self: flex-start;
+}
+</style>

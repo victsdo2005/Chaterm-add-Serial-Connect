@@ -1,0 +1,11 @@
+node_modules
+dist
+dist-linux
+release
+.git
+.gitignore
+**/.cache
+**/dist
+**/node_modules
+Dockerfile
+docker

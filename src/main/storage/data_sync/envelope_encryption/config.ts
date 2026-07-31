@@ -1,0 +1,57 @@
+/**
+ * Simplified client-side configuration
+ */
+import { getKmsUrl } from '../../../config/edition'
+
+interface EncryptionConfig {
+  algorithm: string
+  keyLength: number
+  ivLength: number
+  tagLength: number
+}
+
+interface StorageConfig {
+  keyPrefix: string
+  sessionPrefix: string
+}
+
+interface Config {
+  serverUrl?: string
+  encryption: EncryptionConfig
+  storage: StorageConfig
+  timeout: {
+    apiRequest: number
+    keyExpiry: number
+  }
+  security: {
+    enforceHttps: boolean
+  }
+}
+
+const config: Config = {
+  // Edition-specific KMS server URL (CN or Global)
+  serverUrl: getKmsUrl(),
+  encryption: {
+    algorithm: 'aes-256-gcm',
+    keyLength: 32, // 256 bits
+    ivLength: 16, // 128 bits
+    tagLength: 16 // 128 bits
+  },
+
+  storage: {
+    keyPrefix: 'kms_encrypted_key_',
+    sessionPrefix: 'kms_session_'
+  },
+
+  timeout: {
+    apiRequest: 10000, // API request timeout 10 seconds
+    keyExpiry: 24 * 60 * 60 * 1000 // Key expiry time 24 hours
+  },
+
+  security: {
+    enforceHttps: process.env.NODE_ENV === 'production'
+  }
+}
+
+export default config
+export type { Config, EncryptionConfig, StorageConfig }

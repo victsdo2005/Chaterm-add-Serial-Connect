@@ -1,0 +1,174 @@
+import { BrowserWindow, shell, session, ipcMain } from 'electron'
+import { join } from 'path'
+import { is } from '@electron-toolkit/utils'
+import { getBrandingConfig } from './config/branding'
+import { mark } from '@perf'
+import { shouldPreventReloadShortcut, shouldRequestFileEditorReplaceShortcut } from './windowShortcutGuards'
+/**
+ * Result of creating the main window.
+ * `window` is available immediately for IPC registration and other setup.
+ * `contentLoaded` resolves when the renderer page finishes loading.
+ */
+export interface WindowCreationResult {
+  window: BrowserWindow
+  contentLoaded: Promise<void>
+}
+
+/**
+ * Create and manage the main BrowserWindow.
+ * The latest Cookie URL will be passed back via callback to avoid circular dependencies.
+ *
+ * Returns both the BrowserWindow reference and a Promise that resolves when
+ * the page content finishes loading. This allows callers to proceed with
+ * initialization that only needs the window reference while content loads
+ * in parallel.
+ */
+export async function createMainWindow(onCookieUrlChange?: (url: string) => void, shouldPreventClose?: () => boolean): Promise<WindowCreationResult> {
+  const brandingConfig = getBrandingConfig()
+  const windowTitle = brandingConfig.displayName
+  const windowIconPath = brandingConfig.iconPngPath || join(__dirname, '../../resources/icon.png')
+
+  mark('chaterm/main/willCreateBrowserWindow')
+  const mainWindow = new BrowserWindow({
+    width: 1344,
+    height: 756,
+    minWidth: 1060,
+    minHeight: 600,
+    title: windowTitle,
+    icon: windowIconPath,
+    titleBarStyle: 'hidden',
+    ...(process.platform !== 'darwin'
+      ? {
+          frame: false
+        }
+      : {}),
+    show: false,
+    autoHideMenuBar: true,
+    ...(process.platform === 'linux' ? { icon: windowIconPath } : {}),
+    webPreferences: {
+      preload: join(__dirname, '../preload/index.js'),
+      sandbox: false,
+      contextIsolation: true,
+      nodeIntegration: false,
+      defaultFontFamily: {
+        standard: '-apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Helvetica, Arial, sans-serif',
+        serif: 'serif',
+        sansSerif: 'sans-serif',
+        monospace: 'monospace'
+      }
+    }
+  })
+  mark('chaterm/main/didCreateBrowserWindow')
+
+  /**
+   * Show the window only after the 'ready-to-show' event to avoid a white flash.
+   */
+  // mainWindow.on('ready-to-show', () => {
+  //   mainWindow.show()
+  // })
+
+  /**
+   * On macOS the red close button merely hides the window instead of quitting the app.
+   */
+  if (process.platform === 'darwin') {
+    mainWindow.on('close', (event) => {
+      if (shouldPreventClose ? shouldPreventClose() : true) {
+        event.preventDefault()
+        // Exit fullscreen before hiding to prevent black screen issue on macOS
+        if (mainWindow.isFullScreen()) {
+          mainWindow.once('leave-full-screen', () => {
+            mainWindow.hide()
+          })
+          mainWindow.setFullScreen(false)
+        } else {
+          if (mainWindow.isMaximized()) {
+            mainWindow.unmaximize()
+          }
+          mainWindow.hide()
+        }
+      }
+    })
+  }
+
+  /**
+   * Intercept window.open; allow SSO URLs, while opening everything else in the system browser.
+   */
+  mainWindow.webContents.setWindowOpenHandler((details) => {
+    shell.openExternal(details.url)
+    if (details.url.includes('sso')) {
+      return { action: 'allow' }
+    }
+    return { action: 'deny' }
+  })
+
+  // Start loading the renderer content without blocking.
+  // The returned `contentLoaded` promise lets callers await it when needed.
+  mainWindow.once('ready-to-show', () => {
+    mark('chaterm/main/windowReadyToShow')
+  })
+
+  mainWindow.webContents.once('dom-ready', () => {
+    mark('chaterm/main/windowDomReady')
+  })
+
+  mark('chaterm/main/willLoadRenderer')
+  const contentLoaded = (
+    is.dev && process.env['ELECTRON_RENDERER_URL']
+      ? mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
+      : mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
+  ).then(
+    () => {
+      mark('chaterm/main/didLoadRenderer')
+    },
+    (error) => {
+      mark('chaterm/main/didFailLoadRenderer')
+      throw error
+    }
+  )
+  mark('chaterm/main/didStartRendererLoad')
+
+  // Listen for URL changes so we can update the Cookie URL via callback
+  mainWindow.webContents.on('did-finish-load', () => {
+    const url = mainWindow.webContents.getURL()
+    const cookieUrl = url.startsWith('file://') ? 'http://localhost' : url
+    onCookieUrlChange?.(cookieUrl)
+  })
+
+  /**
+   * Allow WebSocket connections that use the ws:// scheme.
+   */
+  session.defaultSession.webRequest.onBeforeRequest({ urls: ['ws://*/*'] }, (details, callback) => {
+    callback({ cancel: false, redirectURL: details.url })
+  })
+
+  // Listen for window state changes
+  mainWindow.on('maximize', () => {
+    mainWindow.webContents.send('window:maximized')
+  })
+
+  mainWindow.on('unmaximize', () => {
+    mainWindow.webContents.send('window:unmaximized')
+  })
+
+  // Disable Command+R (macOS) / Ctrl+R (Windows/Linux) reload shortcut
+  // while preserving Ctrl+R for terminal reverse history search (reverse-i-search)
+  let isTerminalFocused = false
+  let isFileEditorFocused = false
+  ipcMain.on('terminal:focus-changed', (_event, focused: boolean) => {
+    isTerminalFocused = focused
+  })
+  ipcMain.on('file-editor:focus-changed', (_event, focused: boolean) => {
+    isFileEditorFocused = focused
+  })
+  mainWindow.webContents.on('before-input-event', (event, input) => {
+    const shortcutContext = { platform: process.platform, isTerminalFocused, isFileEditorFocused }
+    if (shouldPreventReloadShortcut(input, shortcutContext)) {
+      event.preventDefault()
+      if (shouldRequestFileEditorReplaceShortcut(input, shortcutContext)) {
+        mainWindow.webContents.send('file-editor:replace')
+      }
+    }
+  })
+
+  return { window: mainWindow, contentLoaded }
+}

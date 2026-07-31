@@ -1,0 +1,19 @@
+singleQuote: true # Use single quotes for strings (recommended for JS/TS)
+semi: false # No semicolons at end of statements (must match ESLint semi rule)
+printWidth: 150 # Maximum 150 characters per line (auto-wrap if exceeded)
+trailingComma: none # No trailing commas (options: 'none'|'es5'|'all')
+tabWidth: 2 # Use 2 spaces for indentation (Vue community standard)
+useTabs: false # Disable tabs (force space indentation)
+bracketSpacing: true # Keep spaces inside object brackets (e.g., { foo: bar })
+arrowParens: 'always' # Always add parentheses around arrow function parameters (improves readability)
+proseWrap: 'preserve' # Don't auto-wrap Markdown text (preserve original)
+endOfLine: 'auto' # Auto-detect system line endings (CRLF/LF)
+bracketSameLine: false # Keep brackets on same line when wrapping (e.g., { foo: bar })
+vueIndentScriptAndStyle: false # Don't indent Vue <script>/<style> tags
+htmlWhitespaceSensitivity: 'strict' # Strict handling of whitespace between HTML elements
+singleAttributePerLine: true # One attribute per line (improves readability for long attributes)
+# Enable automatic TypeScript detection
+overrides:
+  - files: '**/*.ts'
+    options:
+      parser: 'typescript'

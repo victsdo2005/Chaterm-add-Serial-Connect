@@ -1,0 +1,1243 @@
+<template>
+  <div
+    class="userInfo"
+    data-onboarding-id="settings-general-content"
+  >
+    <a-card
+      :bordered="false"
+      class="userInfo-container"
+    >
+      <a-form
+        :colon="false"
+        label-align="left"
+        wrapper-align="right"
+        :label-col="{ span: 7, offset: 0 }"
+        :wrapper-col="{ span: 17, class: 'right-aligned-wrapper' }"
+        class="custom-form"
+      >
+        <a-form-item>
+          <template #label>
+            <span class="label-text">{{ $t('user.baseSetting') }}</span>
+          </template>
+        </a-form-item>
+        <a-form-item
+          :label="$t('user.theme')"
+          class="user_my-ant-form-item"
+        >
+          <a-select
+            v-model:value="userConfig.theme"
+            style="width: 240px"
+            class="theme-select"
+            :dropdown-match-select-width="false"
+            @change="changeTheme"
+          >
+            <a-select-opt-group
+              v-for="group in themeOptionGroups"
+              :key="group.labelKey"
+              :label="$t(group.labelKey)"
+            >
+              <a-select-option
+                v-for="option in group.options"
+                :key="option.value"
+                :value="option.value"
+              >
+                <span class="theme-option-content">
+                  <span
+                    class="theme-option-swatch"
+                    :style="getThemeSwatchStyle(option)"
+                  >
+                    <span class="theme-option-swatch-surface"></span>
+                    <span class="theme-option-swatch-accent"></span>
+                  </span>
+                  <span class="theme-option-label">{{ $t(option.labelKey) }}</span>
+                </span>
+              </a-select-option>
+            </a-select-opt-group>
+          </a-select>
+        </a-form-item>
+
+        <a-form-item
+          :label="$t('user.background')"
+          class="user_my-ant-form-item"
+        >
+          <div
+            class="bg-content"
+            data-onboarding-id="settings-background-section"
+          >
+            <!-- Background Grid -->
+            <div class="unified-bg-grid">
+              <!-- Slot 1: Default Background (no background) -->
+              <div
+                class="bg-grid-item default-bg-item"
+                :class="{ active: userConfig.background.mode === 'none' }"
+                @click="selectDefaultBackground"
+              >
+                <div class="default-bg-placeholder">
+                  <desktop-outlined style="font-size: 20px; margin-bottom: 4px" />
+                  <span style="font-size: 10px">{{ $t('user.backgroundDefault') }}</span>
+                </div>
+              </div>
+
+              <!-- Slots 2-6: System Backgrounds -->
+              <div
+                v-for="i in 5"
+                :key="i"
+                class="bg-grid-item system-item"
+                :class="{ active: userConfig.background.mode === 'image' && userConfig.background.image.includes(`wall-${i}.jpg`) }"
+                :data-onboarding-id="i === 1 ? 'settings-background-preset' : undefined"
+                @click="selectSystemBackground(i)"
+              >
+                <img
+                  :src="getSystemBgUrl(i)"
+                  loading="lazy"
+                />
+              </div>
+            </div>
+
+            <!-- Custom Upload Section -->
+            <div class="custom-upload-section">
+              <span class="custom-upload-label">{{ $t('user.backgroundCustomUpload') }}</span>
+              <div class="custom-upload-grid">
+                <!-- Custom uploaded background (if exists) -->
+                <div
+                  v-if="customBackgroundImage"
+                  class="bg-grid-item custom-item"
+                  :class="{ active: userConfig.background.mode === 'image' && userConfig.background.image === customBackgroundImage }"
+                  @click="selectCustomBackground"
+                >
+                  <img
+                    :src="convertFileLocalResourceSrc(customBackgroundImage)"
+                    alt="Custom Background"
+                  />
+                  <div
+                    class="delete-btn"
+                    @click.stop="clearCustomBackground"
+                  >
+                    <delete-outlined />
+                  </div>
+                </div>
+
+                <!-- Upload button -->
+                <div
+                  class="bg-grid-item upload-item"
+                  @click="selectBackgroundImage"
+                >
+                  <div class="upload-placeholder">
+                    <upload-outlined style="font-size: 20px" />
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Sliders (Global for any selected background) -->
+            <div
+              v-if="userConfig.background.mode === 'image' && userConfig.background.image"
+              class="bg-sliders-section mt-2"
+            >
+              <div class="slider-item">
+                <span class="slider-label">{{ $t('user.backgroundOpacity') }}</span>
+                <a-slider
+                  v-model:value="userConfig.background.opacity"
+                  :min="0"
+                  :max="1"
+                  :step="0.05"
+                  @change="changeBackgroundOpacity"
+                />
+              </div>
+              <div class="slider-item">
+                <span class="slider-label">{{ $t('user.backgroundBrightness') }}</span>
+                <a-slider
+                  v-model:value="userConfig.background.brightness"
+                  :min="0"
+                  :max="1"
+                  :step="0.05"
+                  @change="changeBackgroundBrightness"
+                />
+              </div>
+            </div>
+          </div>
+        </a-form-item>
+
+        <a-form-item
+          :label="$t('user.defaultLayout')"
+          class="user_my-ant-form-item"
+        >
+          <a-radio-group
+            v-model:value="userConfig.defaultLayout"
+            class="custom-radio-group"
+            @change="changeDefaultLayout"
+          >
+            <a-radio value="terminal">{{ $t('user.defaultLayoutTerminal') }}</a-radio>
+            <a-radio value="agents">{{ $t('user.defaultLayoutAgents') }}</a-radio>
+          </a-radio-group>
+        </a-form-item>
+        <a-form-item
+          :label="$t('user.language')"
+          class="user_my-ant-form-item"
+        >
+          <a-select
+            v-model:value="userConfig.language"
+            class="language-select"
+            @change="changeLanguage"
+          >
+            <a-select-option value="system">{{ $t('user.languageSystem') }}</a-select-option>
+            <a-select-option value="zh-CN">简体中文</a-select-option>
+            <a-select-option value="zh-TW">繁體中文</a-select-option>
+            <a-select-option value="en-US">English</a-select-option>
+            <a-select-option value="de-DE">Deutsch</a-select-option>
+            <a-select-option value="fr-FR">Français</a-select-option>
+            <a-select-option value="it-IT">Italiano</a-select-option>
+            <a-select-option value="pt-PT">Português</a-select-option>
+            <a-select-option value="ru-RU">Русский</a-select-option>
+            <a-select-option value="ja-JP">日本語</a-select-option>
+            <a-select-option value="ko-KR">한국어</a-select-option>
+            <a-select-option value="ar-AR">العربية</a-select-option>
+          </a-select>
+        </a-form-item>
+        <a-form-item
+          :label="$t('user.watermark')"
+          class="user_my-ant-form-item"
+        >
+          <a-radio-group
+            v-model:value="userConfig.watermark"
+            class="custom-radio-group"
+          >
+            <a-radio value="open">{{ $t('user.watermarkOpen') }}</a-radio>
+            <a-radio value="close">{{ $t('user.watermarkClose') }}</a-radio>
+          </a-radio-group>
+        </a-form-item>
+
+        <a-form-item
+          :label="$t('user.onboardingGuide')"
+          class="user_my-ant-form-item"
+        >
+          <a-button
+            class="setting-button"
+            @click="openOnboardingGuide"
+          >
+            {{ $t('user.openOnboardingGuide') }}
+          </a-button>
+        </a-form-item>
+
+        <!-- Editor Settings -->
+        <a-form-item class="editor-settings-section">
+          <template #label>
+            <span class="label-text">{{ $t('user.editorSettings') }}</span>
+          </template>
+        </a-form-item>
+
+        <a-form-item
+          :label="$t('user.editorFontSize')"
+          class="user_my-ant-form-item"
+        >
+          <a-input-number
+            v-model:value="editorConfig.fontSize"
+            :min="8"
+            :max="32"
+            :step="1"
+            style="width: 120px"
+            @change="saveEditorConfig"
+          />
+        </a-form-item>
+
+        <a-form-item
+          :label="$t('user.editorLineHeight')"
+          class="user_my-ant-form-item"
+        >
+          <a-input-number
+            v-model:value="editorConfig.lineHeight"
+            :min="0"
+            :max="48"
+            :step="1"
+            style="width: 120px"
+            @change="saveEditorConfig"
+          />
+        </a-form-item>
+
+        <a-form-item
+          :label="$t('user.editorFont')"
+          class="user_my-ant-form-item"
+        >
+          <a-select
+            v-model:value="editorConfig.fontFamily"
+            class="language-select"
+            @change="saveEditorConfig"
+          >
+            <a-select-option
+              v-for="opt in FONT_FAMILY_OPTIONS"
+              :key="opt.value"
+              :value="opt.value"
+            >
+              {{ $t(opt.labelKey) }}
+            </a-select-option>
+          </a-select>
+        </a-form-item>
+
+        <a-form-item
+          :label="$t('user.editorTabSize') + '(' + $t('common.space') + ')'"
+          class="user_my-ant-form-item"
+        >
+          <a-input-number
+            v-model:value="editorConfig.tabSize"
+            :min="1"
+            :max="8"
+            :step="1"
+            style="width: 120px"
+            @change="saveEditorConfig"
+          />
+        </a-form-item>
+
+        <a-form-item
+          :label="$t('user.editorWordWrap')"
+          class="user_my-ant-form-item"
+        >
+          <a-radio-group
+            v-model:value="editorConfig.wordWrap"
+            class="custom-radio-group"
+            @change="saveEditorConfig"
+          >
+            <a-radio value="on">{{ $t('common.open') }}</a-radio>
+            <a-radio value="off">{{ $t('common.close') }}</a-radio>
+          </a-radio-group>
+        </a-form-item>
+
+        <a-form-item
+          :label="$t('user.editorMinimap')"
+          class="user_my-ant-form-item"
+        >
+          <a-radio-group
+            v-model:value="editorConfig.minimap"
+            class="custom-radio-group"
+            @change="saveEditorConfig"
+          >
+            <a-radio :value="true">{{ $t('common.open') }}</a-radio>
+            <a-radio :value="false">{{ $t('common.close') }}</a-radio>
+          </a-radio-group>
+        </a-form-item>
+
+        <a-form-item
+          :label="$t('user.editorMouseWheelZoom')"
+          class="user_my-ant-form-item"
+        >
+          <a-radio-group
+            v-model:value="editorConfig.mouseWheelZoom"
+            class="custom-radio-group"
+            @change="saveEditorConfig"
+          >
+            <a-radio :value="true">{{ $t('common.open') }}</a-radio>
+            <a-radio :value="false">{{ $t('common.close') }}</a-radio>
+          </a-radio-group>
+        </a-form-item>
+      </a-form>
+    </a-card>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, onMounted, watch, onBeforeUnmount, computed } from 'vue'
+import { notification } from 'ant-design-vue'
+import { DeleteOutlined, UploadOutlined, DesktopOutlined } from '@ant-design/icons-vue'
+import { userConfigStore, remoteApplyGuard } from '@/services/userConfigStoreService'
+import { userConfigStore as configStore } from '@/store/userConfigStore'
+import { useEditorConfigStore, type EditorConfig, FONT_FAMILY_OPTIONS } from '@/store/editorConfig'
+import eventBus from '@/utils/eventBus'
+import { getActualTheme, getSystemTheme, addSystemThemeListener } from '@/utils/themeUtils'
+import { resolveThemePreset } from '../../../../../../shared/themes/resolve'
+import { THEME_PRESETS } from '../../../../../../shared/themes/presets'
+import { applyThemeToDocument } from '@/themes/applyTheme'
+import type { ThemeId } from '../../../../../../shared/themes/types'
+import { useI18n } from 'vue-i18n'
+import { convertFileLocalResourceSrc } from '@/utils/convertFileLocalResourceSrc'
+import { resolveAppliedLanguage } from '@/utils/languageUtils'
+
+const logger = createRendererLogger('settings.general')
+const api = window.api
+const { locale, t } = useI18n()
+const editorConfigStore = useEditorConfigStore()
+
+const userConfig = ref({
+  language: 'zh-CN',
+  watermark: 'open',
+  theme: 'dark',
+  defaultLayout: 'terminal',
+  lastCustomImage: '',
+  background: {
+    image: '',
+    opacity: 0.05,
+    brightness: 0.9,
+    mode: 'none'
+  }
+})
+
+const customBackgroundImage = ref('')
+const SYSTEM_BG_KEY_PREFIX = 'system-bg:'
+
+interface ThemeOptionPreview {
+  value: ThemeId
+  labelKey: string
+  background: string
+  surface: string
+  accent: string
+  accentAlt?: string
+  border: string
+}
+
+const THEME_LABEL_KEYS: Record<Exclude<ThemeId, 'auto'>, string> = {
+  dark: 'user.themeDark',
+  light: 'user.themeLight',
+  'termius-dark': 'user.themeTermiusDark',
+  'termius-light': 'user.themeTermiusLight',
+  'flexoki-dark': 'user.themeFlexokiDark',
+  'flexoki-light': 'user.themeFlexokiLight',
+  'kanagawa-wave': 'user.themeKanagawaWave',
+  'kanagawa-dragon': 'user.themeKanagawaDragon',
+  'kanagawa-lotus': 'user.themeKanagawaLotus',
+  'hacker-blue': 'user.themeHackerBlue',
+  'hacker-green': 'user.themeHackerGreen',
+  'dracula-night': 'user.themeDraculaNight',
+  'catppuccin-mocha': 'user.themeCatppuccinMocha',
+  'catppuccin-latte': 'user.themeCatppuccinLatte',
+  'gruvbox-dark': 'user.themeGruvboxDark',
+  'nord-frost': 'user.themeNordFrost'
+}
+
+const buildThemePreview = (themeId: ThemeId): ThemeOptionPreview => {
+  if (themeId === 'auto') {
+    const dark = THEME_PRESETS.dark.uiTokens
+    const light = THEME_PRESETS.light.uiTokens
+    return {
+      value: 'auto',
+      labelKey: 'user.themeAuto',
+      background: `linear-gradient(135deg, ${dark['--bg-color']} 0%, ${dark['--bg-color']} 49%, ${light['--bg-color']} 51%, ${light['--bg-color']} 100%)`,
+      surface: `linear-gradient(90deg, ${dark['--bg-color-secondary']} 0%, ${light['--bg-color-secondary']} 100%)`,
+      accent: dark['--button-bg-color'],
+      accentAlt: light['--button-bg-color'],
+      border: '#94a3b8'
+    }
+  }
+
+  const preset = THEME_PRESETS[themeId]
+  return {
+    value: themeId,
+    labelKey: THEME_LABEL_KEYS[themeId],
+    background: preset.uiTokens['--bg-color'],
+    surface: preset.uiTokens['--bg-color-secondary'],
+    accent: preset.uiTokens['--button-bg-color'],
+    border: preset.uiTokens['--border-color-light']
+  }
+}
+
+const themeOptionGroups = computed(() => [
+  {
+    labelKey: 'user.themeGroupSystem',
+    options: [buildThemePreview('auto')]
+  },
+  {
+    labelKey: 'user.themeGroupDefault',
+    options: [buildThemePreview('dark'), buildThemePreview('light')]
+  },
+  {
+    labelKey: 'user.themeGroupOfficial',
+    options: [
+      buildThemePreview('termius-dark'),
+      buildThemePreview('termius-light'),
+      buildThemePreview('flexoki-dark'),
+      buildThemePreview('flexoki-light'),
+      buildThemePreview('kanagawa-wave'),
+      buildThemePreview('kanagawa-dragon'),
+      buildThemePreview('kanagawa-lotus'),
+      buildThemePreview('hacker-blue'),
+      buildThemePreview('hacker-green'),
+      buildThemePreview('dracula-night'),
+      buildThemePreview('catppuccin-mocha'),
+      buildThemePreview('catppuccin-latte'),
+      buildThemePreview('gruvbox-dark'),
+      buildThemePreview('nord-frost')
+    ]
+  }
+])
+
+const getThemeSwatchStyle = (option: ThemeOptionPreview): Record<string, string> => ({
+  '--theme-preview-bg': option.background,
+  '--theme-preview-surface': option.surface,
+  '--theme-preview-accent': option.accent,
+  '--theme-preview-accent-alt': option.accentAlt || option.accent,
+  '--theme-preview-border': option.border
+})
+
+// Editor config form state (synced from store on load)
+const editorConfig = ref<EditorConfig>({
+  fontSize: 14,
+  fontFamily: 'cascadia-mono',
+  tabSize: 4,
+  wordWrap: 'off',
+  minimap: true,
+  mouseWheelZoom: true,
+  cursorBlinking: 'blink',
+  lineHeight: 0
+})
+
+const loadSavedConfig = async () => {
+  try {
+    const savedConfig = await userConfigStore.getConfig()
+    if (savedConfig) {
+      userConfig.value = {
+        ...userConfig.value,
+        ...savedConfig,
+        defaultLayout: savedConfig.defaultLayout || 'terminal',
+        lastCustomImage: savedConfig.lastCustomImage || '',
+        background: savedConfig.background || {
+          image: '',
+          opacity: 0.8,
+          brightness: 1.0,
+          mode: 'none'
+        },
+        watermark: (savedConfig.watermark || 'open') as 'open' | 'close'
+      } as any
+
+      const normalizedSystemBg = normalizeSystemBackgroundImage(userConfig.value.background.image)
+      if (normalizedSystemBg !== userConfig.value.background.image) {
+        userConfig.value.background.image = normalizedSystemBg
+      }
+
+      // Initialize custom background image if current bg is not a system one
+      if (userConfig.value.background.image && !isSystemBackgroundImage(userConfig.value.background.image)) {
+        customBackgroundImage.value = userConfig.value.background.image
+        userConfig.value.lastCustomImage = userConfig.value.background.image
+      } else if (userConfig.value.lastCustomImage) {
+        customBackgroundImage.value = userConfig.value.lastCustomImage
+      }
+      const preset = resolveThemePreset(userConfig.value.theme as ThemeId, getSystemTheme() as 'dark' | 'light')
+      applyThemeToDocument(preset)
+      eventBus.emit('updateTheme', {
+        themeId: userConfig.value.theme,
+        appearance: preset.appearance,
+        preset
+      })
+      api.updateTheme(userConfig.value.theme)
+    }
+
+    // Load editor config from store
+    await editorConfigStore.loadConfig()
+    editorConfig.value = editorConfigStore.getConfigSnapshot()
+  } catch (error) {
+    logger.error('Failed to load config', { error: error })
+    notification.error({
+      message: t('user.loadConfigFailed'),
+      description: t('user.loadConfigFailedDescription')
+    })
+    const fallbackPreset = resolveThemePreset('dark' as ThemeId, getSystemTheme() as 'dark' | 'light')
+    applyThemeToDocument(fallbackPreset)
+    userConfig.value.theme = 'dark'
+  }
+}
+
+const saveConfig = async () => {
+  try {
+    const configToStore = {
+      language: userConfig.value.language,
+      watermark: (userConfig.value.watermark || 'open') as 'open' | 'close',
+      theme: userConfig.value.theme,
+      defaultLayout: userConfig.value.defaultLayout,
+      lastCustomImage: userConfig.value.lastCustomImage,
+      background: userConfig.value.background
+    }
+    await userConfigStore.saveConfig(configToStore as any)
+    eventBus.emit('updateWatermark', configToStore.watermark)
+    const savedPreset = resolveThemePreset(configToStore.theme as ThemeId, getSystemTheme() as 'dark' | 'light')
+    eventBus.emit('updateTheme', {
+      themeId: configToStore.theme,
+      appearance: savedPreset.appearance,
+      preset: savedPreset
+    })
+  } catch (error) {
+    logger.error('Failed to save config', { error: error })
+    notification.error({
+      message: t('user.error'),
+      description: t('user.saveConfigFailedDescription')
+    })
+  }
+}
+
+watch(
+  () => userConfig.value,
+  async () => {
+    if (remoteApplyGuard.isApplying) return
+    await saveConfig()
+  },
+  { deep: true }
+)
+
+const reloadConfigOnSync = async () => {
+  await loadSavedConfig()
+}
+
+const reloadEditorConfigOnSync = async () => {
+  try {
+    await editorConfigStore.loadConfig()
+    editorConfig.value = editorConfigStore.getConfigSnapshot()
+  } catch (error) {
+    logger.error('Failed to reload editor config on sync', { error })
+  }
+}
+
+let systemThemeListener: (() => void) | null = null
+
+onMounted(async () => {
+  await loadSavedConfig()
+
+  eventBus.on('userConfigSyncApplied', reloadConfigOnSync)
+  eventBus.on('editorConfigSyncApplied', reloadEditorConfigOnSync)
+
+  // Add system theme change listener
+  setupSystemThemeListener()
+
+  // Listen for default layout changes from header
+  eventBus.on('defaultLayoutChanged', (mode) => {
+    if (mode === 'terminal' || mode === 'agents') {
+      userConfig.value.defaultLayout = mode
+    }
+  })
+})
+
+onBeforeUnmount(() => {
+  eventBus.off('defaultLayoutChanged')
+  eventBus.off('userConfigSyncApplied', reloadConfigOnSync)
+  eventBus.off('editorConfigSyncApplied', reloadEditorConfigOnSync)
+
+  // Remove system theme listener
+  if (systemThemeListener) {
+    systemThemeListener()
+    systemThemeListener = null
+  }
+})
+
+const changeLanguage = async () => {
+  const stored = userConfig.value.language
+  const applied = resolveAppliedLanguage(stored)
+  locale.value = applied
+  localStorage.setItem('lang', stored)
+  configStore().updateLanguage(stored)
+
+  // Notify other components that language has changed, need to refresh data
+  eventBus.emit('languageChanged', stored)
+}
+
+// Setup system theme change listener
+const setupSystemThemeListener = () => {
+  const listener = addSystemThemeListener(async (_newSystemTheme: string) => {
+    // Only update theme if user has selected 'auto' mode
+    if (userConfig.value.theme === 'auto') {
+      const actualTheme = getActualTheme(userConfig.value.theme)
+      const currentTheme = document.documentElement.className.replace('theme-', '')
+
+      if (currentTheme !== actualTheme) {
+        // System theme changed, update application theme
+        const preset = resolveThemePreset('auto' as ThemeId, getSystemTheme() as 'dark' | 'light')
+        applyThemeToDocument(preset)
+        eventBus.emit('updateTheme', {
+          themeId: 'auto',
+          appearance: preset.appearance,
+          preset
+        })
+        // Update main process window controls
+        await api.updateTheme(userConfig.value.theme)
+        logger.info(`System theme changed, updating application theme to ${actualTheme}`)
+      }
+    }
+  })
+  systemThemeListener = listener as () => void
+
+  // Listen for system theme changes from main process (Windows)
+  if (window.api && window.api.onSystemThemeChanged) {
+    window.api.onSystemThemeChanged((newSystemTheme) => {
+      if (userConfig.value.theme === 'auto') {
+        const currentTheme = document.documentElement.className.replace('theme-', '')
+        if (currentTheme !== newSystemTheme) {
+          const preset = resolveThemePreset('auto' as ThemeId, newSystemTheme as 'dark' | 'light')
+          applyThemeToDocument(preset)
+          eventBus.emit('updateTheme', {
+            themeId: 'auto',
+            appearance: preset.appearance,
+            preset
+          })
+          logger.info(`System theme changed to ${newSystemTheme} (from main process)`)
+        }
+      }
+    })
+  }
+}
+
+const changeTheme = async () => {
+  try {
+    const preset = resolveThemePreset(userConfig.value.theme as ThemeId, getSystemTheme() as 'dark' | 'light')
+    applyThemeToDocument(preset)
+    eventBus.emit('updateTheme', {
+      themeId: userConfig.value.theme,
+      appearance: preset.appearance,
+      preset
+    })
+    // Update main process window controls immediately
+    configStore().updateTheme(userConfig.value.theme)
+    await api.updateTheme(userConfig.value.theme)
+    await saveConfig()
+  } catch (error) {
+    logger.error('Failed to change theme', { error: error })
+    notification.error({
+      message: t('user.themeSwitchFailed'),
+      description: t('user.themeSwitchFailedDescription')
+    })
+  }
+}
+
+const changeDefaultLayout = async () => {
+  // Switch to the selected layout immediately
+  eventBus.emit('switch-mode', userConfig.value.defaultLayout)
+  eventBus.emit('switch-mode', userConfig.value.defaultLayout)
+  await saveConfig()
+}
+
+const selectDefaultBackground = async () => {
+  userConfig.value.background.mode = 'none'
+  userConfig.value.background.image = ''
+  configStore().updateBackgroundMode('none')
+  configStore().updateBackgroundImage('')
+  await saveConfig()
+}
+
+// Helper to get system background URL
+// Using a relative path that works in development and production (if assets are handled correctly)
+// In Electron renderer, we can often use relative paths or require/import
+const getSystemBgStorageKey = (index: number): string => `${SYSTEM_BG_KEY_PREFIX}${index}`
+
+const getSystemBgIndex = (imagePath: string): number | null => {
+  if (!imagePath) {
+    return null
+  }
+
+  if (imagePath.startsWith(SYSTEM_BG_KEY_PREFIX)) {
+    const index = Number(imagePath.slice(SYSTEM_BG_KEY_PREFIX.length))
+    return Number.isNaN(index) ? null : index
+  }
+
+  const match = imagePath.match(/wall-(\d+)\.jpg/)
+  if (!match) {
+    return null
+  }
+
+  const index = Number(match[1])
+  return Number.isNaN(index) ? null : index
+}
+
+const normalizeSystemBackgroundImage = (imagePath: string): string => {
+  const index = getSystemBgIndex(imagePath)
+  if (index === null) {
+    return imagePath
+  }
+  return getSystemBgStorageKey(index)
+}
+
+const isSystemBackgroundImage = (imagePath: string): boolean => getSystemBgIndex(imagePath) !== null
+
+const getSystemBgUrl = (index: number): string => {
+  return new URL(`../../../../assets/backgroup/wall-${index}.jpg`, import.meta.url).href
+}
+
+const selectSystemBackground = async (index: number) => {
+  userConfig.value.background.mode = 'image'
+  userConfig.value.background.image = getSystemBgUrl(index)
+  configStore().updateBackgroundMode('image')
+  configStore().updateBackgroundImage(userConfig.value.background.image)
+  await saveConfig()
+}
+
+const selectCustomBackground = async () => {
+  if (customBackgroundImage.value) {
+    userConfig.value.background.mode = 'image'
+    userConfig.value.background.image = customBackgroundImage.value
+    userConfig.value.lastCustomImage = customBackgroundImage.value
+    configStore().updateBackgroundMode('image')
+    configStore().updateBackgroundImage(userConfig.value.background.image)
+    await saveConfig()
+  }
+}
+
+const selectBackgroundImage = async () => {
+  try {
+    const result = await (api as any).showOpenDialog({
+      properties: ['openFile'],
+      filters: [{ name: 'Images', extensions: ['jpg', 'png', 'gif', 'jpeg', 'webp'] }]
+    })
+
+    if (!result.canceled && result.filePaths.length > 0) {
+      const sourcePath = result.filePaths[0]
+
+      // Call main process to save the file
+      const saveResult = await api.saveCustomBackground(sourcePath)
+
+      if (saveResult.success) {
+        // Use the new path with cache busting
+        const baseUrl = saveResult.url
+        if (baseUrl) {
+          const separator = baseUrl.includes('?') ? '&' : '?'
+          const newPath = `${baseUrl}${separator}t=${Date.now()}`
+          customBackgroundImage.value = newPath
+          userConfig.value.background.mode = 'image'
+          userConfig.value.background.image = newPath
+          userConfig.value.lastCustomImage = newPath
+          configStore().updateBackgroundMode('image')
+          configStore().updateBackgroundImage(userConfig.value.background.image)
+          await saveConfig()
+        }
+      } else {
+        notification.error({
+          message: t('user.saveBackgroundFailed'),
+          description: saveResult.error
+        })
+      }
+    }
+  } catch (error) {
+    logger.error('Failed to select background image', { error: error })
+  }
+}
+
+const clearCustomBackground = async () => {
+  // If currently selected, reset to default (no background)
+  if (userConfig.value.background.image === customBackgroundImage.value) {
+    userConfig.value.background.mode = 'none'
+    userConfig.value.background.image = ''
+    configStore().updateBackgroundMode('none')
+    configStore().updateBackgroundImage('')
+  }
+  customBackgroundImage.value = ''
+  userConfig.value.lastCustomImage = ''
+  await saveConfig()
+}
+
+const changeBackgroundOpacity = async () => {
+  configStore().updateBackgroundOpacity(userConfig.value.background.opacity)
+  await saveConfig()
+}
+
+const changeBackgroundBrightness = async () => {
+  configStore().updateBackgroundBrightness(userConfig.value.background.brightness)
+  await saveConfig()
+}
+
+const openOnboardingGuide = () => {
+  eventBus.emit('open-user-tab', 'onboardingGuide')
+}
+
+// Save editor config to store and persist via IPC
+const saveEditorConfig = async () => {
+  try {
+    await editorConfigStore.updateConfig(editorConfig.value)
+  } catch (error) {
+    logger.error('Failed to save editor config', { error: error })
+    notification.error({
+      message: t('user.saveFailed'),
+      description: t('user.saveConfigFailedDescription')
+    })
+  }
+}
+</script>
+
+<style scoped>
+.userInfo {
+  width: 100%;
+}
+
+.userInfo-container {
+  width: 100%;
+  background-color: var(--bg-color) !important;
+  border-radius: 6px;
+  padding: 4px;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.15);
+  color: var(--text-color);
+}
+
+:deep(.ant-card) {
+  background-color: var(--bg-color) !important;
+}
+
+:deep(.ant-card-body) {
+  padding: 16px;
+  background-color: var(--bg-color);
+}
+
+.custom-form {
+  color: var(--text-color);
+  align-content: center;
+}
+
+.custom-form :deep(.ant-form-item-label) {
+  padding-right: 20px;
+}
+
+.custom-form :deep(.ant-form-item-label > label) {
+  color: var(--text-color);
+}
+
+.custom-form :deep(.ant-input),
+.custom-form :deep(.ant-input-number),
+.custom-form :deep(.ant-radio-wrapper) {
+  color: var(--text-color);
+}
+
+.custom-form :deep(.ant-input-number) {
+  background-color: var(--input-number-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  transition: all 0.3s;
+  width: 100px !important;
+}
+
+.custom-form :deep(.ant-input-number:hover),
+.custom-form :deep(.ant-input-number:focus),
+.custom-form :deep(.ant-input-number-focused) {
+  background-color: var(--input-number-hover-bg);
+  border-color: #1890ff;
+  box-shadow: 0 0 0 2px rgba(24, 144, 255, 0.2);
+}
+
+.custom-form :deep(.ant-input-number-input) {
+  height: 32px;
+  padding: 4px 8px;
+  background-color: transparent;
+  color: var(--text-color);
+}
+
+.label-text {
+  font-size: 20px;
+  font-weight: bold;
+  line-height: 1.3;
+}
+
+.user_my-ant-form-item {
+  -webkit-box-sizing: border-box;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  color: rgba(0, 0, 0, 0.65);
+  font-size: 30px;
+  font-variant: tabular-nums;
+  line-height: 1.5;
+  list-style: none;
+  -webkit-font-feature-settings: 'tnum';
+  font-feature-settings: 'tnum';
+  margin-bottom: 14px;
+  vertical-align: top;
+  color: #ffffff;
+}
+
+.language-select,
+.theme-select {
+  width: 180px !important;
+  text-align: left;
+}
+
+.theme-select {
+  width: 240px !important;
+}
+
+.setting-button {
+  min-width: 120px;
+  color: var(--text-color);
+  background-color: var(--button-bg-color);
+  border-color: var(--button-bg-color);
+}
+
+.setting-button:hover,
+.setting-button:focus {
+  background-color: var(--button-hover-bg);
+  border-color: var(--button-hover-bg);
+}
+
+.theme-light .setting-button {
+  background-color: #e2e8f0;
+  border-color: #e2e8f0;
+  color: #0f172a;
+}
+
+.theme-light .setting-button:hover,
+.theme-light .setting-button:focus {
+  background-color: #cbd5e1;
+  border-color: #cbd5e1;
+  color: #0f172a;
+}
+
+.language-select :deep(.ant-select-selector),
+.theme-select :deep(.ant-select-selector) {
+  background-color: var(--select-bg);
+  border: 1px solid var(--select-border);
+  border-radius: 6px;
+  color: var(--text-color);
+  transition: all 0.3s;
+  height: 32px;
+}
+
+.language-select :deep(.ant-select-selector:hover),
+.theme-select :deep(.ant-select-selector:hover) {
+  border-color: #1890ff;
+  background-color: var(--select-hover-bg);
+}
+
+.language-select :deep(.ant-select-focused .ant-select-selector),
+.language-select :deep(.ant-select-selector:focus),
+.theme-select :deep(.ant-select-focused .ant-select-selector),
+.theme-select :deep(.ant-select-selector:focus) {
+  border-color: #1890ff;
+  box-shadow: 0 0 0 2px rgba(24, 144, 255, 0.2);
+  background-color: var(--select-hover-bg);
+}
+
+.language-select :deep(.ant-select-selection-item),
+.theme-select :deep(.ant-select-selection-item) {
+  color: var(--text-color);
+  font-size: 14px;
+  line-height: 32px;
+}
+
+.theme-select :deep(.ant-select-item-option-content) {
+  display: flex;
+  align-items: center;
+}
+
+.language-select :deep(.ant-select-arrow),
+.theme-select :deep(.ant-select-arrow) {
+  color: var(--text-color);
+  opacity: 0.7;
+}
+
+.theme-option-content {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.theme-option-swatch {
+  position: relative;
+  width: 28px;
+  height: 18px;
+  flex: 0 0 auto;
+  overflow: hidden;
+  border: 1px solid var(--theme-preview-border);
+  border-radius: 6px;
+  background: var(--theme-preview-bg);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+.theme-option-swatch-surface {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  width: 14px;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--theme-preview-surface);
+}
+
+.theme-option-swatch-accent {
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  width: 10px;
+  height: 4px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--theme-preview-accent) 0%, var(--theme-preview-accent-alt) 100%);
+}
+
+.theme-option-label {
+  display: inline-flex;
+  align-items: center;
+}
+
+.divider-container {
+  width: calc(65%);
+  margin: -10px calc(16%);
+}
+
+:deep(.right-aligned-wrapper) {
+  text-align: right;
+  color: #ffffff;
+}
+
+.checkbox-md :deep(.ant-checkbox-inner) {
+  width: 20px;
+  height: 20px;
+}
+
+.background-setting {
+  display: flex;
+  align-items: center;
+}
+
+/* Unified Background Grid */
+.unified-bg-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 123.2px);
+  gap: 8px;
+  margin-bottom: 16px;
+  padding: 2px; /* Prevent hover scale clipping */
+  justify-content: flex-end;
+}
+
+/* Common Grid Item Styles */
+.bg-grid-item {
+  width: 123.2px;
+  height: 69.3px;
+  border-radius: 8px;
+  overflow: hidden;
+  cursor: pointer;
+  border: 2px solid transparent;
+  transition: all 0.2s;
+  position: relative;
+}
+
+.bg-grid-item:hover {
+  transform: scale(1.05);
+  z-index: 1;
+}
+
+.bg-grid-item.active {
+  border-color: var(--primary-color, #1890ff);
+}
+
+.bg-grid-item img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* Upload Placeholder (Custom Item Empty State) */
+.upload-placeholder {
+  width: 100%;
+  height: 100%;
+  border: 2px dashed var(--text-color-tertiary);
+  border-radius: 6px;
+  background: var(--bg-color-tertiary);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-color);
+  opacity: 0.9;
+  transition: all 0.2s;
+}
+
+.bg-grid-item:hover .upload-placeholder {
+  border-color: var(--primary-color, #1890ff);
+  background: rgba(24, 144, 255, 0.1);
+  opacity: 1;
+  color: var(--primary-color, #1890ff);
+}
+
+/* Delete Button for Custom Image */
+.delete-btn {
+  position: absolute;
+  top: 0;
+  right: 0;
+  padding: 4px;
+  color: white;
+  background: rgba(0, 0, 0, 0.5);
+  border-radius: 0 0 0 4px;
+  line-height: 1;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.bg-grid-item:hover .delete-btn {
+  opacity: 1;
+}
+
+.delete-btn:hover {
+  background: rgba(255, 0, 0, 0.7);
+}
+
+/* Sliders Section */
+.bg-sliders-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.slider-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.slider-label {
+  font-size: 12px;
+  color: var(--text-color);
+  width: 60px;
+  flex-shrink: 0;
+}
+
+.slider-item .ant-slider {
+  flex: 1;
+}
+
+.mt-2 {
+  margin-top: 8px;
+}
+
+/* Default Background Item */
+.default-bg-placeholder {
+  width: 100%;
+  height: 100%;
+  border: 2px dashed rgba(255, 255, 255, 0.3);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.05);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-color);
+  opacity: 0.9;
+  transition: all 0.2s;
+}
+
+.default-bg-item:hover .default-bg-placeholder {
+  border-color: var(--primary-color, #1890ff);
+  background: rgba(24, 144, 255, 0.1);
+  opacity: 1;
+  color: var(--primary-color, #1890ff);
+}
+
+.default-bg-item.active .default-bg-placeholder {
+  border-color: transparent;
+  color: var(--primary-color, #1890ff);
+}
+
+/* Custom Upload Section */
+.custom-upload-section {
+  margin-top: 12px;
+}
+
+.custom-upload-label {
+  font-size: 12px;
+  color: var(--text-color);
+  opacity: 0.7;
+  margin-bottom: 8px;
+  display: block;
+  text-align: right;
+}
+
+.custom-upload-grid {
+  display: flex;
+  gap: 8px;
+  padding: 2px;
+  justify-content: flex-end;
+}
+
+.custom-upload-grid .bg-grid-item {
+  width: 123.2px;
+  height: 69.3px;
+  flex-shrink: 0;
+}
+
+.editor-settings-section {
+  margin-top: 35px;
+}
+</style>

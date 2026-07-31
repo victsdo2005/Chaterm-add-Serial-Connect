@@ -1,0 +1,558 @@
+{
+  "releaseNotesUrl": "https://github.com/chaterm/Chaterm/releases/tag/v",
+  "versions": [
+    {
+      "version": "0.12.2",
+      "date": "2026-07-23",
+      "highlights": {
+        "zh-CN": [
+          "连接体验优化：支持取消连接，并增强 MFA 与堡垒机复用处理",
+          "终端交互增强：分屏/克隆标签页支持保留来源标记，优化宏录制体验",
+          "稳定性修复：修复代理 URL 与 SOCKS4/SOCKS5 协议处理问题"
+        ],
+        "en-US": [
+          "Connection experience improved: added connection cancellation support and enhanced MFA and bastion reuse handling",
+          "Terminal interaction enhancements: split and cloned tabs now preserve source tags, with improved macro recording",
+          "Stability fixes: resolved proxy URL and SOCKS4/SOCKS5 handling issues"
+        ]
+      }
+    },
+    {
+      "version": "0.12.1",
+      "date": "2026-07-03",
+      "highlights": {
+        "zh-CN": [
+          "窗口与 Alias 能力增强：支持多窗口控制，并新增别名命令导入导出",
+          "堡垒机连接优化：增强 JumpServer 中文选择与提示解析",
+          "文件体验修复：修复 SFTP 目录、时间戳、编辑器布局和 macOS 文件显示问题",
+          "登录与审计增强：修复最近连接记录，并加强执行历史保留与 SSO 账号限制"
+        ],
+        "en-US": [
+          "Improved window and alias management with multi-window controls and alias import/export",
+          "Better JumpServer compatibility for Chinese selection and prompt parsing",
+          "Fixed SFTP directory, timestamp, editor layout, and macOS file rendering issues",
+          "Enhanced audit and login safety with more accurate recent connections, preserved execution history, and stricter SSO account rules"
+        ]
+      }
+    },    {
+      "version": "0.12.0",
+      "date": "2026-06-11",
+      "highlights": {
+        "zh-CN": [
+          "AI 能力增强：支持开通会员获取更高大模型额度，并新增模型预热调度，优化模型信息获取",
+          "AI 对话体验优化：终端输出会在聊天会话准备就绪后再写入，并增强 Markdown 呈现与消息处理",
+          "终端与 SSH 能力升级：集成 Fig 自动补全，终端类型升级为 `xterm-256color`，并支持本地 Shell 启动模式与环境配置",
+          "连接与凭据管理优化：新增密码复制与密码凭据管理，并增强 SSH 连接处理",
+          "标签页交互修复：修复打开多个终端标签时，触摸板左右滑动无法滚动标签列表的问题"
+        ],
+        "en-US": [
+          "Enhanced AI capabilities: added membership support for higher LLM quotas and model warm-up scheduling to improve model info retrieval",
+          "Improved AI conversation flow: terminal output is now written only after the chat session is ready, with enhanced Markdown rendering and message handling",
+          "Upgraded terminal and SSH capabilities: integrated Fig autocomplete, updated the terminal type to `xterm-256color`, and added local shell startup modes and environment configuration",
+          "Improved connection and credential management: added password copy and password credential management, and enhanced SSH connection handling",
+          "Fixed tab interaction: resolved an issue where horizontal touchpad swipes could not scroll the tab list when multiple terminal tabs were open"
+        ]
+      }
+    },
+    {
+      "version": "0.11.3",
+      "date": "2026-05-28",
+      "highlights": {
+        "zh-CN": [
+          "设置页左侧导航新增对应图标，信息层级更清晰",
+          "亮色主题视觉优化：统一设置页相关按钮背景样式，并提升主机管理与密钥管理空状态图标可见性",
+          "Header 的 Agents 与 Terminal 布局切换改为图标按钮，界面更简洁",
+          "左侧栏名称补齐英文国际化显示，跨语言界面一致性更好",
+          "桌面端应用图标更新，适配 Dock/Launchpad 的视觉风格",
+          "终端设置增强：光标样式改为图标选择，并新增光标闪烁开关与行高输入选项"
+        ],
+        "en-US": [
+          "Added corresponding icons to the left navigation in Settings for clearer information hierarchy",
+          "Light theme visual polish: unified button background styles in Settings and improved empty-state icon visibility in Host Management and Key Management",
+          "Changed the Header layout switches for Agents and Terminal to icon buttons for a cleaner interface",
+          "Completed English i18n for left sidebar names to improve cross-language UI consistency",
+          "Updated desktop app icons to better match Dock and Launchpad visual style",
+          "Enhanced terminal settings: cursor style now uses icon-based selection, with new cursor blink toggle and line-height input options"
+        ]
+      }
+    },
+    {
+      "version": "0.11.2",
+      "date": "2026-05-26",
+      "highlights": {
+        "zh-CN": [
+          "新增交互式新手引导系统",
+          "连接能力扩展：新增 SSH 跳板机支持，并增强 Kubernetes 集群管理流程，复杂网络环境下连接更顺畅",
+          "数据库能力增强：本地工作区新增 SQLite 与 Oracle 支持，并统一 DB-AI 方言校验与图标展示，数据库使用体验更一致",
+          "文件与分组体验优化：新增复制文件绝对路径功能，并完善多语言分组选择与新建分组提示，常见操作更高效",
+          "MCP和快捷键设置UI显示优化"
+        ],
+        "en-US": [
+          "Added an interactive onboarding guide system",
+          "Connection capabilities expanded: added SSH jump host support and improved Kubernetes cluster management workflows for smoother connectivity in complex network environments",
+          "Database support enhanced: added SQLite and Oracle support for local workspaces, and unified DB-AI dialect validation and icon presentation for a more consistent database experience",
+          "File and grouping UX improved: added copy-absolute-path support for files and refined multilingual prompts for group selection and group creation to streamline common actions",
+          "MCP and shortcut settings UI display optimization"
+        ]
+      }
+    },
+    {
+      "version": "0.11.1",
+      "date": "2026-05-19",
+      "highlights": {
+        "zh-CN": [
+          "工作区交互升级：新增节点右键上下文菜单，并优化树节点悬停、选中态与布局对齐，主机管理操作更直观",
+          "用户信息体验增强：用户菜单新增头像与会员状态展示，账户状态查看更清晰",
+          "终端与数据库流程优化：支持终端全选快捷键并保留选择状态，改进终端自动滚动与 AI SQL 报错诊断提示，同时修复组织资产 ID 变更后最近连接可能认证失败的问题"
+        ],
+        "en-US": [
+          "Workspace interaction upgrades: added right-click context menus for nodes and improved tree node hover, selection states, and layout alignment for more intuitive host management",
+          "User info UX enhancements: the user menu now shows avatar and VIP status to view account status more clearly",
+          "Terminal and database workflow improvements: added terminal select-all shortcuts with preserved selection state, refined terminal auto-scroll and AI SQL error diagnosis feedback, and fixed recent connection authentication failures after organization asset ID changes"
+        ]
+      }
+    },
+    {
+      "version": "0.11.0",
+      "date": "2026-05-11",
+      "highlights": {
+        "zh-CN": [
+          "数据库 AI 助手：支持自然语言转 SQL、SQL 解释与优化、SQL 转换与补全等能力，提升数据库问答与分析效率",
+          "数据库工具能力增强：新增 schema/表结构探查、查询执行、索引建议与数据采样，覆盖从诊断到优化的常见流程",
+          "数据库工作区体验升级：引入工作区感知任务与历史过滤、数据库查询结果可视化（含分页），并补齐多语言界面支持"
+        ],
+        "en-US": [
+          "Database AI assistant: added capabilities for natural language to SQL, SQL explanation and optimization, SQL conversion, and completion to improve database analysis workflows",
+          "Database tooling is expanded: added schema/table inspection, query execution, index suggestions, and row sampling to cover common diagnostics-to-optimization scenarios",
+          "Database workspace UX is upgraded: introduced workspace-aware task and history filtering, query result visualization with pagination, and multilingual UI coverage"
+        ]
+      }
+    },
+    {
+      "version": "0.10.4",
+      "date": "2026-05-09",
+      "highlights": {
+        "zh-CN": [
+          "自定义背景图：优化本地资源转换与加载流程，提升自定义背景显示稳定性",
+          "界面适配：优化文件区、工作区与扩展视图中的主机名文本响应式布局，长名称场景下显示更稳",
+          "发布安全与完整性：增强发布流程中的签名与校验产物处理，新增 SLSA 签名结果校验，降低发布链路异常风险"
+        ],
+        "en-US": [
+          "Custom backgrounds: improved local resource conversion and loading flow for more reliable custom background rendering",
+          "UI adaptation: refined responsive hostname text layout in Files, Workspace, and Extension views for more stable display with long names",
+          "Release security and integrity: strengthened signature/checksum artifact handling in the release workflow and added SLSA signing result verification to reduce release pipeline risks"
+        ]
+      }
+    },
+    {
+      "version": "0.10.3",
+      "date": "2026-05-08",
+      "highlights": {
+        "zh-CN": [
+          "资产管理：新增主机导出选择弹窗，支持按连接类型与分组筛选导出范围，批量导出更灵活",
+          "数据库工作区：新增数据库资产与分组能力，支持筛选、排序与索引优化，管理大规模连接更高效",
+          "PostgreSQL 增强：SQL 编辑器支持 Schema 选择，并补充 Schema 相关主键识别与测试覆盖",
+          "数据库操作体验：新增连接右键菜单、表级上下文操作、编辑连接与快速建库入口，并增强 DDL 查看与 SQL 结果标签操作",
+          "AI 对话：优化流式回复中内联审批按钮的自动滚动可见性，减少操作被遮挡",
+          "界面与文件管理：新增官方主题适配；文件浏览器支持显示/隐藏隐藏文件",
+          "稳定性修复：修复终端命令结果转发可靠性问题、代理凭据 URL 编码问题，并将换行包裹命令默认排除出 shell 历史"
+        ],
+        "en-US": [
+          "Asset management: added a host export selection modal with filters by connection type and group for more flexible batch export",
+          "Database workspace: added database assets and group management, with filtering, ordering, and indexing improvements for large-scale connection management",
+          "PostgreSQL improvements: schema selection is now supported in the SQL editor, with improved schema-aware primary key detection and test coverage",
+          "Database operations UX: added connection context menus, table-level context actions, edit-connection support, and a faster create-database entry, plus improved DDL viewing and SQL result tab actions",
+          "AI conversation: improved auto-scroll visibility for inline approval actions during streaming responses to reduce hidden actions",
+          "UI and file explorer: introduced official theme adaptation and support for showing/hiding hidden files in the explorer",
+          "Stability fixes: improved terminal command result forwarding reliability, fixed proxy credential URL encoding, and excluded wrapped commands from shell history by default"
+        ]
+      }
+    },
+    {
+      "version": "0.10.2",
+      "date": "2026-04-28",
+      "highlights": {
+        "zh-CN": [
+          "内置模型：Chaterm CN 版新增内置 DeepSeek V4 模型支持",
+          "AI 与模型：优化模型插件与选择体验；支持插件输入模型；可在后台自动拉取并刷新默认模型信息；增强 OpenAI 兼容（含 Azure 端点识别）",
+          "对话体验：新增“历史消息加载中”提示，并支持按页加载更早消息；上下文截断提示更清楚，减少对话中断时的困惑; 支持对AI对话内容搜索",
+          "连接管理：新增最近连接记录；远程终端可识别并处理陈旧连接；分屏/克隆标签时会保留来源标记，排查上下文更直观",
+          "主机与资产检索：搜索支持主机名等更多维度；优化组织资产搜索与堡垒机父级标题展示，跨层级查找更快",
+          "知识库与内容处理：知识库搜索与结果展示更贴近语义；网页内容提取会过滤导航等非正文区域，粘贴到 AI 对话更干净可读",
+          "阅读与操作细节：Markdown 渲染区支持文本选择复制，查看长内容时摘录更方便"
+        ],
+        "en-US": [
+          "Built-in model: Chaterm CN version adds built-in DeepSeek V4 model support",
+          "AI and models: improved model plugin and model selection experience; support for plugin input models; background refresh of default model info; better OpenAI compatibility including Azure endpoint detection",
+          "Conversation flow: added a clear 'loading history' hint and paginated loading for older messages; clearer context truncation notices reduce confusion when long chats are trimmed; support searching for AI conversation content",
+          "Connection management: recent connections are now recorded; remote terminals can detect and handle stale connections; split/clone panels keep source tags so context is easier to track",
+          "Host and asset search: search now covers more fields such as hostnames; improved organization asset search and bastion parent-title display for faster cross-level lookup",
+          "Knowledge base and content handling: knowledge search and result rendering are more semantic; web content extraction removes navigation and other non-content blocks before sending to AI",
+          "Reading and interaction polish: text selection and copy are now supported in the markdown renderer, making long-output excerpts easier"
+        ]
+      }
+    },
+    {
+      "version": "0.10.1",
+      "date": "2026-04-13",
+      "highlights": {
+        "zh-CN": [
+          "知识库：支持按内容搜索笔记；从外部拖文件进知识库更稳定",
+          "AI：可把网页链接交给助手阅读；长文件会先整理摘要再进对话，更省上下文；修复部分新款模型连不上或检测失败的问题",
+          "SSH：支持端口隧道转发；复用连接、唤醒已有标签等选项让反复登录更少折腾",
+          "终端：长日志滚动时显示更稳、不易乱行；断线后自动回到终端输入区；可选显示关闭按钮，鼠标中键可关闭当前标签",
+          "主机列表：堡垒机主机分组更清晰，列表打开更快、布局更好认"
+        ],
+        "en-US": [
+          "Knowledge base: search your notes by meaning; dragging files in from outside is more reliable",
+          "AI: share a web link and the assistant can read it; long files are summarized so they use less context; fixes model connection checks for some newer models",
+          "SSH: port tunnel forwarding; options to reuse connections and wake an existing tab mean fewer repeated logins",
+          "Terminal: steadier display when scrolling long logs; after a disconnect, focus returns to the terminal; optional tab close button and middle-click to close the current tab",
+          "Host list: clearer grouping for bastion hosts, faster loading, and easier-to-scan layout"
+        ]
+      }
+    },
+    {
+      "version": "0.10.0",
+      "date": "2026-03-31",
+      "highlights": {
+        "zh-CN": [
+          "Kubernetes：新增 Kubernetes 插件，并适配 AI 对话的 Command/Agent 模式",
+          "SSH：新增断线后的自动重连；实现唤醒连接处理与命令执行",
+          "AI：新增 GLM 兼容消息格式转换；修复 AI 设置中“Enable Thinking”按钮显示/可用性问题",
+          "Skill：支持将 Skill 以 ZIP 形式导出进行分享",
+          "终端与命令执行：平台改用登录 Shell 获取用户配置；优化 autoExecuteCode 自动切换终端的执行逻辑",
+          "本地连接：支持本地连接的（Ctrl/Command + K）快捷键弹出的对话框进行AI对话",
+          "文件管理：修复断线后文件管理导致无法重新连接的问题",
+          "任务管理：更新任务标题时同步写入 updated_at 时间戳"
+        ],
+        "en-US": [
+          "Kubernetes: add Kubernetes plugin; adapt the AI dialog Command/Agent modes and improve K8s terminal background theme handling",
+          "SSH: add automatic reconnection after disconnects; implement wakeup connection handling with command execution",
+          "AI: add GLM-compatible message format conversion; fix the \"Enable Thinking\" button in AI settings",
+          "Skill: support exporting Skill as a ZIP for sharing",
+          "Terminal & command execution: use login shells on Unix-like platforms to load user configuration; improve autoExecuteCode switching logic for terminal execution",
+          "Local connection: support AI dialog in the dialog opened by the shortcut key (Ctrl/Command + K) for local connection",
+          "File management: fix the inability to reconnect after file management when disconnected",
+          "Task management: update the updated_at timestamp when the task title changes"
+        ]
+      }
+    },
+    {
+      "version": "0.9.4",
+      "date": "2026-03-24",
+      "highlights": {
+        "zh-CN": [
+          "技能（Skill）：对话中会显示当前用到的Skill；支持把一段对话一键整理成Skill；启用Skill时会有提示；管理、编辑Skill内容更简单",
+          "知识库与同步：笔记可同步到云端并查看剩余空间；打开应用后会自动拉取最新内容；用户配置支持跨设备同步",
+          "资产管理：优化添加主机的布局样式",
+          "界面与体验：首次打开默认使用深色主题；填写主机地址与端口时排版更整齐"
+        ],
+        "en-US": [
+          "Skill: see which Skill apply to the current chat; turn a conversation into a Skill with one click; get a notice when a Skill is turned on; simpler management and editing of Skill content",
+          "Knowledge base and sync: sync notes to the cloud and see how much space is left; the app pulls the latest content when you open it; user configuration supports cross-device synchronization",
+          "Asset management: optimize the layout style of adding hosts",
+          "Look and feel: dark theme by default; tidier layout for host and port fields"
+        ]
+      }
+    },
+    {
+      "version": "0.9.3",
+      "date": "2026-03-12",
+      "highlights": {
+        "zh-CN": [
+          "多语言：新增阿拉伯语本地化支持",
+          "Agent：新增 read_file 工具与大体积工具输出落盘策略，规范 tool_result JSON 解析，提升复杂任务稳定性",
+          "AI 对话：支持仅输入 / 触发命令弹窗，降低命令触发门槛",
+          "Skills：修复无法读取本地 Skills 目录下 references、scripts 子目录的问题",
+          "文件管理：重构文件夹上传/下载/传输流程，统一父子任务与进度展示，修复标签切换导致已选文件丢失的问题",
+          "性能与体验：优化终端数据处理与交互稳定性，修复浅色主题切换背景时的终端显示异常"
+        ],
+        "en-US": [
+          "Localization: add Arabic localization support",
+          "Agent: add read_file tool and large tool-output offloading, normalize tool_result JSON handling to improve stability for complex tasks",
+          "AI conversation: support triggering the command popup by typing a standalone /, lowering the friction of command usage",
+          "Skills: fix the issue where the references and scripts subdirectories under the local Skills directory were not read correctly",
+          "File management: refactor folder upload/download/transfer flow, unify parent/child task and progress display, fix selected files being lost when switching tabs",
+          "Performance and UX: optimize terminal data handling and interaction stability, fix terminal display issues when switching backgrounds in the light theme"
+        ]
+      }
+    },
+    {
+      "version": "0.9.2",
+      "date": "2026-03-03",
+      "highlights": {
+        "zh-CN": [
+          "AI 与 Agent：删除 Chat 模式、Agent 模式支持空主机和批量的主机",
+          "命令补全：新增AI驱动的命令建议、支持长命令水平滚动不换行",
+          "终端：支持 Ctrl + 点击 快捷下载文件",
+          "知识库：Markdown 预览支持复制、下拉 transition 动画优化",
+          "界面与背景：优化自定义背景显示效果",
+          "文件管理：交互与拖拽优化、下拉选活跃 SFTP/拖拽新增、直接创建 SFTP",
+          "连接与其它：优化Jumpserver认证逻辑，支持仅密码连接"
+        ],
+        "en-US": [
+          "AI and Agent: remove Chat mode, Agent mode supports empty host and batch hosts",
+          "Command completion: add AI-driven command suggestions, support long command horizontal scroll no wrap",
+          "Terminal: support Ctrl+click to download files",
+          "Knowledge center: markdown preview supports copy, dropdown transition animation optimization",
+          "UI and background: optimize custom background display effect",
+          "File management: interaction and drag mode, dropdown active SFTP/drag to add",
+          "Connection and other: optimize Jumpserver authentication logic, support password connection only"
+        ]
+      }
+    },
+    {
+      "version": "0.9.1",
+      "date": "2026-02-11",
+      "highlights": {
+        "zh-CN": [
+          "知识中心：Mermaid 渲染、Markdown 引导、重命名与标签同步修复",
+          "编辑器：统一配置管理、Monaco 行号与边距优化",
+          "文件管理：传输进度展示重构与测试修复",
+          "终端：Ctrl+R 防误触保留反向搜索、发送优先中断、输出渲染改进",
+          "标签与上下文：标签关闭逻辑优化、缓存对话数据修复",
+          "界面：背景图显示优化、水印展示逻辑调整"
+        ],
+        "en-US": [
+          "Knowledge center: Mermaid rendering, markdown guide, rename and tab sync fixes",
+          "Editor: unified config, Monaco line numbers and margin tweaks",
+          "File management: transfer progress refactor and test fixes",
+          "Terminal: Ctrl+R no accidental reload, send prioritizes interrupt, output rendering",
+          "Tabs and context: tab closure logic, cached chat data fix",
+          "UI: background image display optimization, watermark display logic adjustment"
+        ]
+      }
+    },
+    {
+      "version": "0.9.0",
+      "date": "2026-02-06",
+      "highlights": {
+        "zh-CN": [
+          "新增知识库：支持图片与剪贴板粘贴、缩放与可配置字体、本地文件管理与拖拽、对话总结到知识库",
+          "工作区与快捷命令：工作区 IP/主机名显示切换、默认布局记忆、支持快捷命令拖拽排序与移动",
+          "终端与 AiTab：支持交互式命令执行，AiTab 动态背景与 Monaco 自定义背景，修复分屏误插入等问题",
+          "文件管理：文件管理与 SFTP 增强，修复插件拖拽与根目录等问题",
+          "体验优化：登录欢迎语与模型选项刷新、禁用误触刷新快捷键、macOS 全屏黑屏修复、依赖与 Electron 升级"
+        ],
+        "en-US": [
+          "Knowledge base: image and clipboard paste, zoom and configurable fonts, local file management and drag-and-drop, summarize conversations to knowledge base",
+          "Workspace and shortcut commands: Show IP/Hostname toggle in workspace, default layout memory, shortcut commands drag reorder and move",
+          "Terminal and AiTab: interactive command execution, AiTab dynamic background and Monaco custom background, fix split-tab accidental insertion and related issues",
+          "File management: file management and SFTP enhancements, fix plugin drag-and-drop and root directory issues",
+          "UX improvements: login welcome message and model options refresh, disable accidental reload shortcut, macOS fullscreen black screen fix, dependency and Electron upgrades"
+        ]
+      }
+    },
+    {
+      "version": "0.8.3",
+      "date": "2026-01-29",
+      "highlights": {
+        "zh-CN": [
+          "新增任务管理 Focus Chain Service 和增强 Todo 功能，支持上下文跟踪、自动转换、日期字段和进度指示器",
+          "新增图片上传和可信设备管理功能",
+          "支持会话级别的只读命令自动批准和执行",
+          "本地 Windows 终端支持 AI 对话功能",
+          "新增订阅功能插件",
+          "AI Tab 增强：支持快速选择已打开主机、标签页上下文菜单、拖放上下文项，知识中心新增文档添加到聊天功能",
+          "支持在上下文中使用 @docs/chats 引用，插件按用户隔离提升安全性",
+          "增强 Linux 终端提示匹配，支持环境前缀和 shell 版本提示",
+          "优化主题样式和 UI 一致性，修复 Windows 系统快捷键和 SSH 类型兼容性问题"
+        ],
+        "en-US": [
+          "Add Focus Chain Service for task management and enhance Todo functionality with context tracking, auto-transition, date fields, and progress indicators",
+          "Add image upload and trusted device management features",
+          "Support session-level auto-approval and execution for read-only commands",
+          "Local Windows terminals support AI conversation",
+          "Add Subscribe feature plugin",
+          "AI Tab enhancements: quick selection for opened hosts, tab context menu, drag-and-drop context items, and knowledge center 'Add to Chat' feature",
+          "Support @docs/chats references in context and isolate plugins per user for improved security",
+          "Enhance Linux terminal prompt matching with environment prefixes and shell version prompts",
+          "Optimize theme styles and UI consistency, fix Windows system shortcuts and SSH type compatibility issues"
+        ]
+      }
+    },
+    {
+      "version": "0.8.2",
+      "date": "2026-01-20",
+      "highlights": {
+        "zh-CN": [
+          "新增AWS EC2实例连接插件支持",
+          "新增堡垒机（Qizhi、UCloud）插件支持",
+          "新增个人知识库模块",
+          "支持Agent Skills",
+          "支持修改用户头像功能",
+          "国际版支持Apple ID登陆",
+          "新增多语言支持：德语、法语、意大利语、葡萄牙语、俄语、繁体中文",
+          "修复若干问题，提升用户体验"
+        ],
+        "en-US": [
+          "Add AWS EC2 instance connection plugin support",
+          "Add Bastion Host (Qizhi, UCloud) plugin support",
+          "Add personal knowledge base module",
+          "Support Agent Skills",
+          "Support modifying user avatars",
+          "International edition supports Apple ID login",
+          "Add multiple new languages: German, French, Italian, Portuguese, Russian, and Traditional Chinese",
+          "Fix several issues and improve user experience"
+        ]
+      }
+    },
+    {
+      "version": "0.8.1",
+      "date": "2026-01-12",
+      "highlights": {
+        "zh-CN": [
+          "统一左侧栏点击的操作风格",
+          "支持交换机网络设备连接",
+          "数据同步设置默认启用状态",
+          "优化主机管理页面和密钥管理页面",
+          "SSH连接新增ProxyCommand参数支持",
+          "新增通用插件显示和编辑页面功能",
+          "优化主题和AiTab样式",
+          "优化若干问题，提升操作体验"
+        ],
+        "en-US": [
+          "Unify the operation style of the left sidebar click",
+          "Support switch network device connections",
+          "Set dataSync enabled by default status",
+          "Optimize host management page and key management page",
+          "Add ProxyCommand parameter support for SSH connections",
+          "Add generic plugin display and editing page functionality",
+          "Optimize theme and AiTab styles",
+          "Optimize several issues and enhance the operational experience"
+        ]
+      }
+    },
+    {
+      "version": "0.8.0",
+      "date": "2026-01-07",
+      "highlights": {
+        "zh-CN": [
+          "区分中国版(chaterm.cn)/全球版(chaterm.ai)",
+          "中国版新增手机号验证码登录功能",
+          "新增关键词高亮功能",
+          "新增AiTab编辑模式功能",
+          "支持使用当前聊天输入创建新标签页",
+          "新增日语和韩语国际化支持",
+          "堡垒机连接提示多语言支持",
+          "AI Tab新增欢迎提示功能",
+          "优化模型配置加载状态显示",
+          "命令片段支持宏录制功能",
+          "内联命令生成支持模型选择",
+          "SFTP上传下载功能重构和优化"
+        ],
+        "en-US": [
+          "Support Chinese edition(chaterm.cn)/Global edition(chaterm.ai)",
+          "Add mobile phone verification code login for Chinese edition",
+          "Add keyword highlighting feature",
+          "Add AiTab edit mode feature",
+          "Support creating new tab using current chat input",
+          "Add Japanese and Korean internationalization support",
+          "Bastion connection prompt multi-language support",
+          "Add welcome tips for AI tab",
+          "Optimize model configuration loading state display",
+          "Command snippet supports macro recording",
+          "Provide model selection in inline command generation",
+          "SFTP upload download refactoring and optimization"
+        ]
+      }
+    },
+    {
+      "version": "0.7.3",
+      "date": "2025-12-24",
+      "highlights": {
+        "zh-CN": [
+          "支持用户跳过登陆配置模型使用AI能力",
+          "终端中rz/sz命令支持",
+          "支持Shift+Tab快捷键切换AI对话模式",
+          "新增Maple Mono字体支持",
+          "命令输出结果OUTPUT区域新增主机IP显示标记",
+          "修复Vim可视化编辑器显示不全问题",
+          "优化AiTab页面缩放和多Tab切换体验",
+          "自定义背景内容国际化支持",
+          "优化若干问题，提升应用稳定性"
+        ],
+        "en-US": [
+          "Support user skip login to configure model to use AI ability",
+          "Support rz/sz commands in terminal",
+          "Support Shift+Tab shortcut key to switch AI conversation mode",
+          "Add Maple Mono font support",
+          "Add host IP display mark in the OUTPUT area of the command output results",
+          "Fix the problem of Vim visual editor display not fully problem",
+          "Optimize the AiTab page zoom and multi-Tab switching experience",
+          "Custom background content internationalization support",
+          "Optimize some issues and improve the application stability"
+        ]
+      }
+    },
+    {
+      "version": "0.7.2",
+      "date": "2025-12-18",
+      "highlights": {
+        "zh-CN": [
+          "修复上传自定义的背景图片失败问题",
+          "堡垒机资产列表获取不全问题修复",
+          "AI对话多tab保存和显示对应的对话模式和AI模型",
+          "降低终端输入延迟",
+          "支持Command+Shift+P快捷键进行主机搜索",
+          "优化本地连接分屏功能"
+        ],
+        "en-US": [
+          "Fix the problem of uploading custom background images failed",
+          "Fix the problem of getting all the assets in the jump server list",
+          "AI conversation multi-tab save and display the corresponding conversation mode and AI model",
+          "Reduce the terminal input delay",
+          "Support Command+Shift+P shortcut key to search for hosts",
+          "Optimize the localhost split-screen feature"
+        ]
+      }
+    },
+    {
+      "version": "0.7.1",
+      "date": "2025-12-02",
+      "highlights": {
+        "zh-CN": [
+          "支持自定义的背景图片和系统默认背景",
+          "重构终端分屏功能",
+          "重构快捷命令功能",
+          "新增版本功能更新提示",
+          "设置中新增终端触摸板缩放功能",
+          "支持对AI对话的中断操作",
+          "支持对AI对话的任务内容导出分享",
+          "支持XShell，SecureCRT导出的文件数据导入",
+          "Terminal和Agents布局切换相关功能优化",
+          "优化若干问题，提升应用稳定性"
+        ],
+        "en-US": [
+          "Support custom background images and system default background",
+          "Refactor the split-screen feature",
+          "Refactor the shortcut command feature",
+          "Add a new version update reminder feature",
+          "Add a new terminal touchpad zoom feature in the settings",
+          "Support interrupt the AI conversation",
+          "Support export the AI conversation task content and share",
+          "Support XShell, SecureCRT exported file data import",
+          "Optimize the Terminal and Agents layout switching related features",
+          "Optimize some issues and improve the application stability"
+        ]
+      }
+    },
+    {
+      "version": "0.6.2",
+      "date": "2025-11-13",
+      "highlights": {
+        "zh-CN": ["加强AI模型的选择和测试中的调试过程", "在选项卡菜单中增加了内部分屏显示的选项"],
+        "en-US": ["Enhance AI model selection and debugging process in tests", "Added the option for inner split-screen display within the tab menu"]
+      }
+    },
+    {
+      "version": "0.6.1",
+      "date": "2025-06-08",
+      "highlights": {
+        "zh-CN": ["支持jms令牌", "添加了SSH连接身份"],
+        "en-US": ["Support jms token", "Added SSH connection identity"]
+      }
+    }
+  ]
+}

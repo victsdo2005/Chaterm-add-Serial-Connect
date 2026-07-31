@@ -1,0 +1,152 @@
+// Performance marks (must be first import to capture earliest timestamp)
+import { mark, logRendererTimeline, setupPerfIpcListener, reportMarksToMainAsync } from './utils/perf'
+// 'chaterm/renderer/start' is recorded at module load time
+
+import './assets/main.css'
+import './assets/theme.less'
+import { createApp } from 'vue'
+import App from './App.vue'
+import router from './router'
+import { createPinia } from 'pinia'
+import i18n from './locales'
+import contextmenu from 'v-contextmenu'
+import 'v-contextmenu/dist/themes/default.css'
+import 'ant-design-vue/dist/reset.css'
+import piniaPluginPersistedstate from 'pinia-plugin-persistedstate'
+import { notification } from 'ant-design-vue'
+import { shortcutService } from './services/shortcutService'
+import { getDefaultBrandingConfig, loadBrandingConfig } from './utils/branding'
+import { createRendererLogger } from './utils/logger'
+import { useEditorConfigStore } from './store/editorConfig'
+
+try {
+  const paintObserver = new PerformanceObserver((list, observer) => {
+    for (const entry of list.getEntries()) {
+      if (entry.name === 'first-contentful-paint') {
+        mark('chaterm/renderer/paint/firstContentfulPaint')
+        observer.disconnect()
+        break
+      }
+    }
+  })
+  paintObserver.observe({ type: 'paint', buffered: true })
+} catch {
+  // Paint timing is not available in every Electron/runtime mode.
+}
+
+const defaultBrandingConfig = getDefaultBrandingConfig()
+document.title = defaultBrandingConfig.displayName
+void loadBrandingConfig().then((brandingConfig) => {
+  document.title = brandingConfig.displayName
+})
+
+// Set global notification top position
+notification.config({
+  top: '30px'
+})
+// Import storage functions
+import * as storageState from './agent/storage/state'
+// Import IndexedDB migration listener
+import { setupIndexDBMigrationListener } from './services/indexdb-migration-listener'
+
+// Initialize IndexedDB migration listener
+mark('chaterm/renderer/willSetupIndexedDbMigrationListener')
+setupIndexDBMigrationListener()
+mark('chaterm/renderer/didSetupIndexedDbMigrationListener')
+
+mark('chaterm/renderer/willCreateApp')
+const pinia = createPinia()
+pinia.use(piniaPluginPersistedstate)
+const app = createApp(App)
+// Router
+app.use(router)
+// Internationalization
+app.use(i18n)
+// State management
+app.use(pinia)
+// Context menu
+app.use(contextmenu)
+mark('chaterm/renderer/didCreateApp')
+
+// Vue warning handler - route Vue warnings to unified logger
+const vueLogger = createRendererLogger('vue')
+app.config.warnHandler = (msg, _instance, trace) => {
+  vueLogger.warn(msg, { trace })
+}
+
+// Expose storage API to global window object for main process calls
+declare global {
+  interface Window {
+    storageAPI: typeof storageState
+  }
+}
+
+window.storageAPI = storageState
+
+// Initialize editor config store early
+const initializeEditorConfig = async () => {
+  try {
+    mark('chaterm/renderer/willInitEditorConfig')
+    const editorConfigStore = useEditorConfigStore()
+    await editorConfigStore.loadConfig()
+    mark('chaterm/renderer/didInitEditorConfig')
+  } catch (error) {
+    mark('chaterm/renderer/didFailInitEditorConfig')
+    vueLogger.error('Failed to initialize editor config:', { error })
+  }
+}
+
+mark('chaterm/renderer/willMountApp')
+app.mount('#app')
+mark('chaterm/renderer/didMountApp')
+
+// Initialize editor config after app is mounted
+initializeEditorConfig()
+
+if (import.meta.hot) {
+  import.meta.hot.on('vite:afterUpdate', () => {
+    shortcutService.init()
+  })
+}
+
+import { userConfigStore } from '@/services/userConfigStoreService'
+
+// Register IPC handlers when renderer process starts
+function setupIPCHandlers() {
+  mark('chaterm/renderer/willSetupIpcHandlers')
+  const electronAPI = (window as any).electron
+
+  if (!electronAPI?.ipcRenderer) {
+    mark('chaterm/renderer/didSkipIpcHandlers')
+    return
+  }
+  const { ipcRenderer } = electronAPI
+
+  ipcRenderer.on('userConfig:get', async () => {
+    try {
+      const config = await userConfigStore.getConfig()
+      ipcRenderer.send('userConfig:get-response', config)
+    } catch (error) {
+      const e = error as Error
+      ipcRenderer.send('userConfig:get-error', e.message)
+    }
+  })
+  mark('chaterm/renderer/didSetupIpcHandlers')
+}
+
+setupIPCHandlers()
+
+// Setup perf IPC listener for main process collection requests
+setupPerfIpcListener()
+
+// Mark interactive after microtask queue drains (all sync init complete)
+requestAnimationFrame(() => {
+  mark('chaterm/renderer/firstAnimationFrame')
+  requestAnimationFrame(() => {
+    mark('chaterm/renderer/interactive')
+    logRendererTimeline()
+    reportMarksToMainAsync()
+  })
+})
+
+export { pinia }

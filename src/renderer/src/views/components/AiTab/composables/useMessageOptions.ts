@@ -1,0 +1,110 @@
+import { ref } from 'vue'
+import type { ChatMessage } from '../types'
+import type { WebviewMessage } from '@shared/WebviewMessage'
+import { useSessionState } from './useSessionState'
+
+const logger = createRendererLogger('ai.messageOptions')
+
+/**
+ * Composable for message option interaction functionality
+ * Handles AI-provided option selection and custom input
+ */
+export function useMessageOptions() {
+  const { currentSession, attachTabContext } = useSessionState()
+  const messageOptionSelections = ref<Record<string, string>>({})
+
+  const messageCustomInputs = ref<Record<string, string>>({})
+
+  const handleOptionSelect = (message: ChatMessage, value: string) => {
+    messageOptionSelections.value[message.id] = value
+  }
+
+  const getSelectedOption = (message: ChatMessage): string => {
+    return messageOptionSelections.value[message.id] || ''
+  }
+
+  const handleCustomInputChange = (message: ChatMessage, value: string) => {
+    messageCustomInputs.value[message.id] = value
+  }
+
+  const getCustomInput = (message: ChatMessage): string => {
+    return messageCustomInputs.value[message.id] || ''
+  }
+
+  /**
+   * Determine if option can be submitted
+   * Rules:
+   * 1. If a preset option is selected, can submit directly
+   * 2. If custom option is selected, need to check input content is not empty
+   */
+  const canSubmitOption = (message: ChatMessage): boolean => {
+    const selected = messageOptionSelections.value[message.id]
+
+    if (!selected) {
+      return false
+    }
+
+    if (selected !== '__custom__') {
+      return true
+    }
+
+    const customInput = messageCustomInputs.value[message.id] || ''
+    return customInput.trim().length > 0
+  }
+
+  const handleOptionChoose = async (message: ChatMessage, option?: string) => {
+    const session = currentSession.value
+    if (!session) return
+
+    try {
+      if (option) {
+        message.selectedOption = option
+      }
+      let messageRsp: WebviewMessage = {
+        type: 'askResponse',
+        askResponse: 'yesButtonClicked',
+        text: ''
+      }
+      switch (message.ask) {
+        case 'followup':
+          messageRsp.askResponse = 'messageResponse'
+          messageRsp.text = option || ''
+          break
+      }
+      logger.info('Send message to main process', { data: messageRsp })
+
+      const response = await window.api.sendToMain(attachTabContext(messageRsp))
+      logger.info('Main process response', { data: response })
+
+      session.responseLoading = true
+    } catch (error) {
+      logger.error('Failed to send message to main process', { error: error })
+    }
+  }
+
+  const handleOptionSubmit = async (message: ChatMessage) => {
+    const selected = messageOptionSelections.value[message.id]
+    if (!selected) {
+      return
+    }
+
+    const content = selected === '__custom__' ? messageCustomInputs.value[message.id] : selected
+
+    if (!content || content.trim().length === 0) {
+      return
+    }
+
+    await handleOptionChoose(message, content.trim())
+  }
+
+  return {
+    messageOptionSelections,
+    messageCustomInputs,
+    handleOptionSelect,
+    getSelectedOption,
+    handleCustomInputChange,
+    getCustomInput,
+    canSubmitOption,
+    handleOptionSubmit
+  }
+}
