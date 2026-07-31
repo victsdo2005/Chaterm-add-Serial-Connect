@@ -7,9 +7,6 @@
   <a href="https://www.tbench.ai/leaderboard/terminal-bench/1.0"><img src="https://img.shields.io/badge/Terminal--Bench-Ranked_%232-00D94E?style=for-the-badge&logo=github&logoColor=white" alt="Terminal-Bench"></a>
   <a href="https://aws.amazon.com/cn/blogs/china/chaterm-aws-kms-envelope-encryption-for-zero-trust-security-en/"><img src="https://img.shields.io/badge/AWS-Security-FF9900?style=for-the-badge&logo=amazon-aws&logoColor=white&labelColor=232F3E" alt="AWS Security"></a>
   <a href="https://landscape.cncf.io/?item=provisioning--automation-configuration--chaterm"><img src="https://img.shields.io/badge/CNCF-Landscape-0086FF?style=for-the-badge&logo=kubernetes&logoColor=white" alt="CNCF Landscape"></a>
-</p>
-
-<p align="center">
   <a href="https://scorecard.dev/viewer/?uri=github.com/chaterm/Chaterm"><img src="https://api.scorecard.dev/projects/github.com/chaterm/Chaterm/badge" alt="OpenSSF Scorecard"></a>
   <a href="https://www.bestpractices.dev/projects/12617"><img src="https://www.bestpractices.dev/projects/12617/badge" alt="OpenSSF Best Practices"></a>
   <img src="https://img.shields.io/codecov/c/github/chaterm/Chaterm?style=flat&logo=codecov" alt="Coverage">
@@ -19,104 +16,24 @@
 </p>
 
 <p align="center">
-  <a href="https://chaterm.ai/download/"><img src="https://img.shields.io/badge/macOS-000000?style=for-the-badge&logo=apple&logoColor=white" alt="macOS"></a>
   <a href="https://chaterm.ai/download/"><img src="https://img.shields.io/badge/Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white" alt="Windows"></a>
-  <a href="https://chaterm.ai/download/"><img src="https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black" alt="Linux"></a>
-  <a href="https://aws.amazon.com/marketplace/"><img src="https://img.shields.io/badge/AWS-Marketplace-FF9900?style=for-the-badge&logo=amazon-aws&logoColor=white&labelColor=232F3E" alt="AWS Marketplace"></a>
-  <p align="center">
 </p>
 
-## Table of Contents
+# Chaterm
 
-- [Introduction](#introduction)
-- [Why Choose Chaterm](#why-choose-chaterm)
-- [Key Features](#key-features)
-- [🆕 New: Serial (UART) Connection](#-new-serial-uart-connection)
-  - [Highlights](#highlights)
-  - [Serial Connection Parameters](#serial-connection-parameters)
-  - [How the AI Manages a Serial Session](#how-the-ai-manages-a-serial-session)
-- [Development Guide](#development-guide)
-  - [Install Electron](#install-electron)
-  - [Install](#install)
-  - [Development](#development)
-  - [Build](#build)
-- [Chaterm Documentation](https://chaterm.ai/docs/)
-- [Gold Sponsors](#gold-sponsors)
-- [Acknowledgements](#acknowledgements)
-- [Contributors](#contributors)
-
-# Introduction
-
-Chaterm is an AI native terminal built for infrastructure and cloud resource management. It enables engineers to use natural language to perform complex tasks such as deploying services, troubleshooting, and resolving problems.
-
-With its built-in expert-level knowledge base and powerful proxy reasoning capabilities, Chaterm understands your business topology and operational goals. No need to memorize complex commands, syntax, or parameters — simply describe your task objectives in natural language, and Chaterm can autonomously plan and execute complex operations across multiple hosts or clusters, including key processes such as code building, service deployment, fault diagnosis, and automatic rollback.
-
-Powered by long-term memory and team knowledge bases, Chaterm learns team knowledge and user habits. Its goal is to be your intelligent DevOps co-pilot, allowing engineers to complete daily tasks more efficiently through reusable agent skills. Chaterm aims to lower the cognitive barrier associated with different technology stacks, enabling every developer to quickly gain the operational experience and execution capabilities of a senior SRE.
+Chaterm is an AI-native terminal built for infrastructure and cloud resource management. Describe tasks in natural language, and the built-in Agent plans and executes them across servers, Kubernetes, and now **serial (UART) devices**.
 
 ![Preview image](resources/hero.webp)
 
-![Preview image](resources/hero2.webp)
-
-## Why Choose Chaterm
-
-Chaterm is not just a smarter terminal, it's an infrastructure agent.
-There is a saying that every agent fails all the time, but Chaterm helps you fix it.
-
-- 🤖 From commands to execution — describe tasks, let AI plan and run them
-
-- 🌐 Built for real infrastructure — Servers, Kubernetes, and multi-cluster workflows
-
-- 🔁 Reusable Agent Skills — turn experience into automation
-
-- 🧠 Context-aware intelligence — understands your systems, not just commands
-
-- 🛡️ Safe & controllable — auditable, reviewable, and rollback-ready
-
-- 🔌 **Direct serial connection** — new: drive a switch / router / embedded device's Console port with natural language
-
 ## Key Features
 
-- 🤖 **AI Agent**
-
-  The Agent understands the target, autonomously plans, and performs problem analysis and root cause localization across multiple hosts, automatically closing the loop to complete complex process handling.
-
-  Every operation is auditable and traceable, and supports rapid log rollback, making AI automation more secure and reliable in production environments.
-
-- 🧠 **Smart completion**
-
-  Combining user habits, local memory, and the current server context, the Agent recommends the most suitable commands, making terminal input smarter and more efficient.
-
-  Optional local echo renders safe interactive typing immediately on high-latency SSH sessions while suppressing the confirmed remote echo.
-
-  Supports cross-device session synchronization and reduces mobile input costs through quick commands and voice interaction, making remote maintenance smoother.
-
-- 🧩 **Knowledge Base**
-
-  Supports importing technical manuals, internal documents, scripts, and white papers to build a personal maintenance knowledge system.
-
-  Chaterm understands the current infrastructure context and accurately retrieves relevant knowledge to assist in task decision-making and execution.
-
-- ⚡ **Agent Skill**
-
-  Encapsulates complex maintenance processes into reusable AI skills, achieving structured and reliable automated execution.
-
-  Help teams accumulate operational experience, enabling AI to be applied securely and stably in real production environments.
-
-- 🔌 **Plugin System**
-
-  Through plugin extensions, achieve unified authentication, dynamic authorization, and secure encrypted connections for public cloud servers and Kubernetes.
-
-  Provide a more efficient resource access experience and facilitate centralized infrastructure management.
-
-- 🗄️ **Database Workspace**
-
-  Connect to MySQL, PostgreSQL, SQLite, and Oracle to browse schemas, query data, inspect DDL, edit table rows, and use database-aware AI assistance.
-
-- 🔌 **Serial (UART) Connection** 🆕
-
-  A new connection type that talks directly to serial devices and is driven by the built-in AI Agent through natural language. See the section below.
-
-![Preview image](resources/features.webp)
+- 🤖 **AI Agent** — understands the target, plans, diagnoses root causes across hosts, and closes the loop autonomously; every step is auditable and rollback-ready.
+- 🧠 **Smart completion** — habit + local-memory + context aware command suggestions; safe local echo on high-latency SSH.
+- 🧩 **Knowledge Base** — import manuals / docs / scripts to build a personal maintenance knowledge system.
+- ⚡ **Agent Skill** — encapsulate complex workflows into reusable, reliable AI skills.
+- 🔌 **Plugin System** — unified auth, dynamic authorization, and encrypted connections for public cloud & Kubernetes.
+- 🗄️ **Database Workspace** — browse MySQL / PostgreSQL / SQLite / Oracle, query, inspect DDL, edit rows.
+- 🔌 **Serial (UART) Connection** 🆕 — drive switches, routers, and embedded devices' Console port by natural language. *See below.*
 
 # 🆕 New: Serial (UART) Connection
 
@@ -165,12 +82,6 @@ Relevant implementation:
 
 ## Development Guide
 
-### Install Electron
-
-```sh
-npm i electron -D
-```
-
 ### Install
 
 ```bash
@@ -184,8 +95,6 @@ If Electron reports a native module ABI mismatch, rebuild native dependencies fo
 npm run rebuild:native
 ```
 
-Do not use `npm rebuild better-sqlite3` for Electron runtime fixes; it can compile the module against the wrong Node ABI.
-
 ### Development
 
 ```bash
@@ -197,19 +106,9 @@ npm run dev
 ### Build
 
 ```bash
-# For windows (CN edition; output: dist/cn/chaterm-<ver>-cn-setup-x64.exe)
+# For Windows (CN edition; output: dist/cn/chaterm-<ver>-cn-setup-x64.exe)
 npm run build:win:cn
-
-# For macOS
-npm run build:mac
-
-# For Linux
-npm run build:linux
 ```
-
-## Gold Sponsors
-
-![Preview image](resources/aws.webp) ![Preview image](resources/aliyun.webp)
 
 ## Acknowledgements
 
@@ -218,14 +117,3 @@ Chaterm builds upon excellent open-source projects. We gratefully acknowledge:
 - **[Cline](https://github.com/cline/cline)** — portions of the AI Agent system are adapted from Cline.
 - **[RTK](https://github.com/rtk-ai/rtk)** — command output filtering to reduce token usage in agent workflows.
 - **[serialport (node-serialport)](https://github.com/serialport/node-serialport)** — the serial connection capability in this branch is built on this project.
-
-## Contributors
-
-Thank you for your contribution!
-Please refer to the <a href="./CONTRIBUTING.md">Contribution Guide</a> for more information.
-
-<div align=center style="margin-top: 30px;">
-  <a href="https://github.com/chaterm/Chaterm/graphs/contributors">
-    <img src="https://contrib.rocks/image?repo=chaterm/Chaterm&refresh=true" />
-  </a>
-</div>
